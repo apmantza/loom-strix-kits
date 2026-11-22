@@ -122,6 +122,8 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    bias = -sink), so the bias is r . rel_bias[min(d, 1024)] - sink, 16 multiply-adds per key from a 64 KB table: computed inside the
    attention kernel, nothing per distance materialised. kit/gen_inkattn.py prep: the per-token clips (q: per-channel scale + L2 clip
    22.63; k: clip; v: RMS norm; r: scale + clip 8) and, on global layers, tau = 1 + 0.1 log(max(1, (pos + 1) / 8192)) on q and r;
-   matched to the fork's math by a lane-vectorised interpreter test (kit/test_inkattn.py). Next: the attention core with the bias,
-   the zero-logit sink and the sigmoid output gate.
+   matched to the fork's math (kit/test_inkattn.py). gen_inkattn.decode_swa: the sliding-window decode attention (one workgroup per
+   query head: scores with the bias into LDS, softmax with the zero-logit sink, 2 x 128 lanes for the output dims, sigmoid gate;
+   f32 K / V for now): 630 instructions, 68 VGPRs, 16 waves, lint-clean; equal to the fork's attention within float32 accumulation
+   (window cut at 1,024, sink-dominated heads, GQA) on kit/loomsim.py. Next: KV8 in-tile, the global layers' split-K form, verify spans.
 4. Weights route: UD-Q4_K_XL chosen 22 Nov (see Weights); confirm with our own KLD run against UD-Q8_K_XL (step 2).

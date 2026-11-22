@@ -5,9 +5,9 @@
     the window's last n_conv - 1 inputs;
   - a summation order other than ggml's (each sum term by term, the dynamic lags added one at a time after the static taps), so outputs
     match llama.cpp's bit for bit.
-How: the kernel body the generator emits (index constants / div, view.load, scalar.mulf / addf, view.store) is executed by a small
-interpreter in numpy float32 for every channel, and its outputs and new history are compared bit for bit with a float32 transcription of
-the fork's convolve() (src/models/inkling2.cpp). The kernels also compile for gfx1151 with no lint flag.
+How: kit/loomsim.py runs the emitted kernel (all lanes at once, float32; the kernel uses only * and +, so results are bit-exact for its
+operation order) and its outputs and new history are compared bit for bit with a float32 transcription of the fork's convolve()
+(src/models/inkling2.cpp). The kernels also compile for gfx1151 with no lint flag.
 usage: python3 kit/test_sconv.py"""
 import os
 import re
@@ -21,6 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "common"))
 import gen_sconv  # noqa: E402
+import loomsim  # noqa: E402
 
 fails = 0
 f32 = np.float32
@@ -30,47 +31,6 @@ def ok(cond, what):
     global fails
     print(("ok  " if cond else "FAIL") + " " + what)
     fails += not cond
-
-
-def run_text(text, arrays, C):
-    """execute the kernel body for channels 0 .. C-1; arrays: view name -> numpy array (modified in place by stores)"""
-    body = text[text.index("scf.if %live {"):text.rindex("kernel.return")]
-    scale = f32(float(re.search(r"%scale = scalar\.constant (\S+) : f32", text).group(1)))
-    lines = [ln.strip() for ln in body.splitlines()[1:]]
-    for ch in range(C):
-        env = {"ch": ch, "scale": scale}
-
-        def idx(s):
-            out = []
-            for tok in s.split(","):
-                tok = tok.strip()
-                out.append(env[tok[1:]] if tok.startswith("%") else int(tok))
-            return tuple(out)
-        for ln in lines:
-            if not ln or ln.startswith(("%ch = index.assume", "}")):
-                continue
-            m = re.match(r"%(\w+) = index\.constant (\d+) : index$", ln)
-            if m:
-                env[m.group(1)] = int(m.group(2))
-                continue
-            m = re.match(r"%(\w+) = index\.div %(\w+), %(\w+) : index$", ln)
-            if m:
-                env[m.group(1)] = env[m.group(2)] // env[m.group(3)]
-                continue
-            m = re.match(r"%(\w+) = view\.load %(\w+)\[([^\]]+)\] :", ln)
-            if m:
-                env[m.group(1)] = f32(arrays[m.group(2)][idx(m.group(3))])
-                continue
-            m = re.match(r"%(\w+) = scalar\.(mulf|addf) %(\w+), %(\w+) : f32$", ln)
-            if m:
-                a, b = env[m.group(3)], env[m.group(4)]
-                env[m.group(1)] = f32(a * b) if m.group(2) == "mulf" else f32(a + b)
-                continue
-            m = re.match(r"view\.store %(\w+), %(\w+)\[([^\]]+)\] :", ln)
-            if m:
-                arrays[m.group(2)][idx(m.group(3))] = env[m.group(1)]
-                continue
-            raise SystemExit(f"FAIL interpreter: unknown line {ln!r}")
 
 
 def reference(cur, w, hist, taps, n_conv=4):
@@ -103,12 +63,12 @@ def main():
         hist = rng.standard_normal((C, 3)).astype(f32)
         taps = rng.standard_normal((T, heads, 4)).astype(f32) if heads else None
         y_ref, h_ref = reference(cur, w, hist, taps)
-        arrays = {"cur_view": cur.copy(), "w_view": w, "h_view": hist.copy(), "out_view": np.zeros((T, C), f32)}
+        arrays = {"cur": cur.copy(), "weight": w, "history": hist.copy(), "out": np.zeros((T, C), f32)}
         if heads:
-            arrays["tap_view"] = taps
-        run_text(gen_sconv.sconv(C, T, heads), arrays, C)
-        ok(np.array_equal(arrays["out_view"].view(np.uint32), y_ref.view(np.uint32)) and
-           np.array_equal(arrays["h_view"].view(np.uint32), h_ref.astype(f32).view(np.uint32)),
+            arrays["taps"] = taps
+        loomsim.run(gen_sconv.sconv(C, T, heads), arrays, {}, ((C + 255) // 256, 1, 1), 256)
+        ok(np.array_equal(arrays["out"].view(np.uint32), y_ref.view(np.uint32)) and
+           np.array_equal(arrays["history"].view(np.uint32), h_ref.astype(f32).view(np.uint32)),
            f"C {C} T {T} heads {heads}: outputs and new history equal ggml's bit for bit")
     import kernel_lint as kl
     with tempfile.TemporaryDirectory() as t:

@@ -4,9 +4,12 @@
     clamped to [0, 1]), v not RMS-normalised (or with the wrong length), r's padded lanes (16 of 32) leaking into its norm;
   - tau wrong or applied on local layers (global only: 1 + alpha log(max(1, (pos + 1) / floor)), on q and r, after the clip);
   - heads or waves mixed up (each of 8 waves owns 3 q heads, 1 k, 1 v, 3 r heads).
-How: the emitted kernel body is executed by a lane-vectorised interpreter (8 waves x 32 lanes per token; subgroup sums over the lanes) in
-float32 and compared with a numpy transcription of inkling2.cpp's clip() / rms_norm / tau. Summation order differs from ggml's, so the
-comparison is to 2e-6 relative, not bit for bit. The kernels also compile for gfx1151 with no lint flag.
+decode_swa (the sliding-window decode attention):
+  - the bias at the wrong distance or the window edge off (distance < 1024: n_kv 1,500 checks the cut), GQA heads mixed up, the
+    zero-logit sink left out of the softmax (heads with large sink logits, where it dominates the denominator), the gate missing.
+How: kit/loomsim.py runs the emitted kernels (all lanes of a workgroup at once, in float32) and the results are compared with numpy
+transcriptions of inkling2.cpp's clip() / rms_norm / tau and of its attention (scores + r . rel_bias[d] - sink, softmax with a zero sink,
+sigmoid gate). Summation order differs from ggml's: prep to 2e-6, attention to 2e-4 relative. The kernels compile with no lint flag.
 usage: python3 kit/test_inkattn.py"""
 import os
 import re
@@ -20,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "common"))
 import gen_inkattn  # noqa: E402
+import loomsim  # noqa: E402
 
 f32 = np.float32
 fails = 0
@@ -29,96 +33,6 @@ def ok(cond, what):
     global fails
     print(("ok  " if cond else "FAIL") + " " + what)
     fails += not cond
-
-
-def interpret(text, bufs, T):
-    """run the launch body for every token and wave; values are arrays over the 32 lanes of a wave"""
-    body = text[text.index("} launch(") :]
-    body = body[body.index("{") + 1: body.rindex("kernel.return")]
-    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    views = {}
-    for token in range(T):
-        for wave in range(8):
-            lanes = np.arange(32)
-            env = {"token_id": np.full(32, token), "wave_id": np.full(32, wave), "wl_id": lanes}
-            skip = [False]
-            depth = []
-            for ln in lines:
-                if ln.startswith("scf.if "):
-                    depth.append(env[ln.split()[1][1:]].astype(bool))
-                    continue
-                if ln == "}":
-                    depth.pop()
-                    continue
-                m = re.match(r"%(\w+) = buffer\.view %(\w+)\[%zero\] : buffer -> view<([^>]+)>$", ln)
-                if m:
-                    views[m.group(1)] = m.group(2)
-                    continue
-                if re.match(r"%\w+ = index\.constant 0 : offset$", ln):
-                    continue
-                m = re.match(r"%(\w+) = index\.constant (-?\d+) : index$", ln)
-                if m:
-                    env[m.group(1)] = np.full(32, int(m.group(2)))
-                    continue
-                m = re.match(r"%(\w+) = scalar\.constant (\S+) : (f32|i32)$", ln)
-                if m:
-                    env[m.group(1)] = np.full(32, f32(float(m.group(2)))) if m.group(3) == "f32" else np.full(32, int(m.group(2)))
-                    continue
-                m = re.match(r"%(\w+) = index\.(add|mul|min) %(\w+), %(\w+) : index$", ln)
-                if m:
-                    a, b = env[m.group(3)], env[m.group(4)]
-                    env[m.group(1)] = {"add": a + b, "mul": a * b, "min": np.minimum(a, b)}[m.group(2)]
-                    continue
-                m = re.match(r"%(\w+) = index\.assume %(\w+) ", ln)
-                if m:
-                    env[m.group(1)] = env[m.group(2)]
-                    continue
-                m = re.match(r"%(\w+) = index\.cmp ult, %(\w+), %(\w+) : index$", ln)
-                if m:
-                    env[m.group(1)] = env[m.group(2)] < env[m.group(3)]
-                    continue
-                m = re.match(r"%(\w+) = kernel\.subgroup\.id : index$", ln) or re.match(r"%(\w+) = kernel\.(workgroup\.id<x>|subgroup\.lane\.id) : index$", ln)
-                if m:
-                    continue
-                m = re.match(r"%(\w+) = view\.load %(\w+)\[([^\]]+)\] :", ln)
-                if m:
-                    arr = bufs[views[m.group(2)]]
-                    idx = tuple(env[t.strip()[1:]] for t in m.group(3).split(","))
-                    env[m.group(1)] = arr[idx]
-                    continue
-                m = re.match(r"view\.store %(\w+), %(\w+)\[([^\]]+)\] :", ln)
-                if m:
-                    arr = bufs[views[m.group(2)]]
-                    idx = tuple(env[t.strip()[1:]] for t in m.group(3).split(","))
-                    live = np.logical_and.reduce(depth) if depth else np.ones(32, bool)
-                    for ln_i in np.nonzero(live)[0]:
-                        arr[tuple(i[ln_i] for i in idx)] = env[m.group(1)][ln_i]
-                    continue
-                m = re.match(r"%(\w+) = scalar\.(mulf|addf|divf|maxnumf|minnumf) %(\w+), %(\w+) : f32$", ln)
-                if m:
-                    a, b = env[m.group(3)].astype(f32), env[m.group(4)].astype(f32)
-                    op = m.group(2)
-                    env[m.group(1)] = (a * b if op == "mulf" else a + b if op == "addf" else a / b if op == "divf"
-                                       else np.maximum(a, b) if op == "maxnumf" else np.minimum(a, b)).astype(f32)
-                    continue
-                m = re.match(r"%(\w+) = scalar\.(sqrtf|rsqrtf|logf<afn>) %(\w+) : f32$", ln)
-                if m:
-                    a = env[m.group(3)].astype(f32)
-                    env[m.group(1)] = (np.sqrt(a) if m.group(2) == "sqrtf" else f32(1) / np.sqrt(a) if m.group(2) == "rsqrtf" else np.log(a)).astype(f32)
-                    continue
-                m = re.match(r"%(\w+) = scalar\.sitofp %(\w+) : i32 to f32$", ln)
-                if m:
-                    env[m.group(1)] = env[m.group(2)].astype(f32)
-                    continue
-                m = re.match(r"%(\w+) = scf\.select %(\w+), %(\w+), %(\w+) : f32$", ln)
-                if m:
-                    env[m.group(1)] = np.where(env[m.group(2)], env[m.group(3)], env[m.group(4)]).astype(f32)
-                    continue
-                m = re.match(r"%(\w+) = kernel\.subgroup\.reduce<addf> %(\w+) : f32$", ln)
-                if m:
-                    env[m.group(1)] = np.full(32, env[m.group(2)].astype(np.float64).sum(), f32)
-                    continue
-                raise SystemExit(f"FAIL interpreter: unknown line {ln!r}")
 
 
 def reference(q, k, v, r, qc, rc, pos, glob, qk_clip=22.627416610717773, rel_clip=8.0, eps=9.999999974752427e-07):
@@ -135,6 +49,21 @@ def reference(q, k, v, r, qc, rc, pos, glob, qk_clip=22.627416610717773, rel_cli
     return qo, ko, vo, ro
 
 
+def attention_reference(n_kv, q, r, sinks, gate, rb, kc, vc, W=1024):
+    """one token's sliding-window attention, as the fork: s = q . k / sqrt(128) + r . rel_bias[d] - sink over distances d < W, softmax
+    with a zero-logit sink (max over the scores and 0), the output times sigmoid(gate); GQA: kv head = h / 3"""
+    out = np.zeros((24, 128), np.float64)
+    for h in range(24):
+        kvh = h // 3
+        d = np.arange(min(n_kv, W))
+        j = n_kv - 1 - d
+        s = kc[j, kvh].astype(np.float64) @ q[h] / np.sqrt(128) + rb[d].astype(np.float64) @ r[h] - sinks[h]
+        m = max(0.0, s.max())
+        p = np.exp(s - m)
+        out[h] = (p @ vc[j, kvh]) / (np.exp(-m) + p.sum()) / (1 + np.exp(-gate[h]))
+    return out
+
+
 def main():
     rng = np.random.default_rng(20261122)
     for T, glob in ((1, False), (3, True), (2, False)):
@@ -148,15 +77,30 @@ def main():
         q[0, 0] *= f32(0.01)              # one head below the clip bound (factor 1) to exercise the clamp
         want = reference(q, k, v, r, qc, rc, pos, glob)
         bufs = {"q": q.copy(), "k": k.copy(), "v": v.copy(), "r": r.copy(), "qclip": qc, "rclip": rc, "positions": pos}
-        interpret(gen_inkattn.prep(T, glob), bufs, T)
+        loomsim.run(gen_inkattn.prep(T, glob), bufs, {}, (T, 1, 1), 256)
         errs = [float(np.max(np.abs(bufs[n] - w) / (np.abs(w) + 1e-6))) for n, w in zip(("q", "k", "v", "r"), want)]
         ok(max(errs) < 2e-6, f"T {T} {'global' if glob else 'local'}: q k v r equal the fork's clips / norms / tau (max rel err {max(errs):.1e})")
+    for n_kv in (700, 1500):
+        q = rng.standard_normal((24, 128)).astype(f32)
+        r = rng.standard_normal((24, 16)).astype(f32)
+        sinks = rng.standard_normal(24).astype(f32)
+        sinks[::3] += f32(12)                 # scores far below zero: the zero-logit sink dominates the denominator
+        gate = rng.standard_normal((24, 128)).astype(f32)
+        rb = (rng.standard_normal((1024, 16)) * 0.3).astype(f32)
+        kc = rng.standard_normal((n_kv, 8, 128)).astype(f32)
+        vc = rng.standard_normal((n_kv, 8, 128)).astype(f32)
+        out = np.zeros((24, 128), f32)
+        bufs = {"q": q, "r": r, "sinks": sinks, "gate": gate, "rel_bias": rb, "kc": kc, "vc": vc, "out": out}
+        loomsim.run(gen_inkattn.decode_swa(), bufs, {"n_kv_arg": n_kv}, (24, 1, 1), 256)
+        ref = attention_reference(n_kv, q, r, sinks, gate, rb, kc, vc)
+        err = float(np.max(np.abs(out - ref) / (np.abs(ref) + 1e-3)))
+        ok(err < 2e-4, f"decode_swa n_kv {n_kv}: equals the fork's attention (bias, window, zero sink, gate; max rel err {err:.1e})")
     import kernel_lint as kl
     with tempfile.TemporaryDirectory() as t:
-        for T, glob in ((1, False), (8, True)):
-            name = f"g_ink_attn_prep_t{T}" + ("_global" if glob else "")
+        for name, text in [(f"g_ink_attn_prep_t{T}" + ("_global" if glob else ""), gen_inkattn.prep(T, glob)) for T, glob in ((1, False), (8, True))] + \
+                [("g_ink_attn_dec_swa1024", gen_inkattn.decode_swa())]:
             p = os.path.join(t, "p.loom")
-            open(p, "w").write("target.decl @device\namdgpu.target<gfx11-generic> @rdna3\n" + gen_inkattn.prep(T, glob))
+            open(p, "w").write("target.decl @device\namdgpu.target<gfx11-generic> @rdna3\n" + text)
             o = os.path.join(t, "p.hsaco")
             r_ = subprocess.run([kl.loom_compile(), p, "--target=amdgpu:gfx1151", f"--root={name}", f"--output={o}"], capture_output=True, text=True)
             if r_.returncode:
