@@ -8,7 +8,7 @@ KL-divergence path each turned out to exist already (rules.md section 2). Add a 
 |---|---|---|
 | Weights in | Are the files the pinned ones? Is anything newer upstream? | `common/fetch.py KIT --verify-only`, `common/fresh.py KIT`, both inside `common/kit_check.sh KIT` |
 | Floors | What would each lane cost at the hardware limit? | `common/make_lanes.py` (GGUF, local or `hf:` safetensors headers via huggingface_hub); `common/kit_check.sh` fails when lanes.json drifts from the weights; `common/ceiling.py` |
-| Device limits | Is the bandwidth floor itself right? | `rocm-bandwidth-test` (HSA copy bandwidth), against devices/<gfx>.md |
+| Device limits | Is the bandwidth floor itself right? | `common/bw_probe.sh` (read / write / copy GB/s with 128-bit accesses; the read figure bounds decode), against lanes.json `hardware` and devices/<gfx>.md. rocm-bandwidth-test did not build here (Boost's nested submodules; its pinned TransferBench uses a hardware register gfx1151 lacks) |
 | Scoreboard | Where does served time go? | `common/events_ab.sh`, `events_summary.py` (lanes against floors), `lane_breakdown.py` (per shape, GB/s) |
 | Static: the binary | What does the loop issue and wait on? | `common/loop_census.py`, `compiler_ab.py` (two compilers, every root), `load_cover.py`, `load_events.py`; `llvm-objdump-21 -d --mcpu=gfx1151` |
 | Static: the compiler's view | Why did it place / wait / spill? | `loom-compile --compile-report=details` then `loom-compile-report show / diff / suggest` (wait reasons, `suggest` for pipeline copy waits, spill and allocation rows, schedule bands) |
