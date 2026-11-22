@@ -7,3 +7,4 @@ machines are tagged as theirs.
 | note | topic | kits it serves |
 |---|---|---|
 | [nvme-streaming.md](nvme-streaming.md) | weights and tables larger than memory: n-gram (Engram / PLE) tables and MoE experts read from NVMe on a unified-memory APU | hy4-flash, Qwen3.8 Flash Next, any MoE quant beyond RAM |
+| [engine-lab-inkling.md](engine-lab-inkling.md) | strix-halo-engine-lab's Inkling 2 Mini prefill work (1.6k tok/s at 8K, bit-exact): chunking, attention tiles, NVFP4 decode, controller and SwiGLU epilogues, MoE row mapping, DRAM row-pitch channel collisions | inkling-2-mini; row pitch: every kit |
