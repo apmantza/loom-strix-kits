@@ -17,6 +17,9 @@ The repository has three parts:
   - a fetch script that pins the weights by revision and sha256.
 - `common/` holds tools that work for any kit: build, serve, kernel tests, output equality, gates, an agent-session A/B,
   and code-object analysis.
+- `skills/` holds agent-readable procedures (plain markdown, any coding agent): `skills/loom-strix-optimise/` is how we
+  do speed work on a kit, with the rules (each with its evidence), the gfx1151 device facts and the traps. A kit's own
+  model knowledge is in `kits/<kit>/NOTES.md`.
 
 The weights are never redistributed; each kit downloads them from their original repositories.
 
