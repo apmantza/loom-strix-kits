@@ -112,7 +112,11 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    (weights read once per token, 176 VGPRs, lint-clean; kit/test_loop.py) and the depth-attention mix shared by the block attention
    residuals, the loop messages and the output query (gen_loop.depth_mix: states RMS-normalised, softmax over learned-query scores,
    the normalised states mixed; each state read once, two barriers per call). Still to write: the 48-slot schedule in the program, a
-   multi-token controller for verify spans.
+   multi-token controller for verify spans. **Controller parallelism (23 Nov)**: controller() runs one workgroup per token, so a
+   decode step reads each controller's weights from a single CU; gen_loop.controller_split(TS) spreads D's rows over rank / RB
+   workgroups and G / F's over H / 64, reading every weight once per span (1 token at decode, the verify span otherwise); values
+   match control() on kit/loomsim.py (kit/test_loop.py split_values). How many workgroups are needed comes from a measurement of
+   read bandwidth against grid size (common/bw_probe.sh with a block count).
    **Controller weights are BF16 in disguise (22 Nov)**: all 28.3M f32 values of the GGUF's 144 loop-controller tensors have zero low
    16 bits (exact BF16 upcasts; the native checkpoint stores them in BF16), so storing them as BF16 halves the ~226 MB per token with
    bit-identical results.
@@ -126,6 +130,13 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    per call. kit/test_sconv.py executes the generated kernel text in float32 and matches ggml's convolve() bit for bit. As
    separate kernels these are ~190 launches per token (4 x 48 layer applications): a fusion candidate (into the K/V projection
    and residual epilogues) once the program exists. Speculative rollback (per-step history) is still to add.
+   **Convolution fusion plan (22 Nov; program stage)**: of the four convolutions per layer, the two post-convolutions (attention
+   output, FFN output; 2,304 channels, static taps) act per output row of a projection whose decode matvec already gives each output
+   row to one lane group: the convolution (3 history values + 4 taps per row), the 1/sqrt(5) scale and the residual add go into that
+   matvec's epilogue (the FFN one into the expert combine), with the history in the position-keyed ring (gen_sconv.sconv_pos), so
+   no separate launch and no rollback; Strata does the same. The K / V convolutions (dynamic taps on global layers) fold into the
+   attention prologue with the clips (gen_inkattn.prep) and the KV write, as vLLM does. That removes ~190 of the per-token launches.
+   Done by text rewriting of the generated program, as kit/epi_fuse.py does for Qwen (refuse any block it cannot prove).
    **Attention inputs (22 Nov)**: relative_extent is 1024 on every layer (global included; distances >= 1024 hit the zero pad row,
    bias = -sink), so the bias is r . rel_bias[min(d, 1024)] - sink, 16 multiply-adds per key from a 64 KB table: computed inside the
    attention kernel, nothing per distance materialised. kit/gen_inkattn.py prep: the per-token clips (q: per-channel scale + L2 clip
