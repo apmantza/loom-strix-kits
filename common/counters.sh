@@ -6,6 +6,8 @@
 #   bytes    MemReadBytes (size-weighted L2 -> memory read requests) and GPU busy cycles
 #   l2       GL2C hits, misses, DRAM and memory-controller read requests
 #   latency  VmemLoadLatency, VmemLoadsInFlight, LdsLatency
+#   lds      LDSBankConflict (% of cycles), SQC_LDS_BANK_CONFLICT, LDS activity and instructions, ALUStalledByLDS: is a modelled
+#            bank conflict (Loom's compile report, common/kernel_lint.py) a measured cost? (E245)
 # usage: counters.sh OUT_DIR PRESET[,PRESET...] [--kernel REGEX] -- COMMAND ...
 #        counters.sh OUT_DIR calibrate        (bw_probe under bytes, waits, latency; MemReadBytes against the bytes it reads)
 # Trusted counts need power_dpm_force_performance_level=profile_standard (root; restore auto); run on a quiet machine.
@@ -21,6 +23,7 @@ declare -A PMC=(
   [bytes]="MemReadBytes GRBM_GUI_ACTIVE"
   [l2]="GL2C_HIT GL2C_MISS GL2C_EA_RDREQ_DRAM GL2C_MC_RDREQ GRBM_GUI_ACTIVE"
   [latency]="VmemLoadLatency VmemLoadsInFlight LdsLatency"
+  [lds]="LDSBankConflict SQC_LDS_BANK_CONFLICT SQC_LDS_IDX_ACTIVE SQ_INSTS_LDS ALUStalledByLDS SQ_INST_CYCLES_LDS SQ_WAVE_CYCLES"
 )
 lvl=$(cat /sys/class/drm/card*/device/power_dpm_force_performance_level 2>/dev/null | head -1)
 [ "$lvl" = profile_standard ] || echo "counters: WARNING power level '$lvl' (not profile_standard): some counter clocks may be gated"
