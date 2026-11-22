@@ -1,0 +1,108 @@
+{
+ "_doc": "Hardware and model constants for ceiling.py / events_summary.py. Every number names its source. Update the source when you change a number; recompute the byte counts from the served GGUFs when a quant changes (gguf.GGUFReader).",
+ "hardware": {
+  "name": "Strix Halo, Radeon 8060S, gfx1151 (40 CUs, LPDDR5X unified)",
+  "bw_copy_gbs": 216,
+  "bw_practical_gbs": 228,
+  "wmma_f16_tflops": 45,
+  "_src": "216 GB/s device copy (LEDGER standing-goal table); 228 GB/s reached by the decode matvecs (E50); ~45 TFLOP/s f16 WMMA clock-adjusted peak (E61)"
+ },
+ "model": {
+  "name": "Inkling 2 Mini, native NVFP4/MXFP8 experts + BF16, 8-token verify",
+  "layers": 24,
+  "attn_layers": 24,
+  "q_heads": 24,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "decode_weight_bytes": 15582020646,
+  "gemm_weight_bytes": 17036015616,
+  "linear_params": 4451116032,
+  "kv_bytes_per_pos_layer": 4096,
+  "prefill_chunk": 4096,
+  "attn_slots_global": 8,
+  "attn_slots_sliding": 40,
+  "sliding_window": 1024,
+  "_src": "make_lanes.py on Inkling-2-Mini@b85c3cfa61: decode = all matrices but the token embedding, experts x E[union of 8 tokens' top-8 of 128], layers 6-17 x3; gemm = the same without the head, every expert, loops once; linear_params = matrix elements per token without the head; kv = f16; attention layers [0, 1, 2]...[22, 23]; MTP layers [] excluded (not read when serving without MTP)"
+ },
+ "prefill_marker": "^g_attention_flash2",
+ "_prefill_marker_src": "the prefill attention kernel's name: submissions running it are prefill epochs (adapt to this kit's kernels)",
+ "prefill_min_tokens": 64,
+ "lanes": [
+  {
+   "lane": "decode: target weight matvecs",
+   "phase": "decode",
+   "regex": "^g_mv_|^g_head_mv(?!\\w*_p\\d+$)",
+   "floor": "decode_weights",
+   "_src": "g_head_mv_t*_q8 = @llm_verify on the target Q6_K head (1.043 GB)"
+  },
+  {
+   "lane": "decode: verify attention",
+   "phase": "decode",
+   "regex": "^g_attention_(vsplit|split|combine)$",
+   "floor": "decode_kv"
+  },
+  {
+   "lane": "decode: drafter",
+   "phase": "decode",
+   "regex": "^g_dfl_|^g_head_mv\\w*_p\\d+$|^g_gemm_",
+   "floor": "decode_drafter",
+   "_src": "g_head_mv_*_p40 = @llm_dflash_propose on the q4_0 proposal-head copy (pkg-u60kv2 llm.loom:146291); decode-phase GEMMs are the drafter's (per-step warm pass: g_gemm_q4_k_store/q6_k_store; the target decodes with matvecs)",
+   "submission_regex": "^g_dfl_(prepare|kv_store)$",
+   "_src_submission": "E163: the drafter's propose pass (opens with g_dfl_prepare, 131 dispatches) and its per-step warm pass (g_dfl_kv_store + the fc / K/V GEMMs, 21 dispatches) are submissions of their own; neither marker ever shares a submission with target attention (abba-u60x run 2: 95 + 117 submissions, none with vsplit or flash2). By name the lanes swapped call sites: the propose pass's g_mv_q4_k_* went to the target matvecs and the target's Q8_0 matvecs (ssm_alpha/beta, attn_k/v, attn_output, ssm_out) to the drafter"
+  },
+  {
+   "lane": "decode: GDN",
+   "phase": "decode",
+   "regex": "^g_gdn_",
+   "floor": "decode_gdn_state"
+  },
+  {
+   "lane": "decode: other (producers, rope, spec misc)",
+   "phase": "decode",
+   "regex": ".",
+   "floor": null,
+   "note": "ideal ~0 (fusion)"
+  },
+  {
+   "lane": "prefill: GEMMs (f16 WMMA)",
+   "phase": "prefill",
+   "regex": "^g_gemm_",
+   "floor": "prefill_linear"
+  },
+  {
+   "lane": "prefill: attention (flash2)",
+   "phase": "prefill",
+   "regex": "^g_attention_flash2",
+   "floor": "prefill_attn"
+  },
+  {
+   "lane": "prefill: weight dequant to f16 scratch",
+   "phase": "prefill",
+   "regex": "^g_deq16_",
+   "floor": "prefill_dequant",
+   "note": "design floor; ideal 0 (GEMM on quantized weights)"
+  },
+  {
+   "lane": "prefill: GDN",
+   "phase": "prefill",
+   "regex": "^g_gdn_",
+   "floor": null,
+   "note": "ideal ~0 next to the GEMMs"
+  },
+  {
+   "lane": "prefill: drafter context (DFlash warm)",
+   "phase": "prefill",
+   "regex": "^g_dfl_",
+   "floor": null,
+   "submission_regex": "^g_dfl_kv_store$",
+   "_src_submission": "E163: a prefill chunk's warm pass is its own submission (g_dfl_kv_store + the q4_k/q6_k m256 GEMMs); g_mv_q8_0 in flash2 epochs is the target's (ssm_alpha/beta)"
+  },
+  {
+   "lane": "prefill: other (producers, rope, matvec tails)",
+   "phase": "prefill",
+   "regex": ".",
+   "floor": null,
+   "note": "ideal ~0 (fusion)"
+  }
+ ]
+}

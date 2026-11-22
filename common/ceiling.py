@@ -36,7 +36,14 @@ def floor(kind, m, hw, context=0, prompt=0):
     if kind == "prefill_linear":
         return 2 * m["linear_params"] * prompt / peak
     if kind == "prefill_attn":   # causal: query i attends i + 1 keys; QK^T and PV are 2 FLOPs per multiply-add each
-        return 4 * m["attn_layers"] * m["q_heads"] * m["head_dim"] * (prompt * (prompt + 1) / 2) / peak
+        full = prompt * (prompt + 1) / 2
+        if "attn_slots_global" in m:   # hybrids: a sliding slot's query i attends min(i + 1, window) keys
+            w = m["sliding_window"]
+            win = w * (w + 1) / 2 + max(prompt - w, 0) * w if prompt > w else full
+            pairs = m["attn_slots_global"] * full + m["attn_slots_sliding"] * win
+        else:
+            pairs = m["attn_layers"] * full
+        return 4 * m["q_heads"] * m["head_dim"] * pairs / peak
     if kind is None:
         return None
     raise SystemExit(f"ceiling.py: unknown floor kind {kind!r}")
@@ -52,7 +59,11 @@ def main():
     m, hw = d["model"], d["hardware"]
     print(f"{m['name']} on {hw['name']}: {hw['bw_practical_gbs']} GB/s practical, {hw['wmma_f16_tflops']} TFLOP/s f16 WMMA")
     for ln in d["lanes"]:
-        f = floor(ln["floor"], m, hw, a.context, a.prompt)
+        try:
+            f = floor(ln["floor"], m, hw, a.context, a.prompt)
+        except KeyError as e:   # a new kit's lanes.json before every constant is known (common/new_kit.sh): say which one
+            print(f"  {ln['lane']:45s} floor unknown: lanes.json model has no {e.args[0]!r}")
+            continue
         unit = "ms/step" if ln["phase"] == "decode" else "s/prompt"
         print(f"  {ln['lane']:45s} " + (f"floor {f:9.2f} {unit}" if f is not None else "no floor (fixed cost: judge against 0)")
               + (f"  [{ln['note']}]" if ln.get("note") else ""))

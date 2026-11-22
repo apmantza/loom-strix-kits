@@ -23,12 +23,13 @@ def sha256(p):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("kit")
+    ap.add_argument("--variant", default=os.environ.get("KIT_VARIANT"), help="kits/<kit>/variants/<name>/pins.json instead of the kit's")
     ap.add_argument("--work", default=os.environ.get("WORK"))
     ap.add_argument("--verify-only", action="store_true")
     a = ap.parse_args()
     kd = os.path.join(HERE, "..", "kits", a.kit)
     work = a.work or kd
-    pins = json.load(open(os.path.join(kd, "pins.json")))
+    pins = json.load(open(os.path.join(kd, *(["variants", a.variant] if a.variant else []), "pins.json")))
     bad = 0
     for f in pins["files"]:
         dest = os.path.join(work, f["dest"])

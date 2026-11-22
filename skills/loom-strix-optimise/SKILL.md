@@ -5,13 +5,15 @@ description: Push a Loom-served LLM on AMD Strix Halo (gfx1151) toward the hardw
 
 # Loom on Strix Halo: toward the hardware limits
 
-Plain markdown for any coding agent. The rules are in rules.md (read sections 1, 2 and 6 first), the device facts in
+Plain markdown for any coding agent. The rules are in rules.md (read sections 1, 2 and 6 first), the tools by step in tools.md, the device facts in
 devices/gfx1151.md, the traps in gotchas.md, what the Loom SDK offers our kernels in loom-0.2-seams.md, and the model's own
 knowledge in kits/<kit>/NOTES.md. Commands below run from the repository root; `KIT` is a directory under kits/.
 Keep a log: one entry per try (what ran, where the data is, the result, the decision), refuted tries included.
 
 ## The loop
 
+0. **Weights and floors first.** `common/kit_check.sh KIT`: local files match pins.json, upstream freshness, and lanes.json
+   reproduces from the weights (`common/make_lanes.py`); a stale floor misranks every lane.
 1. **Scoreboard from serving, not from a bench.** `common/events_ab.sh KIT OUT LENGTH PKG` serves the package with a
    per-dispatch profile at a long prompt, then `common/events_summary.py kits/KIT/lanes.json RUN` prints every lane
    against its floor (common/ceiling.py). Cite the served prompt size it prints, not the label. Work on the lane with the
@@ -25,8 +27,9 @@ Keep a log: one entry per try (what ran, where the data is, the result, the deci
 5. **Prior art at the diagnosis step** (rules section 3), with the measured diagnosis in the brief; spot-check key claims.
 6. **Cheapest evidence first** (rules section 2): the compile report, `common/loop_census.py` (the hot loop from its
    backward branch: length, moves, waits), `common/load_cover.py` (where each load is waited), `common/compiler_ab.py`
-   (two compilers, every root); then a timing ablation; then the served binary (`common/serve_code_dump.py`) timed through
-   HIP; then a build.
+   (two compilers, every root), `loom-compile-report show/suggest` on a details report (wait reasons, copy waits, the LDS
+   bank model), Radeon GPU Analyzer for live registers; then a timing ablation; then the served binary (`common/serve_code_dump.py`) timed through
+   HIP, with rocprofv3 counters or thread trace on it when the question is about caches, LDS or stalls; then a build.
 7. **Change test-first.** Kernel cases that straddle every new boundary (`kit/make_kernel_tests.py`), then deliberate
    breaks of each new guard in the built program: a break that survives is a missing case.
 8. **Candidate check.** `common/build.sh KIT PKG` (EXTRA="SWITCH=1" for the candidate; the exact command lands in PKG.cmd),
@@ -35,6 +38,8 @@ Keep a log: one entry per try (what ran, where the data is, the result, the deci
    (`common/events_ab.sh KIT OUT LENGTH REF CAND CAND REF`) and the agent bench
    (`common/agent_ab.sh KIT REF CAND OUT SESSION`: its paired CI must exclude 1 and its neighbour rule must ACCEPT).
 9. **Adopt** only after both pass, with the rollback package named.
+10. **New weights** (another quant, a re-upload): `common/quant_eval.sh` against the reference quant, a `variants/<name>/` in the
+   kit, `KIT_VARIANT=<name> common/kit_check.sh`, then the same candidate check.
 
 ## Running long jobs
 

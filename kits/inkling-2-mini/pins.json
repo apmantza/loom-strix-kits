@@ -1,0 +1,46 @@
+{
+ "_doc": "What this kit was built and measured with. common/fetch.py downloads and verifies these; common/fresh.py compares them with upstream. Base = the native release (NVFP4 / MXFP8 experts, BF16 elsewhere); Unsloth's GGUFs are variants.",
+ "hrx_loom": "0.3.0",
+ "files": [
+  {
+   "repo": "thinkingmachines/Inkling-2-Mini",
+   "revision": "b85c3cfa615fc413cc9af3379f491b963f3b586a",
+   "path": "model-00001-of-00001.safetensors",
+   "sha256": "65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1",
+   "dest": "models",
+   "size": 19526019168
+  },
+  {
+   "repo": "thinkingmachines/Inkling-2-Mini",
+   "revision": "b85c3cfa615fc413cc9af3379f491b963f3b586a",
+   "path": "mtp.safetensors",
+   "sha256": "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2",
+   "dest": "models",
+   "size": 635801416
+  },
+  {
+   "repo": "thinkingmachines/Inkling-2-Mini",
+   "revision": "b85c3cfa615fc413cc9af3379f491b963f3b586a",
+   "path": "config.json",
+   "sha256": "e6c170c3fb666c50e3b509493b6b7a8f948b7d15",
+   "dest": "models",
+   "size": 2722
+  },
+  {
+   "repo": "thinkingmachines/Inkling-2-Mini",
+   "revision": "b85c3cfa615fc413cc9af3379f491b963f3b586a",
+   "path": "hf_quant_config.json",
+   "sha256": "ec915fa4d2b07bfe26240f71e981d34778022baf",
+   "dest": "models",
+   "size": 67924
+  },
+  {
+   "repo": "thinkingmachines/Inkling-2-Mini",
+   "revision": "b85c3cfa615fc413cc9af3379f491b963f3b586a",
+   "path": "tokenizer.json",
+   "sha256": "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6",
+   "dest": "tok",
+   "size": 26178678
+  }
+ ]
+}

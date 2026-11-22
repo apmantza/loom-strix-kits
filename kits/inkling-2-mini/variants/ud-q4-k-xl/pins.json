@@ -1,0 +1,22 @@
+{
+ "_doc": "Unsloth Inkling-2-Mini-UD-Q4_K_XL.gguf (root-folder layout: needs Unsloth's llama.cpp build for references; mainline reads Mainline_Support/)",
+ "hrx_loom": "0.3.0",
+ "files": [
+  {
+   "repo": "unsloth/Inkling-2-Mini-GGUF",
+   "revision": "45fd08764f2b0bf16b03a5483a80e5c7aaec8772",
+   "path": "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+   "sha256": "e62d463c135ffe283df8d94b279a96ca145ac128b52ce854478613045bf4de15",
+   "dest": "models",
+   "size": 17629759456
+  },
+  {
+   "repo": "thinkingmachines/Inkling-2-Mini",
+   "revision": "b85c3cfa615fc413cc9af3379f491b963f3b586a",
+   "path": "tokenizer.json",
+   "sha256": "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6",
+   "dest": "tok",
+   "size": 26178678
+  }
+ ]
+}

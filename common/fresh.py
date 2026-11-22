@@ -68,9 +68,10 @@ def installed_version(venv):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("kit")
+    ap.add_argument("--variant", default=os.environ.get("KIT_VARIANT"), help="kits/<kit>/variants/<name>/pins.json instead of the kit's")
     ap.add_argument("--venv", default=os.environ.get("VENV"))
     a = ap.parse_args()
-    pins = json.load(open(os.path.join(HERE, "..", "kits", a.kit, "pins.json")))
+    pins = json.load(open(os.path.join(HERE, "..", "kits", a.kit, *(["variants", a.variant] if a.variant else []), "pins.json")))
     lines, stale, broken = check(pins, installed_version(a.venv))
     for x in lines:
         print(x)

@@ -10,6 +10,11 @@ lsk_load() {   # KIT
   [ -f "$KD/kit.env" ] || die "no kit manifest $KD/kit.env"
   local e=${LSK_ENV:-$HOME/.config/loom-strix-kits/env}
   set -a; [ -f "$e" ] && . "$e"; . "$KD/kit.env"; set +a
+  # a quant variant (kits/<kit>/variants/<name>/: its own pins.json and config.json) replaces the kit's weights and config
+  if [ -n "${KIT_VARIANT:-}" ]; then
+    [ -d "$KD/variants/$KIT_VARIANT" ] || die "no variant $KD/variants/$KIT_VARIANT"
+    [ -f "$KD/variants/$KIT_VARIANT/config.json" ] && KIT_CONFIG=variants/$KIT_VARIANT/config.json
+  fi
   WORK=${WORK:-$KD}; PORT=${PORT:-8160}; PYTHON=${PYTHON:-python3}
   KIT_SRC=${KIT_SRC:-$LSK/kit}; STATE=${STATE:-$WORK/state}
   LOOM_SERVE=${LOOM_SERVE:-${VENV:+$VENV/bin/}loom-serve}

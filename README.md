@@ -28,7 +28,7 @@ The weights are never redistributed; each kit downloads them from their original
 | Kit | Model | Weights | State |
 |---|---|---|---|
 | [qwen38-27b](kits/qwen38-27b/) | Qwen3.8-27B (hybrid Gated DeltaNet + attention, DFlash2 speculative decoding) | unsloth UD-Q4_K_XL GGUF | used daily for agent work; tuning ongoing |
-| inkling-2-mini | Thinking Machines Inkling 2 Mini (26B MoE, ~3.4B active, looped layers) | to be decided: native NVFP4/MXFP8 or unsloth GGUF | planned |
+| [inkling-2-mini](kits/inkling-2-mini/) | Thinking Machines Inkling 2 Mini (26B MoE, ~3.4B active, looped layers) | native NVFP4/MXFP8 release; Unsloth GGUFs as variants | scoping (NOTES.md) |
 
 ## Requirements
 
@@ -65,6 +65,8 @@ common/serve.sh qwen38-27b pkg                        # OpenAI-compatible API, t
 | `common/fresh.py KIT` | is the kit still current: installed and measured hrx-loom against PyPI, each pinned file's sha256 against its repository's main (exit 1 stale, 2 check failed) |
 | `common/new_kit.sh NAME MODEL_ID` | scaffolds `kits/NAME/` (manifest, pins, lanes, notes, fetch wrapper) |
 | `common/make_lanes.py WEIGHTS` | the floors' model constants from a GGUF or safetensors header (local or remote): bytes per decode step (MoE: the experts a verify step's tokens touch; looped layers; MTP and vision excluded), multiply-adds, KV slots for hybrid attention |
+| `common/kit_check.sh KIT` | the weights gate: files match the pins, upstream freshness, lanes.json reproduces from the weights |
+| `common/quant_eval.sh REF CAND OUT` | KL divergence, same top token and perplexity of a quant against a reference quant (llama.cpp) |
 | `common/fetch.py KIT` | downloads the kit's pinned files (`kits/<kit>/pins.json`) and verifies every sha256 |
 | `common/checks.py` | A/B verdict checks (paired bootstrap CI, ABBA neighbour rule), a loop flag, GPU memory per process from fdinfo |
 

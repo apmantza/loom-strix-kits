@@ -64,6 +64,9 @@ for a fraction of the next one's cost.
 - **Measure on a quiet machine**: no build, compile or second server beside a profile (a CPU build during a profile moved GEMM
   time 123 -> 131 s). common/wait_quiet.sh waits builds out; common/build.sh refuses during a measurement.
 
+- **Search before building a tool**: Loom's own tools and docs workflows, installed packages, the ROCm and llama.cpp builds
+  (tools.md lists them by step). In one session a remote safetensors reader, a hand bank-conflict analysis and a KL-divergence
+  path were each about to be written while huggingface_hub, Loom's compile report and llama-perplexity already did them.
 - **Plateau rule**: after three levers in a row land inside noise, stop and write a ranked status of the remaining levers, each with
   its price and the evidence behind it, before starting a fourth (E212, from sybil-solutions/inference-optimisation-skill).
 - **Never park an experiment without its root cause**. "Slower, unexplained" or "held back by X" is not a
