@@ -54,8 +54,9 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
 - Unsloth UD-Q8_K_XL keeps the native NVFP4 experts of layers 0-19 (llama.cpp has an NVFP4 type), with each expert's amax and
   outer denominator folded into one f32 `.scale`; the MXFP8 experts of layers 20-23 become **BF16** (2x their native bytes).
   So only the native route keeps those experts 8-bit.
-- Still to check on values (fetch a byte range, no full download): the norms' prep (copy or add1), the `.scale` formula, and
-  whether the converter de-interleaves w13's gate and up rows.
+- Checked on values (byte ranges of the native file, ~220 KB, against UD-Q8_K_XL; exact everywhere): norms are copied as stored
+  (no +1); the GGUF's NVFP4 `.scale` = amax / outer denominator (2688 = 6 x 448); native w13 rows interleave gate and up (even =
+  gate) and the GGUF de-interleaves them, for NVFP4 and MXFP8 alike; the GGUF's BF16 MXFP8 experts are a lossless upcast.
 - Prior art on this ROCm: hipBLASLt 10.2 ships hand-written gfx1151 kernels for 4-bit-weight GEMMs with bf16/fp16 activations.
 - References: Unsloth's official gfx1151 build of its fork (b12588-mix-c0c3de8, release asset, digest checked).
 

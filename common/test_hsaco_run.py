@@ -96,6 +96,17 @@ def main():
                 hr.pack_kernargs(m, alias, s2, p2); ok(False, f"packer refuses an argument {what}")
             except SystemExit:
                 ok(True, f"packer refuses an argument {what}")
+    # 4. file fill (a launch's metadata packets): bytes in order, zero-padded, oversize refused. Recurrence: a packet file
+    #    longer than its buffer silently truncated would launch the head kernel with a wrong span count.
+    import numpy as np, tempfile
+    with tempfile.TemporaryDirectory() as t:
+        p = os.path.join(t, "m.bin"); np.array([8, 0, 0, 0, 1], np.int32).tofile(p)
+        b = hr.fill(32, "file:" + p, np.random.default_rng(0))
+        ok(list(b[:20].view(np.int32)) == [8, 0, 0, 0, 1] and not b[20:].any() and len(b) == 32, "file fill keeps the bytes and zero-pads")
+        try:
+            hr.fill(16, "file:" + p, np.random.default_rng(0)); ok(False, "file fill refuses a file larger than its buffer")
+        except SystemExit:
+            ok(True, "file fill refuses a file larger than its buffer")
     sys.exit(1 if fails else 0)
 
 

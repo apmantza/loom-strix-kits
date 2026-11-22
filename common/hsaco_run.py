@@ -11,7 +11,7 @@ What it reads instead of being told:
     indirect grid read from a buffer, a select) is refused: pass --grid X,Y,Z;
   - the device signature (`} launch(...)`) names scalars and buffers: --scalar and --buf accept the source names (k_arg or k)
     or the metadata names (k, binding2).
-Buffers: --buf NAME=BYTES[:FILL], FILL = zero | f16u | f32u | u8 (uniform: f16/f32 in [-1, 1], bytes 0..255; constant operands
+Buffers: --buf NAME=BYTES[:FILL], FILL = zero | f16u | f32u | u8 | file:PATH (uniform: f16/f32 in [-1, 1], bytes 0..255; raw file bytes, zero-padded; constant operands
 raise clocks on this power-limited chip, E15) | byte:0xNN | f32:VALUE. Every buffer the kernel takes must be given (fail closed).
 --compare NAME[:f32|f16] after one launch per object: bytes equal, else the max absolute difference (exit 1 when they differ).
 usage: hsaco_run.py [--loom FILE --workload k=v,...] [--grid X,Y,Z] --kernel NAME [--scalar k=v ...] --buf NAME=BYTES[:FILL] ...
@@ -137,7 +137,12 @@ def fill(nbytes, how, rng):
         return np.full(nbytes, int(val, 0), np.uint8)
     if kind == "f32":
         return np.full(nbytes // 4, float(val), np.float32).view(np.uint8)
-    sys.exit(f"unknown fill {how} (zero | f16u | f32u | u8 | byte:0xNN | f32:VALUE)")
+    if kind == "file":                                    # raw bytes (e.g. a launch's metadata packets), zero-padded
+        b = np.fromfile(val, np.uint8)
+        if len(b) > nbytes:
+            sys.exit(f"fill {how}: {len(b)} bytes do not fit the {nbytes}-byte buffer")
+        return np.concatenate([b, np.zeros(nbytes - len(b), np.uint8)])
+    sys.exit(f"unknown fill {how} (zero | f16u | f32u | u8 | byte:0xNN | f32:VALUE | file:PATH)")
 
 
 def pack_kernargs(meta, alias, scalars, pointers):

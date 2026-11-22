@@ -1,6 +1,6 @@
 {
  "family": "inkling2",
- "doc": "HF Inkling2Loop (Thinking Machines Inkling 2 Mini; text model only, model.llm.*) -> internal names = llama.cpp's inkling2 GGUF names (unsloth b12588-mix), so the native and GGUF routes share one vocabulary. Read by kit/test_hf_names_inkling2.py for coverage (each text key maps once, each GGUF name has an entry); not yet by inspect_safetensors.py, which has no MoE, loop or NVFP4 path. `prep` as in qwen35.json; `shape: true` = conv1d [C, 1, K] -> [K, C]; `transpose: true` = the converter transposes the matrix (internal shape = the HF shape, not its reverse); `verify` = a value-level fact not yet checked against the GGUF. The vision tower (model.visual.*) and mtp.safetensors (DSpark) are out of scope here.",
+ "doc": "HF Inkling2Loop (Thinking Machines Inkling 2 Mini; text model only, model.llm.*) -> internal names = llama.cpp's inkling2 GGUF names (unsloth b12588-mix), so the native and GGUF routes share one vocabulary. Read by kit/test_hf_names_inkling2.py for coverage (each text key maps once, each GGUF name has an entry); not yet by inspect_safetensors.py, which has no MoE, loop or NVFP4 path. `prep` as in qwen35.json; `shape: true` = conv1d [C, 1, K] -> [K, C]; `transpose: true` = the converter transposes the matrix (internal shape = the HF shape, not its reverse); The vision tower (model.visual.*) and mtp.safetensors (DSpark) are out of scope here.",
  "architectures": [
   "Inkling2LoopForConditionalGeneration"
  ],
@@ -53,16 +53,14 @@
   },
   "token_embd_norm.weight": {
    "hf": "model.llm.embed_norm.weight",
-   "prep": "copy",
-   "verify": "copy vs add1: compare with the GGUF's token_embd_norm"
+   "prep": "copy"
   },
   "output.weight": {
    "hf": "model.llm.unembed.weight"
   },
   "output_norm.weight": {
    "hf": "model.llm.norm.weight",
-   "prep": "copy",
-   "verify": "copy vs add1"
+   "prep": "copy"
   },
   "output_res_query.weight": {
    "hf": "model.llm.attn_res.output_query"
@@ -133,8 +131,7 @@
    },
    "ffn_norm.weight": {
     "hf": "mlp_norm.weight",
-    "prep": "copy",
-    "verify": "copy vs add1"
+    "prep": "copy"
    },
    "ffn_gate_inp.weight": {
     "hf": "mlp.gate.weight",
@@ -147,8 +144,7 @@
   "local": {
    "attn_norm.weight": {
     "hf": "attn_norm.weight",
-    "prep": "copy",
-    "verify": "copy vs add1"
+    "prep": "copy"
    },
    "attn_k_conv.weight": {
     "hf": "attn.k_sconv.weight",
@@ -164,18 +160,15 @@
   "global": {
    "attn_q_inp_norm.weight": {
     "hf": "q_input_norm.weight",
-    "prep": "copy",
-    "verify": "copy vs add1"
+    "prep": "copy"
    },
    "attn_k_inp_norm.weight": {
     "hf": "k_input_norm.weight",
-    "prep": "copy",
-    "verify": "copy vs add1"
+    "prep": "copy"
    },
    "attn_v_inp_norm.weight": {
     "hf": "v_input_norm.weight",
-    "prep": "copy",
-    "verify": "copy vs add1"
+    "prep": "copy"
    },
    "attn_k_conv.weight": {
     "hf": "attn.k_sconv.static_w",
@@ -233,13 +226,12 @@
    }
   },
   "nvfp4": {
-   "_doc": "NVFP4 (modelopt layout): U8 = two e2m1 per byte, F8_E4M3 scale per 16 values, per-expert F32 amax and one outer-scale denominator; GGUF folds amax and the denominator into one F32 .scale per expert (formula: verify). w13 = gate and up rows interleaved (Inkling's reference): whether the GGUF converter de-interleaves them: verify; `gguf_scale` names that derived GGUF tensor (F32 [128]), from amax and outer",
+   "_doc": "NVFP4 (modelopt layout): U8 = two e2m1 per byte (even element in the low nibble), F8_E4M3 scale per 16 values, per-expert F32 amax and one outer-scale denominator (2688 = 6 x 448); value = e2m1 x scale16 x amax / outer. GGUF (ggml NVFP4, 64-value blocks of 4 ue4m3 scales + 32 code bytes) keeps the per-16 scales and folds amax / outer into one F32 .scale per expert (`gguf_scale`). w13 rows interleave gate and up (even = gate); the GGUF converter de-interleaves them (gate rows first)",
    "ffn_gate_up_exps.weight": {
     "hf": "mlp.experts.w13_weight",
     "scale": "mlp.experts.w13_weight_scale",
     "amax": "mlp.experts.w13_weight_amax",
     "outer": "mlp.experts.w13_weight_outer_scale_denominator",
-    "verify": "gate/up row order; .scale formula",
     "gguf_scale": "ffn_gate_up_exps.scale"
    },
    "ffn_down_exps.weight": {
@@ -247,21 +239,20 @@
     "scale": "mlp.experts.w2_weight_scale",
     "amax": "mlp.experts.w2_weight_amax",
     "outer": "mlp.experts.w2_weight_outer_scale_denominator",
-    "verify": ".scale formula",
     "gguf_scale": "ffn_down_exps.scale"
    }
   },
   "mxfp8": {
-   "_doc": "MXFP8: F8_E4M3 values, U8 E8M0 scale per 32. Unsloth's GGUFs carry these experts as BF16 (upcast), so the native route is the only one that keeps them 8-bit",
+   "_doc": "MXFP8: F8_E4M3 values, U8 E8M0 scale per 32 (value = e4m3 x 2^(e8m0 - 127)); w13 rows interleave gate and up as in NVFP4. Unsloth's GGUFs carry these experts as BF16 (lossless upcast, de-interleaved), so the native route is the only one that keeps them 8-bit",
    "ffn_gate_up_exps.weight": {
     "hf": "mlp.experts.w13_weight",
-    "scale": "mlp.experts.w13_weight_scale",
-    "verify": "gate/up row order"
+    "scale": "mlp.experts.w13_weight_scale"
    },
    "ffn_down_exps.weight": {
     "hf": "mlp.experts.w2_weight",
     "scale": "mlp.experts.w2_weight_scale"
    }
   }
- }
+ },
+ "value_checks": "Checked 11-22 on values (byte-range reads of the native file against the Unsloth UD-Q8_K_XL GGUF): norms are copied as stored (bf16 -> f32, no +1; exact on embed_norm, norm, layer 0 attn/mlp norms); the GGUF's per-expert NVFP4 .scale = amax / outer_scale_denominator exactly (the denominator is 2688 = 6 x 448); native NVFP4 bytes hold the even element in the low nibble; native w13 rows interleave gate and up (even = gate, odd = up) and the GGUF de-interleaves them (gate rows 0-1151, up 1152-2303), for NVFP4 (layer 0) and MXFP8 (layer 20) alike, exact; the GGUF's BF16 copy of the MXFP8 experts is lossless."
 }
