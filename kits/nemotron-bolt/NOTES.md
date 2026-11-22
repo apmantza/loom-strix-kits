@@ -152,7 +152,10 @@ Q4 recipes read more bytes for no measured gain.
    their signs applied on 32-bit words, the sign table computed from parity, one scale per 32 values) and a single-token probe
    matvec with the 2 KB grid read from constant memory or staged in LDS: both compile on Loom 0.2.0 and 0.3.0 for gfx1151
    (225 / 230 instructions, 37 / 30 VGPRs, 8 dot4, no lint flag; kit/test_iq2xxs.py). Which grid placement is faster is a GPU
-   question. Remaining in step 1: a nemotron_h_moe name map from the GGUF tensor table; one
+   question. Also started: kit/gen_mamba2.py, a Mamba-2 decode step in llama.cpp's operation order (softplus, scalar decay per
+   head, state row split over 8 lanes with a xor-shuffle sum, D added after): 186 instructions, 80 VGPRs, 16 waves, the state
+   read and written once (4 MiB each way per layer: a ~37 us per layer, ~1.5 ms per token floor at f32), lint-clean on 0.2.0
+   and 0.3.0 (kit/test_mamba2.py). Remaining in step 1: a nemotron_h_moe name map from the GGUF tensor table; one
    IQ2_XXS probe matvec (grid + sign lookups to int8 for dot4, as gen_nvfp4's probe) and one Mamba-2 decode-step probe adapted
    from gen_gdn's recurrence, compiled for gfx1151 with the kernel lint, to see VALU per value and register cost.
 2. Reference on the machine (a 24 GB download, a short GPU window beside live): llama.cpp main built for gfx1151 with the
