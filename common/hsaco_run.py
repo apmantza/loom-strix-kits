@@ -301,6 +301,9 @@ def main():
         sz, _, how = rest.partition(":")
         bufspec[n] = (int(float(sz)), how or "zero")
     print(f"kernel {a.kernel}: grid {grid} x workgroup {block}; kernarg {metas[0]['.kernarg_segment_size']} B")
+    import glob as _g
+    lv = sorted({open(f).read().strip() for f in _g.glob("/sys/class/drm/card*/device/power_dpm_force_performance_level")}) or ["unknown"]
+    print(f"  power level {'/'.join(lv)}" + ("" if lv == ["auto"] else "  ** NOT the serving level (auto): times here need not hold in service (HRX-like E300) **"))
     if a.loom:                                            # buffers too small for the kernel's own views refuse before any launch
         need, skipped = view_needs(open(a.loom).read(), a.kernel, {**kv(a.workload), **scalars})
         short = [f"{k}: {bufspec[k][0]} B given, {v[1]} needs {v[0]} B" for k, v in sorted(need.items()) if k in bufspec and bufspec[k][0] < v[0]]
