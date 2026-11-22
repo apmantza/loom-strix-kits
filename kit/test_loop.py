@@ -5,6 +5,10 @@
     decode cost a GDN second state pass showed, E185). D's rows are read once (36 128-bit loads per row per lane in the row loop), G and
     F once (H / 256 outputs x rank / 16 chunks x 2 matrices x 4 loads);
   - the kernel spilling or scalarised (E230 shapes): it compiles for gfx1151 with no lint flag and no scratch.
+depth_mix (the block attention residuals, loop messages and output query; ~100 calls per decode token):
+  - a state read more than once ((S + NQ) x H / 256 loads per lane);
+  - one workgroup reduction (two barriers) per sum: the first form had S + S x NQ of them (40 barriers at S 5, NQ 3) serialised on
+    the decode path; the batched form has two.
 The arithmetic gets a GPU value test against llama.cpp's control() later.
 usage: python3 kit/test_loop.py   (needs loom-compile: VENV)"""
 import os
@@ -43,6 +47,21 @@ def main():
         want = 2 * H // (32 * 4) + 2 * (H // 256) * (rank // 16) * 4
         ok(b128 == want, f"controller weights read once: {b128} 128-bit loads (want {want}: D row loop {2 * H // 128}, G and F {want - 2 * H // 128})")
         ok(not x["flags"] and not x["scratch"], f"no lint flag ({x['flags']}), no scratch, {x['vgpr']} VGPRs, {x['waves']} waves")
+        for S, NQ in ((5, 3), (5, 4), (2, 1)):
+            p = os.path.join(t, f"m{S}{NQ}.loom")
+            open(p, "w").write("target.decl @device\namdgpu.target<gfx11-generic> @rdna3\n" + gen_loop.depth_mix(H, S, NQ))
+            o = os.path.join(t, f"m{S}{NQ}.hsaco")
+            r = subprocess.run([kl.loom_compile(), p, "--target=amdgpu:gfx1151", f"--root=g_depth_mix_s{S}_q{NQ}", f"--output={o}",
+                                "--compile-report=summary", f"--compile-report-output={o[:-6]}.json"], capture_output=True, text=True)
+            if r.returncode:
+                sys.exit(f"FAIL compile mix {S} {NQ}: {r.stderr.strip()[:300]}")
+            ins = kl.disasm(o)[0]
+            x = kl.lint(o)
+            loads = sum(1 for i in ins if i.startswith("global_load"))
+            bars = sum(1 for i in ins if i.startswith("s_barrier"))
+            ok(loads == (S + NQ) * (H // 256) and bars == 2 and not x["flags"] and not x["scratch"],
+               f"depth_mix S {S} NQ {NQ}: {loads} loads (want {(S + NQ) * (H // 256)}: states once), {bars} barriers (want 2), "
+               f"flags {x['flags']}, {x['vgpr']} VGPRs, {x['waves']} waves")
     sys.exit(1 if fails else 0)
 
 

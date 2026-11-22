@@ -109,6 +109,8 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    **Loop (22 Nov)**: every pass restarts from the prelude output; passes 2-3 mix a message (depth attention over the previous
    pass's block states) into each core layer's q, k, v and FFN inputs through a controller, out = cur - tanh(F z) cur +
    tanh(G z) msg, z = D [rms(cur); rms(msg)] (rank 64, f32 weights, ~226 MB per token). kit/gen_loop.py has the controller kernel
-   (weights read once per token, 176 VGPRs, lint-clean; kit/test_loop.py). Still to write: the message mix (shared with the block
-   attention residuals), the 48-slot schedule in the program, a multi-token controller for verify spans.
+   (weights read once per token, 176 VGPRs, lint-clean; kit/test_loop.py) and the depth-attention mix shared by the block attention
+   residuals, the loop messages and the output query (gen_loop.depth_mix: states RMS-normalised, softmax over learned-query scores,
+   the normalised states mixed; each state read once, two barriers per call). Still to write: the 48-slot schedule in the program, a
+   multi-token controller for verify spans.
 4. Weights route: UD-Q4_K_XL chosen 22 Nov (see Weights); confirm with our own KLD run against UD-Q8_K_XL (step 2).
