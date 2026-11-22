@@ -3,7 +3,7 @@
 this census six times by hand). Every loop is a backward branch [target, branch]; for each loop holding WMMAs:
 length, WMMAs, v_mov (v_dual_mov halves counted), scratch ops, vmcnt waits, and the runs of >= RUN consecutive moves with their
 offset in the loop and their first/last instruction, so a reader can place them (before the back-edge, at a branch join, in a
-rare path). Also the shared helpers of scripts/compiler_ab.py (disasm, hot_loop, cover).
+rare path). Also the shared helpers of kernel_lint.py, load_events.py and load_cover.py (disasm, loops, hot_loop, cover).
 usage: loop_census.py HSACO [HSACO ...] [--run 4] [--all]   (--all: loops without WMMAs too)"""
 import argparse
 import os

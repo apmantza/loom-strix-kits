@@ -12,6 +12,9 @@
   - a regression against another build missed (E226 0.3.0's longer loop and move run, E230 a new spill, E236 fewer waves);
   - launch sites miscounted (E241: launches without a grid were missed): direct launches with and without a grid, through
     dual-target selectors, and none inside template bodies;
+  - report columns read from the wrong place: LDS bank extra rounds from the summary report's gfx1151 model (E243: the 256-row
+    GEMMs' activation staging store, 48 extra rounds), each kernel's served ms from a profile run, a load's distance to its wait
+    and the loads still in flight at the back-edge (E109);
   - the outer shell of a nested loop taken as the hot loop (E237: the 16-token swiglu matvecs were flagged `select` for
     their outer loop's selects while the dot4s sat in the inner loop): the inner loop must be chosen, nothing flagged.
 usage: python3 kit/test_kernel_lint.py   (needs loom-compile: VENV from the environment or the machine env file)"""
@@ -109,6 +112,25 @@ def main():
     s2 = kl.launch_sites([prog])
     ok((s2["g_k1"], s2["g_k2"], s2["g_k3"], s2.get("g_k4", 0)) == (2, 1, 1, 0),
        f"launch sites: selectors 2, grid launch 1, gridless launch 1, none 0 ({dict(s2)})")
+    import json, tempfile as tf
+    with tf.TemporaryDirectory() as t:
+        js = os.path.join(t, "k.json")
+        json.dump({"source_low": {"memory": {"bank_service": {"structural": {"conflicted_packet_count": 4, "extra_round_count": 48}}}}}, open(js, "w"))
+        ok(kl.bank(js) == (4, 48), f"bank: conflicted packets and extra rounds from the report ({kl.bank(js)})")
+        ok(kl.bank(os.path.join(t, "none.json")) == (None, None), "bank: no report, no figure")
+        run = os.path.join(t, "run"); os.makedirs(run)
+        with open(os.path.join(run, "events.jsonl"), "w") as f:
+            for k, ns in (("g_a", 2_000_000), ("g_a", 1_000_000), ("g_b", 500_000)):
+                f.write(json.dumps({"type": "dispatch_event", "valid": True, "key": k, "duration_ns": ns}) + "\n")
+            f.write(json.dumps({"type": "dispatch_event", "valid": False, "key": "g_a", "duration_ns": 9_000_000}) + "\n")
+        open(os.path.join(run, "x.req.json"), "w").write(json.dumps({"requests": [{"prompt_tokens": 81430}]}))
+        ms, prompt = kl.served_ms(run)
+        ok(ms == {"g_a": 3.0, "g_b": 0.5} and prompt == 81430, f"served ms per kernel from valid events only ({dict(ms)}, {prompt})")
+    pf = ["s_mov_b32 s0, 0", "global_load_b128 v[1:4], v0, s[2:3]", "global_load_b128 v[5:8], v0, s[2:3]"] + \
+         ["v_dot4_i32_iu8 v9, v10, v11, v9"] * 6 + ["s_waitcnt vmcnt(1)", "v_add_nc_u32_e32 v1, v1, v2"]
+    pf.append(back(len(pf), 1))
+    r = kl.lint_listing("cover", *listing(pf))
+    ok(r["cover_min"] == 8 and r["in_flight"] == 1, f"load cover: first load retired 8 instructions after issue, one in flight at the back-edge ({r['cover_min']}, {r['in_flight']})")
     sys.exit(1 if fails else 0)
 
 

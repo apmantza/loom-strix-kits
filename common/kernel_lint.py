@@ -19,10 +19,12 @@ Reported, not flagged: non-MMA instructions per MMA, moves, VGPRs, waves/SIMD, V
 its first WMMA), and with --package the kernel's launch sites in the package. Calibrated on 225 served kernels (E237 / E241):
 v_mul_lo_u32 (address math) and a drain alone are not defects.
 Decoding goes through loop_census.disasm (ROCm 10.2 llvm-objdump; it refuses undecoded words).
-usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--flagged] [--strict]
-       kernel_lint.py --package PKG --out DIR [--baseline DIR] [--jobs N] [--flagged] [--strict]
-         (--package compiles every gfx11 kernel root of PKG/program/*.loom with the machine's Loom into DIR first;
-          --strict: exit 1 when anything is flagged)"""
+Also reported: LDS waits (lgkmcnt) per MMA (E61), the shortest load-to-wait distance and the loads still in flight at the
+back-edge (E109), the extra LDS bank-service rounds of Loom's gfx1151 bank model, and with --profile each kernel's served ms.
+usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--profile RUN] [--flagged] [--strict]
+       kernel_lint.py --package PKG | --program FILE.loom ... --out DIR [--loom-compile PATH] [--roots REGEX] [--jobs N] [...]
+         (compiles every gfx11 kernel root into DIR first; two compilers: run twice with --loom-compile and pass the first
+          run's DIR as --baseline of the second; --strict: exit 1 when anything is flagged)"""
 import argparse
 import collections
 import concurrent.futures
@@ -35,7 +37,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from loop_census import disasm, loops, moves  # noqa: E402
+from loop_census import cover, disasm, loops, moves  # noqa: E402
 
 FLAGS = ("select", "repack", "scratch", "copies", "outlier")
 MM = ("v_wmma", "v_dot4", "v_dot2", "v_dot8")
@@ -105,9 +107,19 @@ def residency(js):
             lim.get("reduction_units_to_next_better_tier"))
 
 
+def bank(js):
+    """(conflicted LDS packets, extra bank-service rounds) from a Loom summary report's gfx1151 bank model, or Nones"""
+    if not os.path.exists(js):
+        return None, None
+    st = ((((json.load(open(js)).get("source_low") or {}).get("memory") or {}).get("bank_service") or {}).get("structural") or {})
+    return st.get("conflicted_packet_count"), st.get("extra_round_count")
+
+
 def lint(path):
     ins, addr = disasm(path)
-    return lint_listing(os.path.basename(path)[:-6], ins, addr, residency(path[:-6] + ".json"))
+    r = lint_listing(os.path.basename(path)[:-6], ins, addr, residency(path[:-6] + ".json"))
+    r["bank_conf"], r["bank_extra"] = bank(path[:-6] + ".json")
+    return r
 
 
 def lint_listing(name, ins, addr, res=(None, None, None)):
@@ -130,6 +142,10 @@ def lint_listing(name, ins, addr, res=(None, None, None)):
              scratch=sum(1 for x in full if "scratch_" in x))
     per = mm or dot
     r["other_per_op"] = round((len(b) - per) / per, 1) if per else None   # common path
+    lgkm = sum(1 for x in b if x.startswith("s_waitcnt") and "lgkmcnt" in x)
+    r["lds_waits_per_op"] = round(lgkm / per, 2) if per else None      # E61: lgkmcnt(0) after each LDS read pair before the MMAs
+    cv, pend = cover(full, 0, len(full) - 1)
+    r["cover_min"], r["in_flight"] = (min(cv) if cv else None), pend     # E109: loads waited right after issue; carried across
     if r["select"] >= 0.25 * len(b):
         r["flags"].append("select")
     if r["pk"] >= 8 and r["bfe"] >= 32:
@@ -214,17 +230,18 @@ def launch_sites(texts):
     return sites
 
 
-def compile_package(pkg, out, jobs):
-    """every gfx11 kernel root of PKG/program/*.loom compiled into OUT (code object + summary report); returns the program
-    texts and the roots that failed to compile standalone (named, never hidden)"""
-    lc = loom_compile()
+def compile_programs(progs, out, jobs, lc=None, roots=None):
+    """every gfx11 kernel root (matching ROOTS, a regex) of the program files compiled into OUT (code object + summary report)
+    with loom-compile LC (default: the machine's); returns the program texts and the roots that failed to compile standalone
+    (named, never hidden)"""
+    lc = lc or loom_compile()
     os.makedirs(out, exist_ok=True)
     texts, work = [], []
-    for prog in sorted(glob.glob(os.path.join(pkg, "program", "*.loom"))):
+    for prog in progs:
         t = open(prog).read()
         texts.append(t)
         for k in sorted(set(re.findall(r'(?m)^kernel\.def (?:target\(@\w+\) )?export\("(\w+)"\)', t))):
-            if not k.endswith("_rdna4"):
+            if not k.endswith("_rdna4") and (roots is None or re.search(roots, k)):
                 work.append((prog, k))
     def one(pk):
         prog, k = pk
@@ -239,23 +256,43 @@ def compile_package(pkg, out, jobs):
     return texts, failed
 
 
+def served_ms(run):
+    """kernel -> served milliseconds in a profiled run (common/events_summary.py's loader: iree-profile dispatch events of one
+    served request), and the run's prompt size"""
+    import events_summary
+    ev, prompt = events_summary.load(run)
+    ms = collections.Counter()
+    for e in ev:
+        ms[e["key"]] += e["duration_ns"] / 1e6
+    return ms, prompt
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="*")
     ap.add_argument("--package", help="a package directory: compile its kernel roots into --out first")
-    ap.add_argument("--out", help="with --package: where the code objects go")
+    ap.add_argument("--program", action="append", default=[], help="a program file to compile into --out first (repeatable)")
+    ap.add_argument("--out", help="with --package / --program: where the code objects go")
+    ap.add_argument("--loom-compile", help="the compiler for --package / --program (default: the machine's VENV); two runs with "
+                                           "different compilers plus --baseline compare two Loom versions on the same kernels")
+    ap.add_argument("--roots", help="with --package / --program: only kernel roots matching this regex")
+    ap.add_argument("--profile", help="a served profile run directory (events.jsonl + *.req.json): each kernel's served ms, and "
+                                      "flagged kernels ordered by it")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--baseline", help="a directory of the same kernels from another build: flag what got worse")
     ap.add_argument("--flagged", action="store_true", help="print flagged kernels only")
     ap.add_argument("--strict", action="store_true", help="exit 1 when any kernel is flagged")
     a = ap.parse_args()
     sites, failed = None, []
-    if a.package:
+    progs = sorted(glob.glob(os.path.join(a.package, "program", "*.loom"))) if a.package else []
+    progs += a.program
+    if progs:
         if not a.out:
-            sys.exit("kernel_lint: --package needs --out")
-        texts, failed = compile_package(a.package, a.out, a.jobs)
+            sys.exit("kernel_lint: --package / --program need --out")
+        texts, failed = compile_programs(progs, a.out, a.jobs, a.loom_compile, a.roots)
         sites = launch_sites(texts)
         a.paths = [a.out] + a.paths
+    ms, prompt = served_ms(a.profile) if a.profile else ({}, None)
     files = []
     for p in a.paths:
         files += sorted(glob.glob(os.path.join(p, "*.hsaco"))) if os.path.isdir(p) else [p]
@@ -268,16 +305,18 @@ def main():
             b = os.path.join(a.baseline, r["kernel"] + ".hsaco")
             if os.path.exists(b):
                 r["flags"] += ["regress:" + x for x in regressions(r, lint(b))]
-    rows.sort(key=lambda r: (-len(r["flags"]), -(sites or {}).get(r["kernel"], 0), r["kernel"]))
+    rows.sort(key=lambda r: (-bool(r["flags"]), -ms.get(r["kernel"], 0), -len(r["flags"]), -(sites or {}).get(r["kernel"], 0), r["kernel"]))
     print(f"{'kernel':42s} {'where':>6s} {'loop':>5s} {'comm':>5s} {'mm':>4s} {'other/op':>8s} {'sel':>4s} {'pk':>3s} {'bfe':>4s} {'scr':>4s} {'mov':>4s} "
-          f"{'run':>4s} {'vgpr':>4s} {'w/S':>3s} {'next':>4s} {'pf':>5s} {'sites':>5s}  flags")
+          f"{'run':>4s} {'vgpr':>4s} {'w/S':>3s} {'next':>4s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
     for r in rows:
         if a.flagged and not r["flags"]:
             continue
         f = lambda v: "-" if v is None else str(v)
         s = "-" if sites is None else str(sites.get(r["kernel"], 0))
         print(f"{r['kernel']:42s} {r['where']:>6s} {r['loop']:5d} {r['common']:5d} {r['wmma'] or r['dot']:4d} {f(r['other_per_op']):>8s} {r['select']:4d} {r['pk']:3d} "
-              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {f(r['waves']):>3s} {f(r['to_next']):>4s} {r['pf']:>5s} {s:>5s}  "
+              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {f(r['waves']):>3s} {f(r['to_next']):>4s} {r['pf']:>5s} {s:>5s} "
+              f"{f(r['lds_waits_per_op']):>5s} {f(r['cover_min']):>4s} {r['in_flight']:3d} {f(r.get('bank_extra')):>5s} "
+              f"{('%.1f' % ms[r['kernel']]) if r['kernel'] in ms else '-':>8s}  "
               f"{' '.join(r['flags'])}")
     for k, (v, med, n) in sorted(outl.items()):
         print(f"outlier {k}: {v} non-MMA instructions per MMA vs a median of {med} over {n} peers")
@@ -286,6 +325,10 @@ def main():
         print(f"not launched in the package ({len(unl)}): {' '.join(unl)}")
     for k, why in failed:
         print(f"not compiled standalone: {k}: {why}")
+    if ms:
+        tot = sum(ms.values()); fl = sum(ms.get(r["kernel"], 0) for r in rows if r["flags"])
+        print(f"served profile {a.profile} ({prompt} prompt tokens): {tot / 1e3:.1f} s of dispatches; flagged kernels {fl / 1e3:.2f} s "
+              f"({100 * fl / tot:.1f} %)")
     flagged = sum(1 for r in rows if r["flags"])
     print(f"kernel_lint: {len(rows)} kernels, {flagged} flagged" + (f", {len(failed)} roots did not compile standalone" if failed else ""))
     sys.exit(1 if a.strict and flagged else 0)

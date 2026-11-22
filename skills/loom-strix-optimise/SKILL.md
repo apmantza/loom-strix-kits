@@ -29,8 +29,8 @@ Keep a log: one entry per try (what ran, where the data is, the result, the deci
    checkout at the installed tag (loom/docs/src, loom/py/loom/dialect) and kit/.
 5. **Prior art at the diagnosis step** (rules section 3), with the measured diagnosis in the brief; spot-check key claims.
 6. **Cheapest evidence first** (rules section 2): the compile report, `common/loop_census.py` (the hot loop from its
-   backward branch: length, moves, waits), `common/load_cover.py` (where each load is waited), `common/compiler_ab.py`
-   (two compilers, every root), `loom-compile-report show/suggest` on a details report (wait reasons, copy waits, the LDS
+   backward branch: length, moves, waits), `common/load_cover.py` (where each load is waited), `common/kernel_lint.py`
+   (every root of a package or program; against another build or compiler with `--baseline`), `loom-compile-report show/suggest` on a details report (wait reasons, copy waits, the LDS
    bank model), Radeon GPU Analyzer for live registers; then a timing ablation; then the served binary (`common/serve_code_dump.py`) timed through
    HIP, with rocprofv3 counters or thread trace on it when the question is about caches, LDS or stalls; then a build.
 7. **Change test-first.** Kernel cases that straddle every new boundary (`kit/make_kernel_tests.py`), then deliberate

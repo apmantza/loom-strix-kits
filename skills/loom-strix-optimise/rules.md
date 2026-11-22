@@ -65,7 +65,7 @@ for a fraction of the next one's cost.
   waits with common/load_cover.py (instructions from each load to the wait that retires it) and load_events.py. Loom
   places a pending load's consumer at its earliest legal point; only a data dependency keeps it late (E110: E76's
   deferred conversion never reached the binary, so its "no effect" tested nothing).
-- **Count a loop from its backward branch with a script (common/loop_census.py, compiler_ab.py), never a hand-cut line range, and place
+- **Count a loop from its backward branch with a script (common/loop_census.py, kernel_lint.py), never a hand-cut line range, and place
   each run of moves in its block (branch join, back-edge, rare path) before naming the mechanism** (E168 -> E179: "264
   v_mov, a back-edge copy" came from a range wider than the loop; the copies sat at branch joins).
 - **Compile a generator change as the served program emits it** (E230): splice it into the served program (recipe switches,
