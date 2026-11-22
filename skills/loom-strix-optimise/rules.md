@@ -49,6 +49,12 @@ for a fraction of the next one's cost.
 - **Count a loop from its backward branch with a script (common/loop_census.py, compiler_ab.py), never a hand-cut line range, and place
   each run of moves in its block (branch join, back-edge, rare path) before naming the mechanism** (E168 -> E179: "264
   v_mov, a back-edge copy" came from a range wider than the loop; the copies sat at branch joins).
+- **Compile a generator change as the served program emits it** (E230): splice it into the served program (recipe switches,
+  post-passes) before counting. The IQ4 lookup rewrite compiled clean from the bare generator and spilled 2.4 KB under the
+  served recipe's padding-skip `scf.if`.
+- **Check a model against the measured rows it should also explain before naming it a cause** (E233 -> E234): 'q6_k is slow
+  because its last round is part-empty' was written down, then the same model put 14-29 % idle on kernels measured at the
+  bandwidth ceiling. A model that mispredicts the controls explains nothing.
 - **Ablation**: timing-only builds that remove one ingredient (loads, barriers, dequant, a scale read) rank levers
   before any rewrite (E15, E52). Results are garbage by design; label them so.
 - **Profile per kernel, both sides of a loss** (E10: an average hid +84 % in one kernel and -11/-23 % in two). Split a

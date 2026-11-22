@@ -28,6 +28,14 @@
 - **Spills and global loads share vmcnt**: any spill drains the prefetch (gfx11).
 - **I2: a token's result must not depend on its span** (alone == in span, atol 0). Partitions (split-K boundaries) must
   depend on the token's position only (E144: absolute key splits sized by a 4096-position bucket).
+- **LLVM 21's llvm-objdump mis-decodes gfx1151** (E230): it cannot decode `v_cmp_*_e64` with an SGPR result, prints `.long` plus a
+  phantom instruction (mostly `v_cndmask`), shows no `v_cmp`, and can drop a loop's branch target. A '972 v_cndmask' loop was
+  480 `v_cmp` + 480 `v_cndmask`. Decode with ROCm 10.2's llvm-objdump; common/loop_census.disasm refuses listings with `.long`.
+- **Byte vectors: mask lookup indices as bytes, do shifts as words** (E230, E233). An i32 `andi 0x0f0f0f0f` then a bitcast to
+  bytes hides that each index is < 16: `vector.table.lookup` became a 960-instruction compare/select chain per GEMM tile;
+  `andi vector<16xi8> splat 15` after the bitcast gives `v_perm_b32`. The reverse for shifts by a runtime amount: on
+  `vector<32xi8>` the compiler extracts and repacks every byte (q6_k matvec loop 616 vs 290 instructions); do them on
+  `vector<8xi32>` (exact when the kept bits never cross a byte) and subtract a per-byte bias as `(c | 0x80) - k, ^ 0x80`.
 - **Generated-text rewrites are contracts**: every anchor exactly once, build fails otherwise (kit/kv8_late.py, gen_flash2s.py
   FLASH2_SPLITK_ANY), proven with a mutant.
 
