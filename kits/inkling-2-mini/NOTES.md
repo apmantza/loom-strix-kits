@@ -62,6 +62,13 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
 - Checked on values (byte ranges of the native file, ~220 KB, against UD-Q8_K_XL; exact everywhere): norms are copied as stored
   (no +1); the GGUF's NVFP4 `.scale` = amax / outer denominator (2688 = 6 x 448); native w13 rows interleave gate and up (even =
   gate) and the GGUF de-interleaves them, for NVFP4 and MXFP8 alike; the GGUF's BF16 MXFP8 experts are a lossless upcast.
+- Unsloth UD-Q4_K_XL (17.6 GB) is not a Q4_K file: experts of layers 0-19 keep the **native NVFP4 bytes** (11.47 GB), the
+  MXFP8 experts of layers 20-23 become Q8_0 (4.33 GB), attention / gates / other Q8_0 (0.68 GB), embedding and output Q8_0
+  (0.98 GB) [comp, tensor table]. UD-Q8_K_XL holds native values everywhere (NVFP4 experts, lossless BF16 upcasts, native BF16),
+  so it is an exact local reference: Unsloth's KLD 0.0107 / 98.0 % same top token for UD-Q4_K_XL is effectively against native.
+- **Route chosen (22 Nov): UD-Q4_K_XL** (route b): native NVFP4 experts, no MXFP8 software decode (Q8_0 is a served kit format),
+  Q8_0 instead of BF16 attention (fewer bytes per token than native); quality checked with common/quant_eval.sh against
+  UD-Q8_K_XL. Fallback if that KLD is too high: NVFP4 experts + Q8_0 MXFP8 experts + BF16 attention.
 - Prior art on this ROCm: hipBLASLt 10.2 ships hand-written gfx1151 kernels for 4-bit-weight GEMMs with bf16/fp16 activations.
 - References: Unsloth's official gfx1151 build of its fork (b12588-mix-c0c3de8, release asset, digest checked).
 
@@ -80,4 +87,4 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    integer codes by a v_perm table, two e4m3 half scales decoded on integers, the per-expert factor applied per row) and a
    single-token probe matvec: compiles on Loom 0.2.0 and 0.3.0 for gfx1151, 211 instructions, 35 VGPRs, no lint flag
    (kit/test_nvfp4.py). Not yet wired into gen_moe; no kernel test yet.
-4. Decide the weights route on numbers: native (exact, 5.55 GB/token) or a GGUF quant (fewer attention bytes; KLD from step 2).
+4. Weights route: UD-Q4_K_XL chosen 22 Nov (see Weights); confirm with our own KLD run against UD-Q8_K_XL (step 2).
