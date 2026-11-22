@@ -60,6 +60,15 @@ sel = list(range(len(turns)))[int(lo or 0):(int(hi) if hi else None)][::a.every]
 URL = a.url.rstrip("/")
 
 
+def _parses(args):
+    """whether a tool call's streamed arguments parse as JSON"""
+    try:
+        json.loads(args)
+        return True
+    except ValueError:
+        return False
+
+
 def history(k, own):
     """Messages for turn k. In own mode the assistant messages before k are replaced by the engine's replies."""
     h = [dict(m) for m in msgs[:turns[k]["upto"]]]
@@ -152,7 +161,8 @@ def run(k, own):
            "ttft": round(ttft, 2), "prefill_tps": round((pt - cached) / ttft, 1) if ttft > 0 else None, "out": out,
            "rec_out": t["rec_out"], "gen_s": round(gen, 2), "decode_tps": round((out - 1) / gen, 1) if gen > 0 and out > 1 else None,
            "wall": round(end - t0, 2), "rec_wall": t["rec_wall_s"], "cap": cap,
-           "loop": round(checks.loop_share("".join(reasoning) + "".join(content)), 3)}   # >= 0.5 over >= 64 words: a degenerate repeat, not speed
+           "loop": round(checks.loop_share("".join(reasoning) + "".join(content)), 3),   # >= 0.5 over >= 64 words: a degenerate repeat, not speed
+           "tools": [{"name": c["name"], "json": _parses(c["args"])} for _, c in sorted(calls.items())]}   # tool calls made, args valid JSON
     if dc0:
         dc1 = server_draft_counters(a.url)
         row["draft_acc"] = acceptance_between(dc0, dc1)
