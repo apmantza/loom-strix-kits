@@ -1,0 +1,75 @@
+// The E233 @g_q6_k_icodes (32-bit word shifts and masks), kept as kernel_lint's clean fixture (test_kernel_lint.py).
+func.def inline @g_q6_k_icodes(%w: buffer, %origin: offset, %group: index) -> (vector<32xi8>, f32, f32) {
+  %c2 = index.constant 2 : index
+  %c4 = index.constant 4 : index
+  %c8 = index.constant 8 : index
+  %c32 = index.constant 32 : index
+  %c64 = index.constant 64 : index
+  %qh_base = index.constant 128 : index
+  %sc_base = index.constant 192 : index
+  %d_bytes = index.constant 208 : offset
+  %nibbles = vector.splati 252645135 : vector<8xi32>
+  %two_bits = vector.splati 50529027 : vector<8xi32>
+  %four = vector.splati 4 : vector<8xi32>
+  %top_bits = vector.splati -2139062144 : vector<8xi32>
+  %thirty_two = vector.splati 538976288 : vector<8xi32>
+  %bounded = index.assume %group [range(%group, 0, 7)] : index
+  %half = index.div %bounded, %c4 : index
+  %j = index.rem %bounded, %c4 : index
+  %j_low = index.rem %j, %c2 : index
+  %j_high = index.div %j, %c2 : index
+  %ql_half = index.mul %half, %c64 : index
+  %ql_part = index.mul %j_low, %c32 : index
+  %ql_index = index.add %ql_half, %ql_part : index
+  %qh_half = index.mul %half, %c32 : index
+  %qh_index = index.add %qh_base, %qh_half : index
+  %sc_half = index.mul %half, %c8 : index
+  %sc_j = index.mul %j, %c2 : index
+  %sc_part = index.add %sc_half, %sc_j : index
+  %sc_index = index.add %sc_base, %sc_part : index
+  %ql_add = index.cast %ql_index : index to offset
+  %qh_add = index.cast %qh_index : index to offset
+  %sc_add = index.cast %sc_index : index to offset
+  %ql_origin = index.add %origin, %ql_add : offset
+  %qh_origin = index.add %origin, %qh_add : offset
+  %sc_origin = index.add %origin, %sc_add : offset
+  %d_origin = index.add %origin, %d_bytes : offset
+  %ql_view = buffer.view %w[%ql_origin] : buffer -> view<32xi8>
+  %qh_view = buffer.view %w[%qh_origin] : buffer -> view<32xi8>
+  %sc_view = buffer.view %w[%sc_origin] : buffer -> view<2xi8>
+  %d_view = buffer.view %w[%d_origin] : buffer -> view<1xf16>
+  %ql = vector.load %ql_view[0] : view<32xi8> -> vector<32xi8>
+  %qh = vector.load %qh_view[0] : view<32xi8> -> vector<32xi8>
+  %sc = vector.load %sc_view[0] : view<2xi8> -> vector<2xi8>
+  %d_half = view.load %d_view[0] : view<1xf16> -> f16
+  %d = scalar.extf %d_half : f16 to f32
+  %shift_low = index.mul %j_high, %c4 : index
+  %shift_high = index.mul %j, %c2 : index
+  %shift_low32 = index.cast %shift_low : index to i32
+  %shift_high32 = index.cast %shift_high : index to i32
+  // The 6-bit codes are assembled on 32-bit words (HRX-like E233): as vector<32xi8> shifts the compiler extracts and repacks
+  // every byte (~350 extra instructions per group). Word shifts are exact here: the bits a byte keeps after its shift never
+  // come from its neighbour (low nibble: shift 0 or 4, mask 0x0f; high pair: shift 0-6, mask 0x03). code - 32 per byte
+  // without borrows: (c | 0x80) - 0x20, then ^ 0x80 (c <= 63, so c | 0x80 >= 0x80 > 0x20).
+  %qlw = vector.bitcast %ql : vector<32xi8> to vector<8xi32>
+  %qhw = vector.bitcast %qh : vector<32xi8> to vector<8xi32>
+  %shift_low_v = vector.splat %shift_low32 : vector<8xi32>
+  %shift_high_v = vector.splat %shift_high32 : vector<8xi32>
+  %ql_shifted = vector.shrui %qlw, %shift_low_v : vector<8xi32>
+  %low = vector.andi %ql_shifted, %nibbles : vector<8xi32>
+  %qh_shifted = vector.shrui %qhw, %shift_high_v : vector<8xi32>
+  %qh_bits = vector.andi %qh_shifted, %two_bits : vector<8xi32>
+  %high = vector.shli %qh_bits, %four : vector<8xi32>
+  %combined = vector.ori %low, %high : vector<8xi32>
+  %raised = vector.ori %combined, %top_bits : vector<8xi32>
+  %lowered = vector.subi %raised, %thirty_two : vector<8xi32>
+  %signed_w = vector.xori %lowered, %top_bits : vector<8xi32>
+  %signed = vector.bitcast %signed_w : vector<8xi32> to vector<32xi8>
+  %s0_i8 = vector.extract %sc[0] : vector<2xi8> -> i8
+  %s1_i8 = vector.extract %sc[1] : vector<2xi8> -> i8
+  %s0f = scalar.sitofp %s0_i8 : i8 to f32
+  %s1f = scalar.sitofp %s1_i8 : i8 to f32
+  %s0 = scalar.mulf %s0f, %d : f32
+  %s1 = scalar.mulf %s1f, %d : f32
+  func.return %signed, %s0, %s1 : vector<32xi8>, f32, f32
+}
