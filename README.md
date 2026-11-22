@@ -67,6 +67,7 @@ common/serve.sh qwen38-27b pkg                        # OpenAI-compatible API, t
 | `common/make_lanes.py WEIGHTS` | the floors' model constants from a GGUF or safetensors header (local or remote): bytes per decode step (MoE: the experts a verify step's tokens touch; looped layers; MTP and vision excluded), multiply-adds, KV slots for hybrid attention |
 | `common/kit_check.sh KIT` | the weights gate: files match the pins, upstream freshness, lanes.json reproduces from the weights |
 | `common/quant_eval.sh REF CAND OUT` | KL divergence, same top token and perplexity of a quant against a reference quant (llama.cpp) |
+| `common/hsaco_run.py` | Launch any Loom kernel's code object through HIP (arguments from its metadata, grid from the .loom source): timing, A/B, output comparison, counters |
 | `common/counters.sh` | Hardware counters on a HIP process (ROCm 10.2): wait reasons, memory bytes, L2, load latency, with derived metrics per GPU |
 | `common/bw_probe.sh` | DRAM read, write and copy bandwidth (HIP), the measured ceiling behind the decode floors |
 | `common/fetch.py KIT` | downloads the kit's pinned files (`kits/<kit>/pins.json`) and verifies every sha256 |
