@@ -9,12 +9,13 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   repack    packed 16-bit shifts (v_pk_lshrrev/lshlrev_b16) >= 8 and byte extracts (v_bfe_*) >= 32 in the hot loop: byte
             vectors shifted by a runtime amount, every byte extracted and repacked (E233: q6_k / q3_k codes, 616 vs 290).
   scratch   any scratch load/store in the hot loop: a spill; on gfx11 spills share vmcnt with the loads (E230: 2,464 B).
-  copies    a run of >= COPY_RUN register moves in the hot loop (gaps of up to 3 other instructions): the allocator copying a
+  copies    a run of >= COPY_RUN register-to-register moves in the hot loop (moves of constants are initialisation, E251) (gaps of up to 3 other instructions): the allocator copying a
             carried value or a branch's results (E179 / ROCm/hrx-system#3542: flash2's 45-move run before its back-edge).
   join      a run of >= JOIN_RUN moves right after an exec-mask restore, anywhere in the kernel: a value-yielding scf.if whose
             branches leave the result in different registers, copied at the join (E242: a prefetch under scf.if; E247: the norm's
             idle-lane zero branch, 61-64 moves per pass). Fix shape: compute on a clamped index and select.
-  outlier   non-MMA instructions per MMA (or dot) > OUTLIER x the median of its peers (same family, place, MMA kind and MMA
+  [outlier] a NOTE, not a flag (E251: 0 of 2 confirmed on llama.cpp, where one template spans formats of different cost):
+            non-MMA instructions per MMA (or dot) > OUTLIER x the median of its peers (same family, place, MMA kind and MMA
             count, >= 3 kernels): a kernel doing much more per multiply than its siblings (E233: q6_k's matvec 616 vs q5_k's 261).
   regress:  (with --baseline) worse than the same kernel in another build: a new spill, the prefetch now drained, fewer
             waves per SIMD, or the hot loop / its longest move run >= 10 % longer (E226: Loom 0.3.0's vmcnt(0) + 32-move shift;
@@ -47,7 +48,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from loop_census import cover, disasm, loops, moves  # noqa: E402
 
-FLAGS = ("select", "repack", "scratch", "copies", "join", "outlier")
+FLAGS = ("select", "repack", "scratch", "copies", "join")
 MM = ("v_wmma", "v_dot4", "v_dot2", "v_dot8")
 COPY_RUN = 16
 JOIN_RUN = 32
@@ -91,12 +92,24 @@ def hot(ins, addr):
     return (best[1], best[2], L) if best else None
 
 
+def copy_moves(x):
+    """register-to-register moves an instruction performs (v_mov / v_dual_mov halves whose source is a VGPR): a move of a
+    constant or an SGPR initialises a register, it does not copy one (E251: llama.cpp's accumulator zero-inits read as copies)"""
+    halves = [h.strip() for h in x.split("::")]
+    n = 0
+    for h in halves:
+        m = re.match(r"(?:v_dual_mov_b32|v_mov_b(?:16|32)(?:_e32|_e64)?)\s+v\d+(?:\.[lh])?,\s*([^\s,]+)", h)
+        if m and re.match(r"v\d+(?:\.[lh])?$|v\[", m.group(1)):            # 16-bit halves too (gfx11.5 true16: v_mov_b16 vN.l, vM.h)
+            n += 1
+    return n
+
+
 def longest_move_run(body):
-    """the most register moves in one run (moves at most 3 instructions apart), as loop_census.census groups them"""
+    """the most register-to-register moves in one run (moves at most 3 instructions apart), as loop_census.census groups them"""
     best = cur = 0
     last = None
     for j, x in enumerate(body):
-        m = moves(x)
+        m = copy_moves(x)
         if not m:
             continue
         cur = cur + m if last is not None and j - last <= 3 else m
@@ -113,7 +126,7 @@ def join_runs(ins):
     for j in restores:
         n, last = 0, None
         for k in range(j + 1, min(len(ins), j + 400)):
-            m = moves(ins[k])
+            m = moves(ins[k])                    # a join zero-fills and copies: both count (E247's 64 zero moves + 61 copies)
             if m:
                 if last is not None and k - last > 3:
                     break
@@ -288,7 +301,7 @@ def outliers(rows):
         med = statistics.median(x["other_per_op"] for x in g)
         for r in g:
             if med and r["other_per_op"] > OUTLIER * med:
-                r["flags"].append("outlier")
+                r.setdefault("notes", []).append("outlier")   # a prompt to read, not a flag (E251: 0 of 2 confirmed on llama.cpp)
                 hit[r["kernel"]] = (r["other_per_op"], med, len(g))
     return hit
 
@@ -416,7 +429,7 @@ def main():
               f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {f(r['waves']):>3s} {f(r['to_next']):>4s} {r['pf']:>5s} {s:>5s} "
               f"{f(r['lds_waits_per_op']):>5s} {f(r['cover_min']):>4s} {r['in_flight']:3d} {f(r.get('bank_extra')):>5s} "
               f"{('%.1f' % ms[r['kernel']]) if r['kernel'] in ms else '-':>8s}  "
-              f"{' '.join(r['flags'])}")
+              f"{' '.join(r['flags'])}{('  [' + ' '.join(r['notes']) + ']') if r.get('notes') else ''}")
     for k, (v, med, n) in sorted(outl.items()):
         print(f"outlier {k}: {v} non-MMA instructions per MMA vs a median of {med} over {n} peers")
     if sites is not None:

@@ -13,6 +13,9 @@
     a lookup chain compares against the table's entries;
   - another engine's code object (many kernels in one file, E244: llama.cpp's 147 objects hold 8,374 kernels) linted as one
     kernel or sliced wrongly: a two-kernel object must give two rows, each equal to that kernel compiled alone;
+  - accumulator zero-inits counted as copies, or 16-bit half-register copies missed (E251, llama.cpp's blind review: 3 of 4
+    copies flags were `v_mov vN, 0` runs; a real 36-move run was v_mov_b16 vN.l, vM.h): constants do not count, true16 moves do;
+  - outlier presented as a defect (E251: 0 of 2 confirmed): it is a note, not a flag;
   - a branch-join copy not flagged (E247: the norm's idle-lane zero branch, 61-64 moves after an exec restore, every pass):
     a run of 40 moves right after an exec restore flags `join`, one of 20 does not;
   - a regression against another build missed (E226 0.3.0's longer loop and move run, E230 a new spill, E236 fewer waves);
@@ -106,13 +109,20 @@ def main():
     moves_loop = lambda nm: ["s_mov_b32 s0, 0", "v_dot4_i32_iu8 v1, v2, v3, v1"] + [f"v_mov_b32_e32 v{10 + i}, v{40 + i}" for i in range(nm)] + [back(2 + nm, 1)]
     r = kl.lint_listing("run20", *listing(moves_loop(20)))
     ok("copies" in r["flags"] and r["run"] == 20, f"a 20-move run in the hot loop flags copies (run {r['run']})")
+    zi = ["s_mov_b32 s0, 0", "v_dot4_i32_iu8 v1, v2, v3, v1"] + [f"v_mov_b32_e32 v{10 + i}, 0" for i in range(20)] + [back(22, 1)]
+    r = kl.lint_listing("zeroinit", *listing(zi))
+    ok("copies" not in r["flags"] and r["run"] == 0, f"20 zero-init moves are not copies (run {r['run']})")
+    h16 = ["s_mov_b32 s0, 0", "v_dot4_i32_iu8 v1, v2, v3, v1"] + [f"v_mov_b16_e64 v{10 + i}.l, v{60 + i}.h op_sel:[1,0]" for i in range(20)] + [back(22, 1)]
+    r = kl.lint_listing("true16", *listing(h16))
+    ok("copies" in r["flags"] and r["run"] == 20, f"20 half-register copies are copies (run {r['run']})")
     r = kl.lint_listing("run10", *listing(moves_loop(10)))
     ok("copies" not in r["flags"], f"a 10-move run does not (run {r['run']}, flags {r['flags']})")
     row = lambda k, op, wm=0, dt=8: {"kernel": k, "where": "loop", "wmma": wm, "dot": dt, "other_per_op": op, "flags": []}
     rows = [row("g_mv_a", 3.0), row("g_mv_b", 3.2), row("g_mv_c", 2.9), row("g_mv_d", 8.6),
             row("g_attention_x", 30.0, 32, 0), row("g_gemm_a", 10.0, 32, 0), row("g_gemm_b", 11.0, 32, 0), row("g_gemm_c", 10.5, 32, 0)]
     hit = kl.outliers(rows)
-    ok(set(hit) == {"g_mv_d"}, f"outlier: the matvec at 2.8x its peers, not the attention kernel beside GEMMs ({sorted(hit)})")
+    ok(set(hit) == {"g_mv_d"} and not any("outlier" in x["flags"] for x in rows) and "outlier" in rows[3].get("notes", []),
+       f"outlier: the matvec at 2.8x its peers, as a note not a flag, not the attention kernel beside GEMMs ({sorted(hit)})")
     base = {"scratch": 0, "pf": "kept", "waves": 12, "loop": 1544, "run": 4}
     ok(kl.regressions(dict(base, loop=2179, run=32), base) == ["loop1544->2179", "run4->32"], "regress: 0.3.0's longer loop and move run (E226)")
     ok(kl.regressions(dict(base, scratch=513, pf="drain"), base) == ["spill", "drain"], "regress: a new spill and a drained prefetch (E230)")
