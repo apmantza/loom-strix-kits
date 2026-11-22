@@ -25,7 +25,9 @@ its first WMMA), and with --package the kernel's launch sites in the package. Ca
 v_mul_lo_u32 (address math) and a drain alone are not defects.
 Decoding goes through loop_census.disasm (ROCm 10.2 llvm-objdump; it refuses undecoded words).
 Also reported: LDS waits (lgkmcnt) per MMA (E61), the shortest load-to-wait distance and the loads still in flight at the
-back-edge (E109), the extra LDS bank-service rounds of Loom's gfx1151 bank model, and with --profile each kernel's served ms.
+back-edge (E109), the extra LDS bank-service rounds of Loom's gfx1151 bank model (whole kernel, not the hot loop: read the report's
+bank_service_groups before acting; E249: the f16 GEMMs' 48 extra rounds were the epilogue's once-per-tile store), and with --profile
+each kernel's served ms.
 A code object holding many kernels (another engine's build: *.co / *.hsaco) is linted kernel by kernel (lint_object).
 usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--profile RUN] [--flagged] [--strict]
        kernel_lint.py --package PKG | --program FILE.loom ... --out DIR [--loom-compile PATH] [--roots REGEX] [--jobs N] [...]
