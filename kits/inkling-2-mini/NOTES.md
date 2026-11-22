@@ -118,4 +118,10 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    per call. kit/test_sconv.py executes the generated kernel text in float32 and matches ggml's convolve() bit for bit. As
    separate kernels these are ~190 launches per token (4 x 48 layer applications): a fusion candidate (into the K/V projection
    and residual epilogues) once the program exists. Speculative rollback (per-step history) is still to add.
+   **Attention inputs (22 Nov)**: relative_extent is 1024 on every layer (global included; distances >= 1024 hit the zero pad row,
+   bias = -sink), so the bias is r . rel_bias[min(d, 1024)] - sink, 16 multiply-adds per key from a 64 KB table: computed inside the
+   attention kernel, nothing per distance materialised. kit/gen_inkattn.py prep: the per-token clips (q: per-channel scale + L2 clip
+   22.63; k: clip; v: RMS norm; r: scale + clip 8) and, on global layers, tau = 1 + 0.1 log(max(1, (pos + 1) / 8192)) on q and r;
+   matched to the fork's math by a lane-vectorised interpreter test (kit/test_inkattn.py). Next: the attention core with the bias,
+   the zero-logit sink and the sigmoid output gate.
 4. Weights route: UD-Q4_K_XL chosen 22 Nov (see Weights); confirm with our own KLD run against UD-Q8_K_XL (step 2).
