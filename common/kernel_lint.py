@@ -11,6 +11,9 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   scratch   any scratch load/store in the hot loop: a spill; on gfx11 spills share vmcnt with the loads (E230: 2,464 B).
   copies    a run of >= COPY_RUN register moves in the hot loop (gaps of up to 3 other instructions): the allocator copying a
             carried value or a branch's results (E179 / ROCm/hrx-system#3542: flash2's 45-move run before its back-edge).
+  join      a run of >= JOIN_RUN moves right after an exec-mask restore, anywhere in the kernel: a value-yielding scf.if whose
+            branches leave the result in different registers, copied at the join (E242: a prefetch under scf.if; E247: the norm's
+            idle-lane zero branch, 61-64 moves per pass). Fix shape: compute on a clamped index and select.
   outlier   non-MMA instructions per MMA (or dot) > OUTLIER x the median of its peers (same family, place, MMA kind and MMA
             count, >= 3 kernels): a kernel doing much more per multiply than its siblings (E233: q6_k's matvec 616 vs q5_k's 261).
   regress:  (with --baseline) worse than the same kernel in another build: a new spill, the prefetch now drained, fewer
@@ -42,9 +45,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from loop_census import cover, disasm, loops, moves  # noqa: E402
 
-FLAGS = ("select", "repack", "scratch", "copies", "outlier")
+FLAGS = ("select", "repack", "scratch", "copies", "join", "outlier")
 MM = ("v_wmma", "v_dot4", "v_dot2", "v_dot8")
 COPY_RUN = 16
+JOIN_RUN = 32
 OUTLIER = 2.0
 GROW = 1.10
 
@@ -96,6 +100,28 @@ def longest_move_run(body):
         cur = cur + m if last is not None and j - last <= 3 else m
         last = j
         best = max(best, cur)
+    return best
+
+
+def join_runs(ins):
+    """the longest move run that starts within 3 instructions after an exec-mask restore (the end of a divergent branch):
+    a value-yielding scf.if whose branches leave its result in different registers, copied at the join (E242, E247)"""
+    best = 0
+    restores = [j for j, x in enumerate(ins) if re.match(r"s_(mov|or)_b(32|64) exec(_lo)?,", x)]
+    for j in restores:
+        n, last = 0, None
+        for k in range(j + 1, min(len(ins), j + 400)):
+            m = moves(ins[k])
+            if m:
+                if last is not None and k - last > 3:
+                    break
+                if last is None and k - j > 4:
+                    break
+                n += m
+                last = k
+            elif last is not None and k - last > 3:
+                break
+        best = max(best, n)
     return best
 
 
@@ -216,6 +242,9 @@ def lint_listing(name, ins, addr, res=(None, None, None)):
         r["flags"].append("scratch")
     if r["where"] == "loop" and r["run"] >= COPY_RUN:
         r["flags"].append("copies")
+    r["join"] = join_runs(ins)
+    if r["join"] >= JOIN_RUN:
+        r["flags"].append("join")
     r["pf"] = "-"
     loads = [j for j, x in enumerate(full) if re.match(r"(global|buffer)_load_", x)]
     w = [j for j, x in enumerate(full) if x.startswith("v_wmma")]

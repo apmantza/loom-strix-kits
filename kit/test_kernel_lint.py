@@ -13,6 +13,8 @@
     a lookup chain compares against the table's entries;
   - another engine's code object (many kernels in one file, E244: llama.cpp's 147 objects hold 8,374 kernels) linted as one
     kernel or sliced wrongly: a two-kernel object must give two rows, each equal to that kernel compiled alone;
+  - a branch-join copy not flagged (E247: the norm's idle-lane zero branch, 61-64 moves after an exec restore, every pass):
+    a run of 40 moves right after an exec restore flags `join`, one of 20 does not;
   - a regression against another build missed (E226 0.3.0's longer loop and move run, E230 a new spill, E236 fewer waves);
   - launch sites miscounted (E241: launches without a grid were missed): direct launches with and without a grid, through
     dual-target selectors, and none inside template bodies;
@@ -136,6 +138,12 @@ def main():
         open(os.path.join(run, "x.req.json"), "w").write(json.dumps({"requests": [{"prompt_tokens": 81430}]}))
         ms, prompt = kl.served_ms(run)
         ok(ms == {"g_a": 3.0, "g_b": 0.5} and prompt == 81430, f"served ms per kernel from valid events only ({dict(ms)}, {prompt})")
+    jn = lambda nm: (["s_and_saveexec_b64 s[6:7], vcc", "v_mov_b32_e32 v1, 0", "s_mov_b64 exec, s[6:7]"]
+                     + [f"v_mov_b32_e32 v{10 + i}, v{60 + i}" for i in range(nm)] + ["s_endpgm"])
+    r = kl.lint_listing("join40", *listing(jn(40)))
+    ok("join" in r["flags"] and r["join"] == 40, f"40 moves after an exec restore flag join ({r['join']})")
+    r = kl.lint_listing("join20", *listing(jn(20)))
+    ok("join" not in r["flags"], f"20 do not ({r['join']}, flags {r['flags']})")
     algo = ["s_mov_b32 s0, 0", "v_dot4_i32_iu8 v1, v2, v3, v1"] + ["v_cmp_lt_i32_e64 s1, v4, v5", "v_cndmask_b32_e64 v6, v7, v8, s1"] * 10
     algo.append(back(len(algo), 1))
     r = kl.lint_listing("algo", *listing(algo))
