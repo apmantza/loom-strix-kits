@@ -159,7 +159,7 @@ Q4 recipes read more bytes for no measured gain.
    - kit/hf_names/nemotron_h_moe.json: the GGUF <-> BF16-release name map for all 88 blocks (three mixer kinds, experts
      stacked, A from A_log, the NVFP4 per-tensor factors GGUF-only), checked against both real tensor tables
      (kit/test_hf_names_nemotron_h_moe.py: every tensor once, every pairing by shape).
-2. Reference on the machine (a 24 GB download, a short GPU window beside live): llama.cpp main built for gfx1151 with the
+2. Reference on the machine (the GGUF, mmproj and drafter are downloaded and the run is scripted; it waits for a GPU window): llama.cpp main built for gfx1151 with the
    NVIDIA 24GB GGUF + LiLiCorr: decode with and without the drafter at 4k / 32k, prefill at 2k / 32k, per-op time
    (`GGML_SCHED` / events) to see whether Mamba, IQ2_XXS matvecs or the routers dominate, and logits for later equivalence.
 3. Generator (kit/, behind a `nemotron_h_moe` path): plain decode first (Mamba-2 + IQ2_XXS LatentMoE + NoPE attention),
