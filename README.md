@@ -57,9 +57,13 @@ common/serve.sh qwen38-27b pkg                        # OpenAI-compatible API, t
 | `common/loop_census.py`, `compiler_ab.py`, `load_cover.py`, `load_events.py` | code-object analysis: hot loops, register moves, load-to-wait cover |
 | `common/serve_code_dump.py` | dumps the kernels a running loom-serve compiled, which are not always the ones a benchmark compiles |
 | `common/agent_run_summary.py` | summarizes server-side numbers of an agent run from /metrics snapshots |
+| `common/events_ab.sh KIT OUT LEN PKG...` | served per-dispatch profiles (ABBA order) at one prompt size, then every lane against its hardware floor (`kits/<kit>/lanes.json`) |
+| `common/events_summary.py`, `lane_breakdown.py`, `ceiling.py` | the lane table, one lane kernel by kernel (with GB/s for matvecs), the floors themselves |
+| `common/checks.py` | A/B verdict checks (paired bootstrap CI, ABBA neighbour rule), a loop flag, GPU memory per process from fdinfo |
 
-`build.sh`, `state.sh` and `ktest.sh` have run in this layout. `serve_as.sh`, `eq.sh`, `gates.sh` and `agent_ab.sh` are
-ports of the scripts we use daily; their first runs in this layout are still pending.
+`build.sh`, `state.sh`, `ktest.sh` and `events_summary.py` (on a real served profile) have run in this layout. `serve_as.sh`, `eq.sh`,
+`gates.sh`, `agent_ab.sh` and `events_ab.sh` are ports of the scripts we use daily; their first runs in this layout are still pending.
+`events_ab.sh` needs an `iree-profile` built from the installed hrx-system tag (`IREE_PROFILE` in the machine env).
 
 ## License
 
