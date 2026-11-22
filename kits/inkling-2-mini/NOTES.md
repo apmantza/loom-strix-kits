@@ -113,4 +113,9 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    residuals, the loop messages and the output query (gen_loop.depth_mix: states RMS-normalised, softmax over learned-query scores,
    the normalised states mixed; each state read once, two barriers per call). Still to write: the 48-slot schedule in the program, a
    multi-token controller for verify spans.
+   **Short convolutions (22 Nov)**: kit/gen_sconv.py, the four per-layer causal convolutions with residual and 1/sqrt(n) scale, the
+   global layers' K / V with per-head dynamic taps; one lane per channel, history read and written once, a decode or verify span
+   per call. kit/test_sconv.py executes the generated kernel text in float32 and matches ggml's convolve() bit for bit. As
+   separate kernels these are ~190 launches per token (4 x 48 layer applications): a fusion candidate (into the K/V projection
+   and residual epilogues) once the program exists. Speculative rollback (per-step history) is still to add.
 4. Weights route: UD-Q4_K_XL chosen 22 Nov (see Weights); confirm with our own KLD run against UD-Q8_K_XL (step 2).
