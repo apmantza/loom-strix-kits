@@ -13,6 +13,7 @@ What it reads instead of being told:
     or the metadata names (k, binding2).
 Buffers: --buf NAME=BYTES[:FILL], FILL = zero | f16u | f32u | u8 | file:PATH (uniform: f16/f32 in [-1, 1], bytes 0..255; raw file bytes, zero-padded; constant operands
 raise clocks on this power-limited chip, E15) | byte:0xNN | f32:VALUE. Every buffer the kernel takes must be given (fail closed).
+--save NAME=PREFIX writes buffer NAME after the clean launch to PREFIX.LABEL.bin.
 --compare NAME[:f32|f16] after one launch per object: bytes equal, else the max absolute difference (exit 1 when they differ).
 usage: hsaco_run.py [--loom FILE --workload k=v,...] [--grid X,Y,Z] --kernel NAME [--scalar k=v ...] --buf NAME=BYTES[:FILL] ...
                     [--reps 20] [--warmup 3] [--bytes N (GB/s)] [--compare NAME] [--dry-run] LABEL=OBJ.hsaco [LABEL=OBJ ...]"""
@@ -70,6 +71,44 @@ def loom_kernel(src, name):
                     return work, body, dev
                 body.append(lines[j].strip())
     sys.exit(f"--loom: no kernel.def for {name}")
+
+
+ESIZE = {"f64": 8, "i64": 8, "f32": 4, "i32": 4, "f16": 2, "bf16": 2, "i16": 2, "i8": 1}
+
+
+def view_needs(src, name, values):
+    """{buffer: (bytes its largest zero-offset view of the kernel spans, the view)} for the dense views whose every dimension resolves
+    (a constant, or [%v] with %v / %v_arg given as --scalar or --workload); plus the count of views it could not size. Recurrence
+    (q104 11-22): h16 is [tokens]x162x32xf16 (the PF16_PAD row stride), the run allocated tokens x 5120, the kernel wrote past the end
+    and the GPU fault ('illegal memory access') named no buffer and stopped the window."""
+    lines = src.split("\n")
+    pat = re.compile(r'^kernel\.def\b.*?(?:export\("' + re.escape(name) + r'"\)|@' + re.escape(name) + r'\()')
+    i = next((j for j, l in enumerate(lines) if pat.search(l)), None)
+    if i is None:
+        return {}, 0
+    c = next(j for j in range(i, len(lines)) if lines[j].startswith("} launch("))
+    e = next((j for j in range(c + 1, len(lines)) if lines[j] == "}"), len(lines) - 1)
+    text = "\n".join(lines[c:e + 1])
+    zero = set(re.findall(r"%(\w+) = index\.constant 0 : offset", text))
+    need, skipped = {}, 0
+    for buf, off, shape in re.findall(r"buffer\.view %(\w+)\[%(\w+)\] : buffer -> view<([^>]*)>", text):
+        dims = shape.split("x")
+        ty = dims.pop() if dims else ""
+        n = 1
+        for d in dims:
+            m = re.fullmatch(r"\[%(\w+)\]", d)
+            v = int(d) if d.isdigit() else (values.get(m[1], values.get(m[1] + "_arg")) if m else None)
+            if v is None:
+                n = None
+                break
+            n *= int(v)
+        if off not in zero or "," in shape or ty not in ESIZE or n is None:
+            skipped += 1
+            continue
+        b = n * ESIZE[ty]
+        if b > need.get(buf, (0, ""))[0]:
+            need[buf] = (b, f"view<{shape}>")
+    return need, skipped
 
 
 def eval_config(body, workload):
@@ -223,6 +262,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--bytes", type=float)
     ap.add_argument("--compare", action="append", default=[])
+    ap.add_argument("--save", action="append", default=[], help="NAME=PREFIX: after the clean launch, write buffer NAME to PREFIX.LABEL.bin "
+                    "(e.g. a stamped build's per-wave stage timings, HRX-like E294)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--arg-names", help="comma-separated argument names in order, for code objects whose metadata has none")
@@ -260,6 +301,12 @@ def main():
         sz, _, how = rest.partition(":")
         bufspec[n] = (int(float(sz)), how or "zero")
     print(f"kernel {a.kernel}: grid {grid} x workgroup {block}; kernarg {metas[0]['.kernarg_segment_size']} B")
+    if a.loom:                                            # buffers too small for the kernel's own views refuse before any launch
+        need, skipped = view_needs(open(a.loom).read(), a.kernel, {**kv(a.workload), **scalars})
+        short = [f"{k}: {bufspec[k][0]} B given, {v[1]} needs {v[0]} B" for k, v in sorted(need.items()) if k in bufspec and bufspec[k][0] < v[0]]
+        if short:
+            sys.exit("buffers smaller than the kernel's views:\n  " + "\n  ".join(short))
+        print(f"  buffer sizes checked against {len(need)} sized views ({skipped} views not sizable statically)")
     for x in args:
         names = sorted(alias[x[".name"]])
         print(f"  {x['.offset']:4d} {x['.size']}B {x['.value_kind']:13s} {'/'.join(names)}")
@@ -294,6 +341,9 @@ def main():
         launch(fn)
         hip.ck(hip.h.hipDeviceSynchronize(), f"run {lab}")
         outs[lab] = {c.split(":")[0]: hip.read(ptrs[c.split(":")[0]], len(host[c.split(":")[0]])) for c in a.compare}
+        for sv in a.save:
+            name, _, prefix = sv.partition("=")
+            hip.read(ptrs[name], len(host[name])).tofile(f"{prefix or name}.{lab}.bin")
     rc = 0
     for c in a.compare:
         name, _, dt = c.partition(":")

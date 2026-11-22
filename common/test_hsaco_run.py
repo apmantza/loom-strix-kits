@@ -7,7 +7,9 @@
     is refused with the unsupported line, never guessed;
   - an argument missing, given twice or misspelt passing the kernarg packer;
   - another engine's code object (no argument names in its metadata) launched with arguments bound by guess: --arg-names
-    must name them in order, and a missing or miscounted list is refused.
+    must name them in order, and a missing or miscounted list is refused;
+  - a buffer smaller than the kernel's view of it launched anyway (q104 11-22: a GPU fault naming no buffer): view_needs sizes
+    each zero-offset view from the source and the given scalars.
 usage: test_hsaco_run.py PROGRAM.loom CODE_OBJECT_DIR"""
 import glob, os, re, subprocess, sys
 
@@ -120,6 +122,24 @@ def main():
             hr.name_args(copy.deepcopy(meta), names); ok(False, f"unnamed arguments refused {what}")
         except SystemExit:
             ok(True, f"unnamed arguments refused {what}")
+    # 6. buffer sizes against the kernel's own views (view_needs). Recurrence (q104 11-22): the norm kernel's h16 view is
+    #    [tokens]x162x32xf16 (padded rows), the run gave tokens x 5120 f16 and the GPU faulted naming no buffer.
+    need, skipped = hr.view_needs(src, "g_post_add_norm_rs_live_lv", {"tokens": 4096})
+    if need:
+        ok(need.get("h16", (0,))[0] == 4096 * 162 * 32 * 2, f"h16's padded view sized from the source ({need.get('h16')})")
+        ok(need.get("info", (0,))[0] == 4096 * 16 and skipped == 0, f"every view of the norm kernel sized ({len(need)} buffers, {skipped} skipped)")
+        n2, s2 = hr.view_needs(src, "g_post_add_norm_rs_live_lv", {})
+        ok("h16" not in n2 and s2 > 0, "a dimension with no value given is counted unsized, not guessed")
+    toy = """kernel.def export("t") @t(%n: index) {
+} launch(%n_arg: index, %a: buffer, %b: buffer) {
+  %z = index.constant 0 : offset
+  %o = index.constant 64 : offset
+  %av = buffer.view %a[%z] : buffer -> view<[%n]x4xf32>
+  %bv = buffer.view %b[%o] : buffer -> view<8xf32>
+  kernel.return
+}"""
+    n3, s3 = hr.view_needs(toy, "t", {"n_arg": 3})
+    ok(n3 == {"a": (48, "view<[%n]x4xf32>")} and s3 == 1, f"_arg names resolve; a non-zero offset is skipped, not sized ({n3}, {s3})")
     sys.exit(1 if fails else 0)
 
 
