@@ -6539,6 +6539,14 @@ if __name__ == "__main__":
         # unused scratch there broke concurrent requests (E29/E30: garbage from the first verify step with 4 streams).
         text = "".join(re.sub(r"(?m)^(  %gemm = index\.cmp uge, %t, [^\n]*\n)", lambda m: m.group(1) + _alloc, g, count=1)
                        if "@llm_advance()" in g.split("\n", 1)[0] else _pf16_strip(g) for g in _segs)
+    import epi_fuse   # EPI_FUSE=1 (HRX-like E200): residual add in the output GEMMs' m256 epilogue + noh norms; unset: unchanged
+    def _acc_m256(fmts):
+        _env = dict(os.environ, GEMM_FORMATS=",".join(f"{f}:acc" for f in fmts), GEMM_ACC_M256_ONLY=",".join(fmts))
+        _env.pop("DEQ16_FORMATS", None)
+        _env.setdefault("GEMM_SKIP_PADDING", "1"); _env.setdefault("GEMM_N_FASTEST", "1")
+        return subprocess.run([sys.executable, os.path.join(here, "gen_gemm.py")], capture_output=True, text=True, check=True, env=_env).stdout
+    assert not (epi_fuse.ON and (POST_NORM or MOE)), "EPI_FUSE: the x-only norm assumes no post-norm and no MoE"
+    text = epi_fuse.apply(text, _acc_m256)
     text = pf16_pad.apply(text)   # PF16_PAD (HRX-like E167); unset: unchanged
     if KV8:
         text = kv8_readers(text)

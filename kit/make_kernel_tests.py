@@ -2209,6 +2209,81 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and _F16O_K:
 {_tail}  check.return
 }}
 """)
+# 3a'''. EPI_FUSE (HRX-like E200, kit epi_fuse.py): two chains on the same inputs must agree bit for bit (check.expect.equal).
+# resid: f16 store m256 GEMM -> y, then g_post_add_norm_rs_live[_noh]_lv (x += y; norm)  vs  f16 acc m256 GEMM (x += acc * inv),
+# then g_add_norm_rs_live[_noh]_lv (reads x only; its y operand is a 7.0-filled decoy). x, h16, scales (and h, unless _noh) equal;
+# _noh leaves h untouched (7.0 fill). noh: g_post_add_norm_rs_live_noh_lv == g_post_add_norm_rs_live_lv on x / h16 / scales.
+# 512 rows (two m256 tiles), 5 dead rows (input scale 0, info word 2 = 0, zero x16), every third residual row x30, padded strides.
+_EPI = _pkg_llm_text() or ""
+if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_acc_m256")' in _EPI:
+    _rows, _K, _nu = 512, 1024, H
+    _KP, _HP = _K + _PFPAD, H + _PFPAD
+    _xe = (rng.standard_normal((_rows, _K)) * 0.5).astype(np.float16)
+    _we = (rng.standard_normal((_nu, _K)) * 0.05).astype(np.float16)
+    _inv = rng.uniform(0.5, 2.0, _rows).astype(np.float32)
+    _dead = rng.choice(_rows, 5, replace=False)
+    _xe[_dead] = 0
+    _sc = np.stack([np.ones(_rows, np.float32), _inv], 1)
+    _sc[_dead] = 0
+    _info = np.zeros((_rows, 4), np.int32)
+    _info[:, 2] = 1
+    _info[_dead, 2] = 0
+    save("epi_x16", pfpad(_xe)); save("epi_s", _sc); save("epi_info", _info)
+    save("epi_w", pfpad(_we, np.float16(0)).reshape(-1).view(np.int8))
+    save("epi_r", (rng.standard_normal((_rows, H)) * np.where(np.arange(_rows) % 3 == 0, 30.0, 1.0)[:, None]).astype(np.float32))
+    save("epi_wp", (1 + 0.1 * rng.standard_normal(H)).astype(np.float32))
+    save("epi_wn", (rng.standard_normal(H) * 3e3).astype(np.float32))
+    _WB = _nu * _KP * 2
+
+    def _T(s):
+        return f"tensor<{_rows}x{s}>"
+    _NTY = (f"[index](index, {_T('4xi32')}, {_T(f'{H}xf32')}, tensor<{H}xf32>, {_T(f'{H}xf32')}, tensor<{H}xf32>, "
+            f"{_T(f'{H}xf32')}, {_T('2xf32')}, {_T(f'{_HP}xf16')})")
+    _GTY = f"[index, index](index, index, index, {_T(f'{_KP}xf16')}, {_T('2xf32')}, tensor<{_WB}xi8>, {_T(f'{H}xf32')})"
+    _head = f"""  %rows = check.literal value({_rows}) : index
+  %k = check.literal value({_K}) : index
+  %n = check.literal value({_nu}) : index
+  %x16 = check.file.read.npy path("epi_x16.npy") : {_T(f'{_KP}xf16')}
+  %s = check.file.read.npy path("epi_s.npy") : {_T('2xf32')}
+  %info = check.file.read.npy path("epi_info.npy") : {_T('4xi32')}
+  %w = check.file.read.npy path("epi_w.npy") : tensor<{_WB}xi8>
+  %wp = check.file.read.npy path("epi_wp.npy") : tensor<{H}xf32>
+  %wn = check.file.read.npy path("epi_wn.npy") : tensor<{H}xf32>
+  %xa = check.file.read.npy path("epi_r.npy") : {_T(f'{H}xf32')}
+  %xb = check.file.read.npy path("epi_r.npy") : {_T(f'{H}xf32')}
+  %y = check.generate.fill value(0.0) : {_T(f'{H}xf32')}
+  %yd = check.generate.fill value(7.0) : {_T(f'{H}xf32')}
+  %ha = check.generate.fill value(7.0) : {_T(f'{H}xf32')}
+  %hb = check.generate.fill value(7.0) : {_T(f'{H}xf32')}
+  %h7 = check.generate.fill value(7.0) : {_T(f'{H}xf32')}
+  %sa = check.generate.fill value(7.0) : {_T('2xf32')}
+  %sb = check.generate.fill value(7.0) : {_T('2xf32')}
+  %qa = check.generate.fill value(0.0) : {_T(f'{_HP}xf16')}
+  %qb = check.generate.fill value(0.0) : {_T(f'{_HP}xf16')}
+"""
+
+    def _eq(a, b, ty):
+        return f"  check.expect.equal actual(%{a}) expected(%{b}) : {ty}\n"
+    _XE, _SE, _QE = _eq("xb", "xa", _T(f"{H}xf32")), _eq("sb", "sa", _T("2xf32")), _eq("qb", "qa", _T(f"{_HP}xf16"))
+    for _noh in ("", "_noh"):
+        if f'export("g_add_norm_rs_live{_noh}_lv")' in _EPI:
+            _HE = _eq("hb", "h7", _T(f"{H}xf32")) if _noh else _eq("hb", "ha", _T(f"{H}xf32"))
+            cases.append(f"""check.case public @epi_resid{_noh} {{
+{_head}  kernel.launch @g_gemm_f16_store_m256[%rows, %n](%rows, %k, %n, %x16, %s, %w, %y) : {_GTY}
+  kernel.launch @g_post_add_norm_rs_live{_noh}_lv[%rows](%rows, %info, %y, %wp, %xa, %wn, %ha, %sa, %qa) : {_NTY}
+  kernel.launch @g_gemm_f16_acc_m256[%rows, %n](%rows, %k, %n, %x16, %s, %w, %xb) : {_GTY}
+  kernel.launch @g_add_norm_rs_live{_noh}_lv[%rows](%rows, %info, %yd, %wp, %xb, %wn, %hb, %sb, %qb) : {_NTY}
+{_XE}{_HE}{_SE}{_QE}  check.return
+}}
+""")
+    if 'export("g_post_add_norm_rs_live_noh_lv")' in _EPI:
+        cases.append(f"""check.case public @epi_noh {{
+{_head}  kernel.launch @g_gemm_f16_store_m256[%rows, %n](%rows, %k, %n, %x16, %s, %w, %y) : {_GTY}
+  kernel.launch @g_post_add_norm_rs_live_lv[%rows](%rows, %info, %y, %wp, %xa, %wn, %ha, %sa, %qa) : {_NTY}
+  kernel.launch @g_post_add_norm_rs_live_noh_lv[%rows](%rows, %info, %y, %wp, %xb, %wn, %hb, %sb, %qb) : {_NTY}
+{_XE}{_SE}{_QE}{_eq("hb", "h7", _T(f"{H}xf32"))}  check.return
+}}
+""")
 # 3b'. the producers' fp8 twins (gen_mxfp4s.fuse_mxfp4s_f8; choice prefill.gemm.mxfp4s_f8, gfx12 only) against numpy's e4m3 rounding. The fp8 GEMM itself is tested by the
 # gemm_mxfp4s kbench suite (loom-test cases on synthetic split planes).
 def e4m3_round(x):

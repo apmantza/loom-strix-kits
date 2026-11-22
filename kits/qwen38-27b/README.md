@@ -15,10 +15,12 @@
 
 ```bash
 ./fetch.sh                                     # ~19.7 GB into ./models, ./tok
-export LOOM_KB_ROOT=/path/to/loom-skills/skills/loom-kb
-./build.sh pkg                                 # ~20 s: writes pkg/ (programs + model.json)
-./serve.sh pkg                                 # OpenAI-compatible API on 127.0.0.1:8160
+cd ../.. && common/build.sh qwen38-27b pkg     # ~20 s: writes kits/qwen38-27b/pkg (programs + model.json)
+common/serve.sh qwen38-27b pkg                 # OpenAI-compatible API on 127.0.0.1:8160
 ```
+
+The machine settings (venv, loom-skills checkout) go in `~/.config/loom-strix-kits/env`; see `common/env.example`.
+The recipe and flags are in `kit.env`.
 
 The server holds about 53 GB resident: a 262,144-token
 context, a KV pool shared by all rows and the prefix cache, 4 initial rows, and card sampling (temperature 1.0,
@@ -35,7 +37,7 @@ On real agent tasks served by this recipe (contexts up to ~136k, temperature 1.0
 
 ## What the recipe switches do
 
-Each switch is read in the file named. Unset, a switch leaves the generated program unchanged.
+Each switch is read in the file named (under `kit/`). Unset, a switch leaves the generated program unchanged.
 
 | Switch | Where | What |
 |---|---|---|
@@ -50,12 +52,11 @@ Each switch is read in the file named. Unset, a switch leaves the generated prog
 
 ## Correctness
 
-`kit/make_kernel_tests.py config.json TESTDIR` writes the kernel tests for a built package, and
-`kit/run_kernel_tests.sh pkg TESTDIR` runs them on the GPU. Every recipe change here passed these kernel tests,
+`common/ktest.sh qwen38-27b pkg TESTDIR` writes and runs the kernel tests for the switches the package was built with. Every recipe change here passed these kernel tests,
 greedy output equality against the previous package (texts and draft counters), and a served A/B before going live.
 
 ## Requirements and limits
 
 - gfx1151 only, with ~53 GB free: this preset does not fit a 64 GB machine.
-- Serve with `--pool_backing=fixed` (serve.sh does this). KV8 is only correct with fixed backing on Loom 0.2.0.
+- Serve with `--pool_backing=fixed` (`common/serve.sh` does this). KV8 is only correct with fixed backing on Loom 0.2.0.
 - Unlimited memlock is required.

@@ -7,13 +7,16 @@ These are [Loom](https://pypi.org/project/hrx-loom/) (hrx-loom) model kits tuned
 Max+ 395 with the Radeon 8060S (gfx1151, RDNA 3.5) and 128 GB of unified LPDDR5X. Each kit pushes one model's decode
 and prefill toward this chip's hardware limits, and every change is measured on the served program.
 
-A kit contains:
-- a generator that writes the Loom programs, forked from the `loom-port-llm` starter of
-  [loom-fun/loom-skills](https://github.com/loom-fun/loom-skills);
-- a model config;
-- a fetch script that pins the weights by revision and sha256;
-- the build recipe (generator switches) and serve flags;
-- the kernel tests.
+The repository has three parts:
+- `kit/` is the shared generator that writes the Loom programs for every kit. It is forked from the `loom-port-llm` starter
+  of [loom-fun/loom-skills](https://github.com/loom-fun/loom-skills). Each optimization is a switch, and an unset switch
+  leaves the generated program unchanged, so one model's tuning cannot change another's programs.
+- `kits/<model>/` holds what is specific to one model:
+  - a manifest (`kit.env`: model id, recipe switches, build and serve flags, reference GGUF);
+  - the model config;
+  - a fetch script that pins the weights by revision and sha256.
+- `common/` holds tools that work for any kit: build, serve, kernel tests, output equality, gates, an agent-session A/B,
+  and code-object analysis.
 
 The weights are never redistributed; each kit downloads them from their original repositories.
 
@@ -32,16 +35,31 @@ The weights are never redistributed; each kit downloads them from their original
 - A loom-skills checkout for its knowledge base (`LOOM_KB_ROOT=<checkout>/skills/loom-kb`), tested at 7952d7f.
 - Note that the BIOS power mode matters: on some boards the 85 W default caps prefill noticeably below the 120 W mode.
 
-## Layout
+## Usage
 
+```bash
+cp common/env.example ~/.config/loom-strix-kits/env   # then edit it: venv, loom-skills checkout, llama.cpp, work dir
+kits/qwen38-27b/fetch.sh                              # pinned weights + tokenizer
+common/build.sh qwen38-27b pkg                        # the kit's recipe; EXTRA="SWITCH=1" adds switches
+common/serve.sh qwen38-27b pkg                        # OpenAI-compatible API, the kit's serve flags
 ```
-kits/<kit>/kit/        the generator (Python) and its kernel tests
-kits/<kit>/config.json the model config read by kit/build.py
-kits/<kit>/fetch.sh    pinned downloads into kits/<kit>/models, sha256-checked
-kits/<kit>/build.sh    the current recipe: kit/build.py with its switches
-kits/<kit>/serve.sh    loom-serve with the flags the kit was measured with
-common/                (coming) shared tooling: A/B harness, served-profile tools, gates
-```
+
+| Tool | What it does |
+|---|---|
+| `common/build.sh KIT PKG` | builds with the kit's recipe; writes PKG.cmd (the exact command) and refuses while a measurement runs |
+| `common/serve.sh KIT PKG` | serves in the foreground with the kit's flags |
+| `common/state.sh KIT [--pkg\|--idle]` | shows what serves on the port, read-only |
+| `common/ktest.sh KIT PKG DIR` | runs the kernel tests for exactly the switches PKG was built with |
+| `common/serve_as.sh KIT PKG` | serves one package for a measurement: stops other servers, waits for a quiet machine, checks the port serves PKG |
+| `common/eq.sh KIT PKG REF OUT` | greedy outputs and draft counters against a reference, one server at a time; exits 1 on any difference |
+| `common/gates.sh KIT PKG OUT` | runs loom-skills' quick gates (llama.cpp reference outputs, chat, tools, vision, concurrency) |
+| `common/agent_ab.sh KIT A B OUT SESSION` | A/B on a frozen agent session (`agent_bench/freeze.py`), ABBA halves |
+| `common/loop_census.py`, `compiler_ab.py`, `load_cover.py`, `load_events.py` | code-object analysis: hot loops, register moves, load-to-wait cover |
+| `common/serve_code_dump.py` | dumps the kernels a running loom-serve compiled, which are not always the ones a benchmark compiles |
+| `common/agent_run_summary.py` | summarizes server-side numbers of an agent run from /metrics snapshots |
+
+`build.sh`, `state.sh` and `ktest.sh` have run in this layout. `serve_as.sh`, `eq.sh`, `gates.sh` and `agent_ab.sh` are
+ports of the scripts we use daily; their first runs in this layout are still pending.
 
 ## License
 

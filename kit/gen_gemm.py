@@ -1360,9 +1360,14 @@ if __name__ == "__main__":
     import gen_gemm_rdna4 as _rdna4   # LOOM_RDNA4=0: no gfx12 twins (output byte-identical to the gfx11-only generator)
     post = lambda t: order(skip(t))
     on256 = os.environ.get("GEMM_M256", "1") not in ("", "0", "false", "no")   # 256-row kernels (_m256)
+    acc256 = set(filter(None, os.environ.get("GEMM_ACC_M256_ONLY", "").split(",")))   # gen_llm EPI_FUSE (epi_fuse.py): these formats' acc kernels at 256 rows only
     for item in spec.split(","):
         fmt, modes = item.split(":")
         for mode in modes.split("+"):
+            if mode == "acc" and fmt in acc256:
+                assert fmt not in HELPER and on256, f"GEMM_ACC_M256_ONLY: {fmt} has no 256-row kernel"
+                out.append(_rdna4.with_twins(post(gemm_big256(fmt, mode))))
+                continue
             out.append(_rdna4.with_twins(post(gemm(fmt, mode))))
             if fmt in HELPER:   # the 64-row tile kernel under the 128-row name (its dequant has no prefetchable load)
                 name = f"{PREFIX}_gemm_{fmt}_{mode}"

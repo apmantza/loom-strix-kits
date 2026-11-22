@@ -4,7 +4,7 @@ Strata src/prefill/gemm.cu:1383-1385). Bitwise the same products: only addresses
 
 Writers and readers (the closed set, listed from the served program pkg-u60x, 11-21):
   activations (f16 copies %h16 / %o16 / %f16 / drafter %hc16 / %features16):
-    writers  g_row_scale_f16[_live[_lv]] (view [rows]x[k4]x4xf16), g_post_add_norm_rs[_live[_lv]] (view [tokens]xHGx32xf16)
+    writers  g_row_scale_f16[_live[_lv]] (view [rows]x[k4]x4xf16), g_[post_]add_norm_rs[_live[_noh][_lv]] (view [tokens]xHGx32xf16; EPI_FUSE)
     readers  every g_gemm_* kernel (view [rows]x[k]xf16)                      -> stride k + PAD
   weights (the PREFILL_F16_SCRATCH f16 copy):
     writer   g_deq16_<fmt> (%elem = row * k + col)                              -> row * (k + PAD) + col
@@ -76,7 +76,7 @@ def _audit(text):
     constant. Fails closed on a writer whose width or destination size it cannot resolve (E170)."""
     hg = {}
     for it in _items(text):
-        m = re.match(r'kernel\.def (?:target\(@\w+\) )?export\("(g_post_add_norm_rs\w*)"\)', it)
+        m = re.match(r'kernel\.def (?:target\(@\w+\) )?export\("(g_(?:post_)?add_norm_rs\w*)"\)', it)
         if m:
             g = re.search(r"view<\[%tokens\]x(\d+)x32xf16>", it)
             hg[m.group(1)] = int(g.group(1)) * 32 - PAD if g else None
@@ -85,7 +85,7 @@ def _audit(text):
         def const(name, kind):
             m = re.search(r"^  " + re.escape(name) + r" = index\.constant (\d+) : " + kind + "$", seg, re.M)
             return int(m.group(1)) if m else None
-        for m in re.finditer(r"kernel\.launch @(g_row_scale_f16\w*|g_post_add_norm_rs\w*)\[[^\]]*\]\(([^)]*)\)", seg):
+        for m in re.finditer(r"kernel\.launch @(g_row_scale_f16\w*|g_(?:post_)?add_norm_rs\w*)\[[^\]]*\]\(([^)]*)\)", seg):
             k, args = m.group(1), [a.strip() for a in m.group(2).split(",")]
             dst = args[-1]
             if k.startswith("g_row_scale_f16"):
@@ -105,7 +105,7 @@ def _audit(text):
 
 
 RULES = [(r"g_gemm_f16_\w+", lambda k: _gemm_f16_w(_gemm(k))), (r"g_gemm_\w+", _gemm), (r"g_deq16_\w+", _deq16),
-         (r"g_row_scale_f16(_live)?(_lv)?", _row_scale), (r"g_post_add_norm_rs(_live)?(_lv)?", _post_add)]
+         (r"g_row_scale_f16(_live)?(_lv)?", _row_scale), (r"g_(?:post_)?add_norm_rs(_live)?(_noh)?(_lv)?", _post_add)]
 
 
 ALLOC = re.compile(r"^  (%\w+16) = buffer\.alloca<global> align\(\d+\) (%\w+) : buffer$", re.M)
@@ -152,7 +152,7 @@ def apply(text):
                     done[name] = pat
                     break
             else:
-                assert not re.match(r"g_(gemm|deq16|row_scale_f16|post_add_norm_rs)", name), f"PF16_PAD: no rule for {name}"
+                assert not re.match(r"g_(gemm|deq16|row_scale_f16|post_add_norm_rs|add_norm_rs)", name), f"PF16_PAD: no rule for {name}"
         out.append(it)
     assert any(p.startswith("g_gemm_f16") for p in done.values()), "PF16_PAD: no f16 GEMM converted"
     out = "".join(out)
