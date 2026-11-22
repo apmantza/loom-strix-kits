@@ -5,7 +5,9 @@
   - a kernel picked by prefix (g_gemm_x_m256 matched for g_gemm_x_m256_acc) or a config region evaluated past its own
     `kernel.launch.config`: every kernel.def in a real program is resolved by exact name, and its region either evaluates or
     is refused with the unsupported line, never guessed;
-  - an argument missing, given twice or misspelt passing the kernarg packer.
+  - an argument missing, given twice or misspelt passing the kernarg packer;
+  - another engine's code object (no argument names in its metadata) launched with arguments bound by guess: --arg-names
+    must name them in order, and a missing or miscounted list is refused.
 usage: test_hsaco_run.py PROGRAM.loom CODE_OBJECT_DIR"""
 import glob, os, re, subprocess, sys
 
@@ -107,6 +109,17 @@ def main():
             hr.fill(16, "file:" + p, np.random.default_rng(0)); ok(False, "file fill refuses a file larger than its buffer")
         except SystemExit:
             ok(True, "file fill refuses a file larger than its buffer")
+    # 5. unnamed arguments (a hipcc build of another engine's kernel): named in order, or refused
+    import copy
+    meta = {".args": [{".offset": 0, ".size": 8, ".value_kind": "global_buffer"}, {".offset": 8, ".size": 4, ".value_kind": "by_value"},
+                      {".offset": 16, ".size": 8, ".value_kind": "hidden_block_count_x"}], ".kernarg_segment_size": 24}
+    m = hr.name_args(copy.deepcopy(meta), ["X", "M"])
+    ok([x.get(".name") for x in m[".args"]] == ["X", "M", None], "--arg-names names the non-hidden arguments in order")
+    for what, names in (("without --arg-names", None), ("with a wrong count", ["X"])):
+        try:
+            hr.name_args(copy.deepcopy(meta), names); ok(False, f"unnamed arguments refused {what}")
+        except SystemExit:
+            ok(True, f"unnamed arguments refused {what}")
     sys.exit(1 if fails else 0)
 
 

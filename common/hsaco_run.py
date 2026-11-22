@@ -107,6 +107,24 @@ def kv(items, conv=int):
     return out
 
 
+def name_args(meta, names):
+    """Give the kernel's non-hidden arguments their names when the metadata has none (hipcc code objects of other engines
+    carry no argument names): NAMES in argument order. Refuses a count that does not match and unnamed arguments without
+    NAMES, so a kernel is never launched with arguments bound by guess."""
+    args = [x for x in meta[".args"] if not x[".value_kind"].startswith("hidden_")]
+    unnamed = [x for x in args if not x.get(".name")]
+    if names is None:
+        if unnamed:
+            sys.exit(f"{len(unnamed)} of the kernel's {len(args)} arguments have no name in its metadata: pass --arg-names "
+                     f"with {len(args)} names in order")
+        return meta
+    if len(names) != len(args):
+        sys.exit(f"--arg-names gives {len(names)} names; the kernel takes {len(args)} arguments")
+    for x, n in zip(args, names):
+        x[".name"] = n
+    return meta
+
+
 def bind_names(meta, dev):
     """metadata arg name -> every name it may be given by (metadata name, source name, source name without _arg)."""
     args = [a for a in meta[".args"] if not a[".value_kind"].startswith("hidden_")]
@@ -207,9 +225,10 @@ def main():
     ap.add_argument("--compare", action="append", default=[])
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--arg-names", help="comma-separated argument names in order, for code objects whose metadata has none")
     a = ap.parse_args()
     objs = [o.split("=", 1) if "=" in o else (o, o) for o in a.objects]
-    metas = [kernel_meta(p, a.kernel) for _, p in objs]
+    metas = [name_args(kernel_meta(p, a.kernel), a.arg_names.split(",") if a.arg_names else None) for _, p in objs]
     lay = [[(x[".name"], x[".offset"], x[".size"], x[".value_kind"]) for x in m[".args"]] for m in metas]
     if any(l != lay[0] for l in lay):
         sys.exit("the code objects' argument layouts differ: not an A/B of one kernel")
