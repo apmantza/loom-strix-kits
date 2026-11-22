@@ -29,6 +29,19 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
   (hidden 4,096) into the 2,304-wide text model. Projector GGUFs: Unsloth mmproj BF16 / F16 0.64 GB, F32 1.27 GB; ggml-org
   BF16 0.64 GB, Q8_0 0.35 GB. Vision is a goal for every kit (kit/vision), so the encoder is in scope after plain decode.
 
+## KV cache (22 Nov)
+- As released every loop pass keeps its own cache: 48 slots, 8 global (layers 5 and 23, plus 11 and 17 on each of 3 passes: 8 KV
+  heads x 128 x K,V x 2 B = 32 KiB per token at f16) and 40 sliding-window slots (1,024 positions, 160 MiB fixed) [comp, config].
+  At f16: 1.2 / 4.2 / 8.2 GiB at 32k / 128k / 256k. Sharing the global cache across passes would halve the per-token figure
+  (16 KiB), but no variant of sharing is exact: the model was trained with per-pass caches, the blog shows no KV ablation, and
+  SGLang / vLLM offer only full sharing and refuse it on this fixed-loop model; llama.cpp and Strata keep the 48 slots.
+- At f16 the global slots' reads equal the 5.55 GB weight read near 169k tokens, so long-context decode is KV-bound sooner
+  than on Qwen3.8-27B. Plan: per-pass caches (exact), 8-bit KV read in-tile inside every attention variant (relative bias,
+  sink, sliding window), as the Qwen kit's KV8.
+- llama.cpp: Unsloth's fork's relative-bias attention kernel took only F16/BF16 K/V, so q8_0 KV fell back to a dense path
+  with an extra F16 copy (more memory than F16); fixed in their fork (unslothai/llama.cpp PRs 386 / 399: in-tile q8_0 / q4_0),
+  not upstream. Reference runs on a build without it use F16 KV.
+
 ## Floors (lanes.json from common/make_lanes.py on the native header; 228 GB/s, 45 TFLOP/s)
 - Decode reads **5.55 GB per token** (one token) but **15.6 GB per 8-token verify step**: eight tokens touch ~40 % of each
   layer's experts. Speculation buys far less here than on a dense model: a step costs ~2.8x a token.
