@@ -24,6 +24,11 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
   and MXFP8 (e4m3, an e8m0 scale per 32) in layers 20-23; gate and up rows interleaved. The MTP head (`mtp.safetensors`,
   BF16) is a DSpark block drafter: 3 dense layers drafting 8-token blocks from four target feature taps plus a Markov head.
 
+- **Vision** (`vision_config`, `inkling2_vision` [src, config.json]): a 23-layer ViT, hidden 1,024, 16 heads, MLP ratio 4, native
+  patch 20 with a 32x32 learned position grid, temporal patch 2 (video), a 2x2 merge adapter and a bias-free projector
+  (hidden 4,096) into the 2,304-wide text model. Projector GGUFs: Unsloth mmproj BF16 / F16 0.64 GB, F32 1.27 GB; ggml-org
+  BF16 0.64 GB, Q8_0 0.35 GB. Vision is a goal for every kit (kit/vision), so the encoder is in scope after plain decode.
+
 ## Floors (lanes.json from common/make_lanes.py on the native header; 228 GB/s, 45 TFLOP/s)
 - Decode reads **5.55 GB per token** (one token) but **15.6 GB per 8-token verify step**: eight tokens touch ~40 % of each
   layer's experts. Speculation buys far less here than on a dense model: a step costs ~2.8x a token.
