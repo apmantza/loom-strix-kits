@@ -22,7 +22,7 @@ run() {   # half, package, first turn
   echo "$tag done $(date +%T)"
 }
 run h1 "$A" 0; run h1 "$B" 0; run h2 "$B" 2; run h2 "$A" 2
-"$T" - "$OUT" "$(basename "$A")" "$(basename "$B")" <<'PY' | tee "$OUT/summary.txt"
+"$T" - "$OUT" "$(basename "$A")" "$(basename "$B")" "$H" <<'PY' | tee "$OUT/summary.txt"
 import glob, json, sys
 out, a, b = sys.argv[1:4]
 def rows(pkg):
@@ -48,5 +48,23 @@ for p in (a, b):
     eqd = sum(x["out"] for x in eq) / max(sum(x["gen_s"] for x in eq), 1e-9)
     print(f"{p:14s} decode {out_t/gen:5.2f} tok/s (equal-length turns {eqd:5.2f})  tokens/step {out_t/max(out_t-acc,1):4.2f}  "
           f"prefill {new/ttft:6.1f} tok/s  mean TTFT {ttft/len(rs):5.1f} s  ({len(rs)} turns)")
+sys.path.insert(0, sys.argv[4])
+import checks  # common/checks.py: paired bootstrap CI, ABBA neighbour rule, loop flag
+rate = lambda x: (x["out"] - 1) / x["gen_s"] if x["gen_s"] > 0 and x["out"] > 1 else None
+pt = [t for t in common if rate(R[a][t]) and rate(R[b][t])]
+if len(pt) >= 3:
+    p_, lo, hi = checks.paired_ratio_ci([rate(R[a][t]) for t in pt], [rate(R[b][t]) for t in pt])
+    print(f"decode ratio {b}/{a} (median of per-turn rates, {len(pt)} paired turns): {p_:.3f}, 95 % CI [{lo:.3f}, {hi:.3f}]"
+          + ("  (CI includes 1: not a measured difference)" if lo <= 1 <= hi else ""))
+def half(pkg, h):
+    rs = [x for f in glob.glob(f"{out}/{h}-{pkg}.jsonl") for l in open(f) for d in [json.loads(l)] if d.get("summary", {}).get("label") == pkg for x in d["rows"]]
+    o_, g_ = sum(x["out"] for x in rs), sum(x["gen_s"] for x in rs)
+    return {"decode": o_ / max(g_, 1e-9), "prefill": sum(x["new"] for x in rs) / max(sum(x["ttft"] for x in rs), 1e-9),
+            "ttft": sum(x["ttft"] for x in rs) / max(len(rs), 1)}
+ok, why = checks.neighbour_verdict({h: {"ref": half(a, h), "cand": half(b, h)} for h in ("h1", "h2")}, "decode", ["prefill", "ttft"],
+                                   {"decode": True, "prefill": True, "ttft": False})
+print(f"neighbour rule (B beats A in both ABBA halves, prefill / TTFT not > 3 % worse): {'ACCEPT' if ok else 'REJECT'}; " + "; ".join(why))
+loops = {p: [t for t in common if (R[p][t].get("loop") or 0) >= 0.5 and R[p][t]["out"] >= 64] for p in (a, b)}
+print("loop flags (8-gram repeat share >= 0.5): " + ", ".join(f"{p} {len(v)} turns {v[:6]}" for p, v in loops.items()))
 PY
 echo "AGENT_AB_DONE $(date +%T)"

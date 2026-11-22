@@ -28,6 +28,8 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engines  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import checks  # noqa: E402  loop flag (common/checks.py)
 sys.path.insert(0, os.path.join(os.environ.get("LOOM_SKILLS") or sys.exit("set LOOM_SKILLS to a loom-skills checkout"), "skills/loom-benchmark/scripts"))
 from bench_common import acceptance_between, server_draft_counters  # noqa: E402
 
@@ -149,7 +151,8 @@ def run(k, own):
     row = {"turn": k, "prompt": pt, "cached": cached, "new": pt - cached, "rec_new": t["rec_new"], "rec_cached": t["rec_cached"],
            "ttft": round(ttft, 2), "prefill_tps": round((pt - cached) / ttft, 1) if ttft > 0 else None, "out": out,
            "rec_out": t["rec_out"], "gen_s": round(gen, 2), "decode_tps": round((out - 1) / gen, 1) if gen > 0 and out > 1 else None,
-           "wall": round(end - t0, 2), "rec_wall": t["rec_wall_s"], "cap": cap}
+           "wall": round(end - t0, 2), "rec_wall": t["rec_wall_s"], "cap": cap,
+           "loop": round(checks.loop_share("".join(reasoning) + "".join(content)), 3)}   # >= 0.5 over >= 64 words: a degenerate repeat, not speed
     if dc0:
         dc1 = server_draft_counters(a.url)
         row["draft_acc"] = acceptance_between(dc0, dc1)

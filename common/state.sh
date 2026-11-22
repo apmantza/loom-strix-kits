@@ -12,4 +12,4 @@ st=$(curl -s -m 5 127.0.0.1:$PORT/v1/status | python3 -c "import json,sys; s=jso
 read -r phase act q <<< "$st"
 if [ "${2:-}" = --idle ]; then [ "$act" = 0 ] && [ "$q" = 0 ]; exit; fi
 pid=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-echo "package $pkg pid $pid backing $(tr '\0' '\n' < /proc/$pid/cmdline | sed -n 's/^--pool_backing=//p') phase $phase active $act queued $q"
+echo "package $pkg pid $pid backing $(tr '\0' '\n' < /proc/$pid/cmdline | sed -n 's/^--pool_backing=//p') phase $phase active $act queued $q GPU memory $(python3 "$LSK/common/checks.py" drm "$pid")"

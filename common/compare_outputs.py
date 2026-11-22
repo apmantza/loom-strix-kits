@@ -15,6 +15,8 @@ import time
 SKILLS = os.path.join(os.environ.get("LOOM_SKILLS") or sys.exit("set LOOM_SKILLS to a loom-skills checkout"), "skills")
 sys.path.insert(0, os.path.join(SKILLS, "loom-benchmark", "scripts"))
 from bench_common import doc, server_draft_counters, stream, thinking_extra  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import checks  # noqa: E402  loop flag
 
 argv = [x for x in sys.argv[1:] if x not in ("--long", "--text-only")]
 LONG = "--long" in sys.argv
@@ -30,7 +32,7 @@ if argv and argv[0] == "--diff":
         pfx = next((i for i, (p, q) in enumerate(zip(x, y or "")) if p != q), min(len(x), len(y or ""))) if not eq else "-"
         da, db = A[name].get("draft"), B.get(name, {}).get("draft")
         dsame += da == db
-        print(f"{name:6s} prompt {A[name]['prompt_tokens']} tok  identical={eq}  first diff at char {pfx}  draft A {da} B {db}{'' if da == db else '  DRAFTS DIFFER'}")
+        print(f"{name:6s} prompt {A[name]['prompt_tokens']} tok  identical={eq}  first diff at char {pfx}  draft A {da} B {db}{'' if da == db else '  DRAFTS DIFFER'}{'  LOOP(A)' if checks.is_loop(x) else ''}{'  LOOP(B)' if checks.is_loop(y or '') else ''}")
     print(f"IDENTICAL {same}/{len(A)}  DRAFTS EQUAL {dsame}/{len(A)}")
     sys.exit(0 if same == len(A) and ("--text-only" in sys.argv or dsame == len(A)) else 1)
 SAVE = None
@@ -55,7 +57,7 @@ if SAVE:
         c1 = server_draft_counters(url)
         dr = {k: c1.get(k, 0) - c0.get(k, 0) for k in c1}   # E170: equal prompts on an exact candidate give equal drafts
         res[name] = {"text": s.get("text") or "", "prompt_tokens": s.get("prompt_tokens"), "ttft": s.get("ttft"), "draft": dr}
-        print(f"{name:6s} prompt {s.get('prompt_tokens')} tok  {len(res[name]['text'])} chars  draft {dr}", flush=True)
+        print(f"{name:6s} prompt {s.get('prompt_tokens')} tok  {len(res[name]['text'])} chars  draft {dr}{'  LOOP' if checks.is_loop(res[name]['text']) else ''}", flush=True)
     json.dump(res, open(SAVE, "w"), indent=1)
     sys.exit(0)
 same = 0
