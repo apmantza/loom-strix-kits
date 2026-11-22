@@ -99,5 +99,16 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    **Started 11-22**: kit/gen_nvfp4.py, the NVFP4 expert codes for the int8 decode path (@g_nvfp4_icodes: e2m1 as doubled
    integer codes by a v_perm table, two e4m3 half scales decoded on integers, the per-expert factor applied per row) and a
    single-token probe matvec: compiles on Loom 0.2.0 and 0.3.0 for gfx1151, 211 instructions, 35 VGPRs, no lint flag
-   (kit/test_nvfp4.py). Not yet wired into gen_moe; no kernel test yet.
+   (kit/test_nvfp4.py).
+   **Experts in the shared generator (22 Nov)**: the GGUF route's NVFP4 is ggml's block layout (36 bytes per 64 values, scale bytes
+   first, nibble j / j+8 per 16), not the native split planes: format "nvfp4" (kit/formats.py) with @g_nvfp4_icodes
+   (gen_nvfp4.gguf_icodes), the SITU activation (moe.act "situ") and the per-expert gate_up scale (gen_moe.expert_mv gu_scale).
+   Inkling's fused gate+up (K 2304, 2 x 1152) and down (K 1152) expert kernels compile lint-clean at 16 waves; a GPU value test
+   against ggml's decode is written (kit/test_nvfp4_gguf.py --gpu). Semantics from Unsloth's llama.cpp fork (src/models/inkling2.cpp,
+   inkling2-loop.cpp, llama-graph.cpp build_moe_ffn).
+   **Loop (22 Nov)**: every pass restarts from the prelude output; passes 2-3 mix a message (depth attention over the previous
+   pass's block states) into each core layer's q, k, v and FFN inputs through a controller, out = cur - tanh(F z) cur +
+   tanh(G z) msg, z = D [rms(cur); rms(msg)] (rank 64, f32 weights, ~226 MB per token). kit/gen_loop.py has the controller kernel
+   (weights read once per token, 176 VGPRs, lint-clean; kit/test_loop.py). Still to write: the message mix (shared with the block
+   attention residuals), the 48-slot schedule in the program, a multi-token controller for verify spans.
 4. Weights route: UD-Q4_K_XL chosen 22 Nov (see Weights); confirm with our own KLD run against UD-Q8_K_XL (step 2).
