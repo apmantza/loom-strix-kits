@@ -27,8 +27,12 @@ def floor(kind, m, hw, context=0, prompt=0):
         # write them as f16 (2 B per linear parameter); ideal is 0 (a GEMM that reads quantized weights directly)
         chunks = -(-prompt // m["prefill_chunk"])
         return chunks * (m["gemm_weight_bytes"] + 2 * m["linear_params"]) / bw
-    if kind == "decode_kv":
-        return m["attn_layers"] * context * m["kv_bytes_per_pos_layer"] / bw * 1e3
+    if kind == "decode_kv":   # hybrids (make_lanes --global-layers): global slots read the context, sliding slots their window
+        if "attn_slots_global" in m:
+            pos = m["attn_slots_global"] * context + m["attn_slots_sliding"] * min(context, m["sliding_window"])
+        else:
+            pos = m["attn_layers"] * context
+        return pos * m["kv_bytes_per_pos_layer"] / bw * 1e3
     if kind == "prefill_linear":
         return 2 * m["linear_params"] * prompt / peak
     if kind == "prefill_attn":   # causal: query i attends i + 1 keys; QK^T and PV are 2 FLOPs per multiply-add each

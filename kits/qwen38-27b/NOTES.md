@@ -29,16 +29,16 @@ skills/loom-strix-optimise/devices/gfx1151.md. E-numbers point into the authors'
 Two head matvecs per verify step have two owners: `g_head_mv_t8_q8` is the target's verify head; `g_head_mv_t8_q8_p40` is the
 drafter's proposal head. Attribute a kernel by the program that launches it (events_summary does), not by its name.
 
-## Where the time is (one request, 81,430-token prompt, device time; Nov 2026)
+## Where the time is (one request, 81,430-token prompt, device time; Nov 2026; floors from common/make_lanes.py)
 | Part | Measured | Floor |
 |---|---|---|
-| decode weight matvecs | 80.9 ms/step | 74.3 |
+| decode weight matvecs | 80.9 ms/step | 72.7 (16.58 GB: the GGUF's MTP layer is never read) |
 | decode verify attention | 27.3 ms/step | 12.1 (KV8 bytes) |
 | decode drafter | 10.5 ms/step | 8.7 |
 | decode GDN | 3.6 ms/step | 1.4 |
 | prefill GEMMs | 111.5 s | 88.1 |
 | prefill attention | 60.1 s | 29.0 |
-| prefill dequant | 5.8 s | 5.7 |
+| prefill dequant | 5.8 s | 5.6 |
 | prefill GDN | 9.4 s | ~3.8 |
 
 ## Recipe switches
