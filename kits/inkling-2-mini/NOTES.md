@@ -71,4 +71,8 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
 2. Reference: the Transformers implementation on CPU for per-layer outputs at short prompts; Unsloth's llama.cpp build for
    GGUF references and `common/quant_eval.sh` (UD-Q4_K_XL against UD-Q8_K_XL, which keeps the native experts).
 3. Generator (kit/, behind an `inkling2` architecture path): plain decode first, no speculation; then prefill; then DSpark.
+   **Started 11-22**: kit/gen_nvfp4.py, the NVFP4 expert codes for the int8 decode path (@g_nvfp4_icodes: e2m1 as doubled
+   integer codes by a v_perm table, two e4m3 half scales decoded on integers, the per-expert factor applied per row) and a
+   single-token probe matvec: compiles on Loom 0.2.0 and 0.3.0 for gfx1151, 211 instructions, 35 VGPRs, no lint flag
+   (kit/test_nvfp4.py). Not yet wired into gen_moe; no kernel test yet.
 4. Decide the weights route on numbers: native (exact, 5.55 GB/token) or a GGUF quant (fewer attention bytes; KLD from step 2).
