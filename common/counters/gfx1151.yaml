@@ -1,0 +1,43 @@
+# Derived counters for gfx1151 (rocprofv3 -E this file; ROCm 10.2). Raw counters and units from rocprofv3-avail info --pmc:
+# SQ_WAVE_CYCLES, SQ_WAIT_ANY, SQ_WAIT_INST_ANY are in quad-cycles (4 cycles); SQ_WAIT_CNT_VMVS, SQ_WAIT_DELAY_ALU say "cycles".
+# Until common/counters.sh calibrate has run (bw_probe: known bytes, known waits), the *Pct metrics are unit-uncalibrated and
+# MemReadBytes is checked against bw_probe's 4 GiB. 10.2's own FETCH_SIZE has no gfx1151 expression; MemReadBytes stands in.
+rocprofiler-sdk:
+  counters-schema-version: 1
+  counters:
+    - name: MemReadBytes
+      description: 'Bytes the L2 requested from memory (EA read requests weighted by size). Unit: bytes'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: reduce(GL2C_EA_RDREQ_32B,sum)*32+reduce(GL2C_EA_RDREQ_64B,sum)*64+reduce(GL2C_EA_RDREQ_96B,sum)*96+reduce(GL2C_EA_RDREQ_128B,sum)*128
+    - name: VmemLoadLatency
+      description: 'Mean cycles a vector-memory load is in flight (as LdsLatency, for TEX_LOAD; includes FLAT/global). Unit: cycles'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: reduce(accumulate(SQ_INST_LEVEL_TEX_LOAD,HIGH_RES),sum)/reduce(SQ_INSTS_TEX_LOAD,sum)
+    - name: VmemLoadsInFlight
+      description: 'Mean vector-memory loads in flight per busy cycle (Little: latency x issue rate). Unit: loads'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: reduce(accumulate(SQ_INST_LEVEL_TEX_LOAD,HIGH_RES),sum)/reduce(GRBM_GUI_ACTIVE,max)
+    - name: WaitVmemPct
+      description: 'Waiting on vmcnt/vscnt per wave time (uncalibrated units until calibrate). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*reduce(SQ_WAIT_CNT_VMVS,sum)/(4*reduce(SQ_WAVE_CYCLES,sum))
+    - name: WaitDelayAluPct
+      description: 'Waiting on s_delay_alu per wave time (uncalibrated units until calibrate). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*reduce(SQ_WAIT_DELAY_ALU,sum)/(4*reduce(SQ_WAVE_CYCLES,sum))
+    - name: WaitAnyPct
+      description: 'Waiting on anything per wave time (both in quad-cycles). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*reduce(SQ_WAIT_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
