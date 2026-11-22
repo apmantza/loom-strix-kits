@@ -23,6 +23,9 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
             least half the WMMAs sit within 3 instructions after an lgkmcnt(0) that retires a ds_load issued at most 12
             instructions earlier: no LDS fragment kept in flight across a multiply (the 256-row GEMMs: 48 of 64; their 128-row
             siblings keep one with lgkmcnt(2)). Column ldsser = that share.
+  [barriers] a NOTE: >= BARRIERS workgroup barriers outside every loop: reductions done one at a time (each workgroup sum costs
+            a barrier pair) instead of batched through LDS behind one barrier (E272: a depth-mix draft had 40, the batched form 2;
+            llama.cpp's mul_mat_vec_f with 8 columns has 17, one block reduction per column). Column bar = that count.
   [outlier] a NOTE, not a flag (E251: 0 of 2 confirmed on llama.cpp, where one template spans formats of different cost):
             non-MMA instructions per MMA (or dot) > OUTLIER x the median of its peers (same family, place, MMA kind and MMA
             count, >= 3 kernels): a kernel doing much more per multiply than its siblings (E233: q6_k's matvec 616 vs q5_k's 261).
@@ -62,6 +65,7 @@ MM = ("v_wmma", "v_dot4", "v_dot2", "v_dot8")
 COPY_RUN = 16
 JOIN_RUN = 32
 SERIAL_LINKS = 4
+BARRIERS = 8
 LDSSER = 0.5
 VMLOAD = re.compile(r"(?:global|buffer|flat)_load_")
 SMLOAD = re.compile(r"s_(?:load|buffer_load)_")
@@ -362,6 +366,12 @@ def lint_listing(name, ins, addr, res=(None, None, None)):
     r["ldsser"] = lds_serialized(b) if r["where"] == "loop" else None
     if r["ldsser"] is not None and r["ldsser"] >= LDSSER:
         r.setdefault("notes", []).append("ldsser")             # a prompt to measure, not a flag (E254: cost unproven)
+    inloop = set()
+    for a, z in loops(ins, addr):
+        inloop.update(range(a, z + 1))
+    r["bar"] = sum(1 for j, x in enumerate(ins) if x.startswith("s_barrier") and j not in inloop)
+    if r["bar"] >= BARRIERS:
+        r.setdefault("notes", []).append("barriers")            # E272: reduce several sums behind one barrier
     r["join"] = join_runs(ins)
     if r["join"] >= JOIN_RUN:
         r["flags"].append("join")

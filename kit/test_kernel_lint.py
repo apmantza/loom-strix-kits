@@ -23,6 +23,8 @@
   - the 256-row GEMMs' LDS-to-WMMA serialization (E254: 48 of 64 WMMAs right after lgkmcnt(0), queue item 6 / E152) not
     reported: a loop whose WMMAs each wait lgkmcnt(0) on a fragment just loaded gets the `ldsser` note (a note until a counter
     run shows its cost), one that keeps a fragment in flight with lgkmcnt(2) does not;
+  - reductions serialised one barrier pair at a time (E272: a depth-mix draft with 40 barriers) not noted `barriers`: ten
+    straight-line barriers get the note, the same barriers inside a loop (a staged pipeline) do not;
   - a branch-join copy not flagged (E247: the norm's idle-lane zero branch, 61-64 moves after an exec restore, every pass):
     a run of 40 moves right after an exec restore flags `join`, one of 20 does not;
   - a regression against another build missed (E226 0.3.0's longer loop and move run, E230 a new spill, E236 fewer waves);
@@ -160,6 +162,11 @@ def main():
     far += sum(([f"s_load_b32 s{10 + k}, s[4:5], 0x{4 * k:x}", "s_waitcnt lgkmcnt(0)", wm(k)] for k in range(8)), [])
     r = kl.lint_listing("ldsfar", *listing(loop_of(far)))
     ok("ldsser" not in r.get("notes", []), f"lgkmcnt(0) waits on scalar loads, the LDS loads long before: no note (share {r.get('ldsser')})")
+    sr = ["s_mov_b32 s0, 0"] + sum((["ds_store_b32 v1, v2", "s_barrier", "ds_load_b32 v3, v1", "v_add_f32_e32 v4, v4, v3"] for _ in range(10)), [])
+    r = kl.lint_listing("serial_reduce", *listing(sr + ["s_endpgm"]))
+    ok("barriers" in r.get("notes", []) and r["bar"] == 10, f"ten straight-line barriers get the barriers note (bar {r.get('bar')})")
+    r = kl.lint_listing("pipelined", *listing(loop_of(sum((["ds_store_b32 v1, v2", "s_barrier", "ds_load_b32 v3, v1"] for _ in range(10)), []))))
+    ok("barriers" not in r.get("notes", []), f"barriers inside a loop (a staged pipeline) do not (bar {r.get('bar')})")
     r = kl.lint_listing("run10", *listing(moves_loop(10)))
     ok("copies" not in r["flags"], f"a 10-move run does not (run {r['run']}, flags {r['flags']})")
     row = lambda k, op, wm=0, dt=8: {"kernel": k, "where": "loop", "wmma": wm, "dot": dt, "other_per_op": op, "flags": []}
