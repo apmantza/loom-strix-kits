@@ -4,9 +4,10 @@ number of instructions until the s_waitcnt vmcnt that retires it (in-order vmcnt
 exposed (waited right after issue); ~150-500 = it overlaps work (a working prefetch). Check this before timing any
 reorder or prefetch: Loom places a pending load's consumer at its earliest legal point (E110).
 usage: load_cover.py KERNEL.hsaco FIRST_INSTR LAST_INSTR   (indices as load_events.py prints them)"""
-import sys,re,subprocess
-d=subprocess.run(['llvm-objdump-21','-d','--mcpu=gfx1151',sys.argv[1]],capture_output=True,text=True).stdout
-ins=[x.strip() for x in d.split('\n') if re.match(r'^\s+[a-z]',x)]
+import os,re,sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from loop_census import disasm  # noqa: E402  (one decoder for every tool: E230)
+ins=disasm(sys.argv[1])[0]
 lo,hi=int(sys.argv[2]),int(sys.argv[3])
 q=[]; out=[]
 for i,l in enumerate(ins):

@@ -6,15 +6,36 @@ offset in the loop and their first/last instruction, so a reader can place them 
 rare path). Also the shared helpers of scripts/compiler_ab.py (disasm, hot_loop, cover).
 usage: loop_census.py HSACO [HSACO ...] [--run 4] [--all]   (--all: loops without WMMAs too)"""
 import argparse
+import os
 import re
 import subprocess
 
-OBJDUMP = "llvm-objdump-21"
+
+def objdump():
+    """the disassembler: $OBJDUMP, else the ROCm SDK's (ROCM_SDK from the environment or the machine env file; ROCm 10.2's
+    LLVM decodes every gfx1151 encoding Loom emits), else llvm-objdump-21 (disasm refuses its output where it cannot)"""
+    if os.environ.get("OBJDUMP"):
+        return os.environ["OBJDUMP"]
+    sdk = os.environ.get("ROCM_SDK")
+    if not sdk:
+        f = os.environ.get("LSK_ENV") or os.path.expanduser("~/.config/loom-strix-kits/env")
+        m = re.search(r"(?m)^ROCM_SDK=(\S+)", open(f).read()) if os.path.exists(f) else None
+        sdk = m.group(1) if m else None
+    p = os.path.join(sdk, "lib", "llvm", "bin", "llvm-objdump") if sdk else None
+    return p if p and os.access(p, os.X_OK) else "llvm-objdump-21"
 
 
-def disasm(hs):
-    """(instructions, addresses) of a code object, instruction text without the encoding comment"""
-    d = subprocess.run([OBJDUMP, "-d", "--mcpu=gfx1151", hs], capture_output=True, text=True, check=True).stdout
+def disasm(hs, mcpu="gfx1151"):
+    """(instructions, addresses) of a code object, instruction text without the encoding comment. Refuses a listing with
+    undecoded words (`.long`): llvm-objdump-21 cannot decode some gfx1151 VOP3 forms Loom emits (v_cmp_*_e64 with an SGPR
+    result), prints the first dword as `.long` and the second as a phantom instruction (mostly v_cndmask), so every count
+    and every branch target behind it is wrong (E230: E229's '972 v_cndmask' was 480 v_cmp_eq_i32_e64 + 480 v_cndmask)."""
+    tool = objdump()
+    d = subprocess.run([tool, "-d", f"--mcpu={mcpu}", hs], capture_output=True, text=True, check=True).stdout
+    bad = [l.strip() for l in d.split("\n") if re.match(r"^\s+\.(long|short|byte)\b", l)]
+    if bad:
+        raise SystemExit(f"loop_census: {tool} left {len(bad)} undecoded words in {hs} (first: {bad[0]}); "
+                         "use a decoder that knows the target (OBJDUMP=..., or ROCM_SDK = a ROCm 10.2 _rocm_sdk_core)")
     ins, addr = [], []
     for line in d.split("\n"):
         m = re.match(r"^\s+([a-z]\S*)(.*?)//\s*([0-9A-F]+):", line)

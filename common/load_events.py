@@ -2,10 +2,11 @@
 """Order of loads (by width), vmcnt waits, WMMAs, barriers, branches and conversions in a gfx11 hsaco, run-length
 encoded with instruction indices (E108-E110): `LDx4@808 W3@953 BAR@996 MMAx16@1002` reads "four loads at 808, a wait
 at 953, barrier at 996, 16 WMMAs from 1002". usage: load_events.py KERNEL.hsaco"""
-import sys,re,subprocess
-d=subprocess.run(['llvm-objdump-21','-d','--mcpu=gfx1151',sys.argv[1]],capture_output=True,text=True).stdout
+import os,re,sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from loop_census import disasm  # noqa: E402  (one decoder for every tool: E230)
 ev=[]
-for i,l in enumerate([x for x in d.split('\n') if re.match(r'^\s+[a-z]',x)]):
+for i,l in enumerate(disasm(sys.argv[1])[0]):
     op=l.split()[0]; t=None
     m=re.match(r'(buffer|global)_load_(\w+)',op)
     if m: t='L'+m.group(2).replace('b','').replace('dword','32')
