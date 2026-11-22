@@ -26,6 +26,11 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   [barriers] a NOTE: >= BARRIERS workgroup barriers outside every loop: reductions done one at a time (each workgroup sum costs
             a barrier pair) instead of batched through LDS behind one barrier (E272: a depth-mix draft had 40, the batched form 2;
             llama.cpp's mul_mat_vec_f with 8 columns has 17, one block reduction per column). Column bar = that count.
+  [reread] a NOTE: >= REREAD global loads repeating an earlier load's operands while its address registers are unchanged and no store
+            intervened: the same bytes read twice (E278: Strata's Inkling depth mix reads each state twice; llama.cpp's
+            flash_attn_ext_vec at head 256 with f16 KV repeats 24 loads). Column-free: r['reread'].
+  [tiny]    a NOTE (with --profile): launched >= TINY_CALLS times in the profiled request with a median call under TINY_US: a
+            launch-bound small kernel, a fusion candidate (E278: Inkling's short convolutions, ~190 launches per token).
   [outlier] a NOTE, not a flag (E251: 0 of 2 confirmed on llama.cpp, where one template spans formats of different cost):
             non-MMA instructions per MMA (or dot) > OUTLIER x the median of its peers (same family, place, MMA kind and MMA
             count, >= 3 kernels): a kernel doing much more per multiply than its siblings (E233: q6_k's matvec 616 vs q5_k's 261).
@@ -66,6 +71,9 @@ COPY_RUN = 16
 JOIN_RUN = 32
 SERIAL_LINKS = 4
 BARRIERS = 8
+TINY_CALLS = 1000
+REREAD = 2
+TINY_US = 10.0
 LDSSER = 0.5
 VMLOAD = re.compile(r"(?:global|buffer|flat)_load_")
 SMLOAD = re.compile(r"s_(?:load|buffer_load)_")
@@ -370,6 +378,9 @@ def lint_listing(name, ins, addr, res=(None, None, None)):
     for a, z in loops(ins, addr):
         inloop.update(range(a, z + 1))
     r["bar"] = sum(1 for j, x in enumerate(ins) if x.startswith("s_barrier") and j not in inloop)
+    r["reread"] = rereads(ins)
+    if r["reread"] >= REREAD:
+        r.setdefault("notes", []).append("reread")              # E278: the same bytes loaded twice
     if r["bar"] >= BARRIERS:
         r.setdefault("notes", []).append("barriers")            # E272: reduce several sums behind one barrier
     r["join"] = join_runs(ins)
@@ -482,15 +493,56 @@ def compile_programs(progs, out, jobs, lc=None, roots=None):
     return texts, failed
 
 
-def served_ms(run):
-    """kernel -> served milliseconds in a profiled run (common/events_summary.py's loader: iree-profile dispatch events of one
-    served request), and the run's prompt size"""
+def served_stats(run):
+    """kernel -> (served ms, calls, median us per call) in a profiled run (common/events_summary.py's loader: iree-profile dispatch
+    events of one served request), and the run's prompt size"""
     import events_summary
     ev, prompt = events_summary.load(run)
-    ms = collections.Counter()
+    per = collections.defaultdict(list)
     for e in ev:
-        ms[e["key"]] += e["duration_ns"] / 1e6
-    return ms, prompt
+        per[e["key"]].append(e["duration_ns"] / 1e3)
+    return {k: (sum(v) / 1e3, len(v), statistics.median(v)) for k, v in per.items()}, prompt
+
+
+def served_ms(run):
+    """kernel -> served milliseconds in a profiled run, and the run's prompt size"""
+    st, prompt = served_stats(run)
+    return collections.Counter({k: v[0] for k, v in st.items()}), prompt
+
+
+def tiny(rows, stats):
+    """note `tiny` on kernels launched at least TINY_CALLS times in the profiled request with a median call under TINY_US: launch-bound
+    small kernels, fusion candidates (Inkling's short convolutions would be ~190 launches per token, E278)"""
+    for r in rows:
+        ms, calls, med = stats.get(r["kernel"], (0, 0, 0))
+        if calls >= TINY_CALLS and med < TINY_US:
+            r.setdefault("notes", []).append("tiny")
+
+
+def rereads(ins):
+    """global / buffer loads that repeat an earlier load with the same operands while its address registers were not redefined and
+    no store intervened: the same bytes read twice (Strata's Inkling depth mix reads each state twice, E278)"""
+    n = 0
+    seen = {}                                     # load operand text (destination dropped) -> address registers
+    for x in ins:
+        op = x.split()[0]
+        if re.match(r"(?:global|buffer|flat|scratch)_store|buffer_gl|s_dcache", op):
+            seen.clear()
+            continue
+        if re.match(r"(?:global|buffer|flat)_load_", op):
+            parts = x.split(None, 1)[1] if " " in x else ""
+            dst, _, rest = parts.partition(",")
+            key = (op, rest.strip())
+            if key in seen:
+                n += 1
+            seen[key] = regs(rest)
+            d = defs_uses(x)[0]
+        else:
+            d = defs_uses(x)[0]
+        if d:
+            for k in [k for k, a in seen.items() if a & d]:
+                del seen[k]
+    return n
 
 
 def main():
@@ -518,7 +570,8 @@ def main():
         texts, failed = compile_programs(progs, a.out, a.jobs, a.loom_compile, a.roots)
         sites = launch_sites(texts)
         a.paths = [a.out] + a.paths
-    ms, prompt = served_ms(a.profile) if a.profile else ({}, None)
+    stats, prompt = served_stats(a.profile) if a.profile else ({}, None)
+    ms = collections.Counter({k: v[0] for k, v in stats.items()})
     files = []
     for p in a.paths:
         files += sorted(glob.glob(os.path.join(p, "*.hsaco")) + glob.glob(os.path.join(p, "*.co"))) if os.path.isdir(p) else [p]
@@ -527,6 +580,7 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
         rows = [r for rs in ex.map(lint_file, files) for r in rs]
     outl = outliers(rows)
+    tiny(rows, stats)
     if a.baseline:
         for r in rows:
             b = os.path.join(a.baseline, r["kernel"] + ".hsaco")

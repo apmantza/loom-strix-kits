@@ -25,6 +25,11 @@
     run shows its cost), one that keeps a fragment in flight with lgkmcnt(2) does not;
   - reductions serialised one barrier pair at a time (E272: a depth-mix draft with 40 barriers) not noted `barriers`: ten
     straight-line barriers get the note, the same barriers inside a loop (a staged pipeline) do not;
+  - the same bytes loaded twice not noted `reread` (E278: Strata's depth mix; llama.cpp's head-256 flash_attn_ext_vec repeats 24
+    loads): two repeated loads with unchanged addresses get the note; a moved address, an intervening store or a pointer chase
+    do not count;
+  - launch-bound small kernels not noted `tiny` from a profile (E278): >= 1000 calls with a median under 10 us get it, fewer calls
+    or longer calls do not;
   - a branch-join copy not flagged (E247: the norm's idle-lane zero branch, 61-64 moves after an exec restore, every pass):
     a run of 40 moves right after an exec restore flags `join`, one of 20 does not;
   - a regression against another build missed (E226 0.3.0's longer loop and move run, E230 a new spill, E236 fewer waves);
@@ -167,6 +172,19 @@ def main():
     ok("barriers" in r.get("notes", []) and r["bar"] == 10, f"ten straight-line barriers get the barriers note (bar {r.get('bar')})")
     r = kl.lint_listing("pipelined", *listing(loop_of(sum((["ds_store_b32 v1, v2", "s_barrier", "ds_load_b32 v3, v1"] for _ in range(10)), []))))
     ok("barriers" not in r.get("notes", []), f"barriers inside a loop (a staged pipeline) do not (bar {r.get('bar')})")
+    rr = ["global_load_b128 v[0:3], v4, off", "global_load_b128 v[8:11], v5, off", "v_add_f32_e32 v10, v0, v1",
+          "global_load_b128 v[20:23], v4, off", "global_load_b128 v[24:27], v5, off", "s_endpgm"]
+    r = kl.lint_listing("reread", *listing(rr))
+    ok("reread" in r.get("notes", []) and r["reread"] == 2, f"two loads repeated with unchanged addresses get the reread note ({r['reread']})")
+    clean = ["global_load_b128 v[0:3], v4, off", "v_add_nc_u32_e32 v4, 16, v4", "global_load_b128 v[20:23], v4, off",
+             "global_load_b64 v[8:9], v5, off", "global_store_b32 v6, v7, off", "global_load_b64 v[12:13], v5, off",
+             "global_load_b64 v[30:31], v[30:31], off", "global_load_b64 v[30:31], v[30:31], off", "s_endpgm"]
+    r = kl.lint_listing("noreread", *listing(clean))
+    ok(r["reread"] == 0, f"a moved address, an intervening store and a pointer chase are not rereads ({r['reread']})")
+    rows_t = [{"kernel": k} for k in ("a", "b", "c")]
+    kl.tiny(rows_t, {"a": (50.0, 5000, 3.0), "b": (50.0, 500, 3.0), "c": (500.0, 5000, 40.0)})
+    ok(["tiny" in r_.get("notes", []) for r_ in rows_t] == [True, False, False],
+       "tiny: 5000 calls at 3 us noted; 500 calls, or 40 us calls, not")
     r = kl.lint_listing("run10", *listing(moves_loop(10)))
     ok("copies" not in r["flags"], f"a 10-move run does not (run {r['run']}, flags {r['flags']})")
     row = lambda k, op, wm=0, dt=8: {"kernel": k, "where": "loop", "wmma": wm, "dot": dt, "other_per_op": op, "flags": []}
