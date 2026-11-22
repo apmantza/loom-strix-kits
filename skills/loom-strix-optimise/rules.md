@@ -19,7 +19,8 @@ make it worse. Classify first, with numbers:
   show MemReadBytes matching the bytes a probe reads): wait reasons (vmem, ALU dependency, LDS), load latency and loads in flight
   answer the classification directly for any kernel a HIP harness can launch (common/hsaco_run.py); the ablations above stay the
   check when counters are not available or disagree.
-- **Occupancy is latency hiding, not a throughput model**: read VGPRs and the VGPRs to free for the next residency tier from the
+- **Occupancy is latency hiding, not a throughput model**: read the limiting resource first (VGPRs, LDS, workgroup slots or the wave
+  cap: the compile report names it; devices/gfx1151.md has the VGPR tiers), then the VGPRs and the VGPRs to free for the next residency tier from the
   compile report (`common/kernel_lint.py` prints both); a rewrite that frees registers is worth a tier only if the kernel waits on
   latency. Loom kernels run in WGP mode (a workgroup over 4 SIMDs). A model of part-empty last rounds of workgroups predicted
   14-29 % idle on decode matvecs measured at the bandwidth ceiling (E234): do not rank work by it.
