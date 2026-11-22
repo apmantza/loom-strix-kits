@@ -9,7 +9,7 @@ decode_swa (the sliding-window decode attention):
     zero-logit sink left out of the softmax (heads with large sink logits, where it dominates the denominator), the gate missing.
 How: kit/loomsim.py runs the emitted kernels (all lanes of a workgroup at once, in float32) and the results are compared with numpy
 transcriptions of inkling2.cpp's clip() / rms_norm / tau and of its attention (scores + r . rel_bias[d] - sink, softmax with a zero sink,
-sigmoid gate). Summation order differs from ggml's: prep to 2e-6, attention to 2e-4 relative. The kernels compile with no lint flag.
+sigmoid gate). Summation order differs from ggml's: prep to 2e-6 relative, attention to 1e-5 of the output's RMS. The kernels compile with no lint flag.
 usage: python3 kit/test_inkattn.py"""
 import os
 import re
@@ -93,8 +93,8 @@ def main():
         bufs = {"q": q, "r": r, "sinks": sinks, "gate": gate, "rel_bias": rb, "kc": kc, "vc": vc, "out": out}
         loomsim.run(gen_inkattn.decode_swa(), bufs, {"n_kv_arg": n_kv}, (24, 1, 1), 256)
         ref = attention_reference(n_kv, q, r, sinks, gate, rb, kc, vc)
-        err = float(np.max(np.abs(out - ref) / (np.abs(ref) + 1e-3)))
-        ok(err < 2e-4, f"decode_swa n_kv {n_kv}: equals the fork's attention (bias, window, zero sink, gate; max rel err {err:.1e})")
+        err = float(np.max(np.abs(out - ref)) / np.sqrt((ref ** 2).mean()))   # max abs error over the output's RMS (scale-free)
+        ok(err < 1e-5, f"decode_swa n_kv {n_kv}: equals the fork's attention (bias, window, zero sink, gate; max err / rms {err:.1e})")
     import kernel_lint as kl
     with tempfile.TemporaryDirectory() as t:
         for name, text in [(f"g_ink_attn_prep_t{T}" + ("_global" if glob else ""), gen_inkattn.prep(T, glob)) for T, glob in ((1, False), (8, True))] + \

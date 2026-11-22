@@ -254,6 +254,11 @@ class Sim:
             safe = np.where(mask, flat, 0)
             env[m.group(1)] = arr[np.clip(safe[:, None] + np.arange(n), 0, arr.size - 1)].copy()
             return
+        m = re.match(r"%(\w+) = vector\.slice %(\w+)\[(\d+)\] : vector<\d+x\w+> -> vector<(\d+)x\w+>$", ln)
+        if m:
+            o, n = int(m.group(3)), int(m.group(4))
+            env[m.group(1)] = env[m.group(2)][:, o:o + n].copy()
+            return
         m = re.match(r"%(\w+) = vector\.dotf<[^>]*> %(\w+), %(\w+), %(\w+) : vector<\d+xf32>, vector<\d+xf32>, f32$", ln)
         if m:
             a, b = env[m.group(2)].astype(np.float64), env[m.group(3)].astype(np.float64)
