@@ -14,6 +14,15 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   join      a run of >= JOIN_RUN moves right after an exec-mask restore, anywhere in the kernel: a value-yielding scf.if whose
             branches leave the result in different registers, copied at the join (E242: a prefetch under scf.if; E247: the norm's
             idle-lane zero branch, 61-64 moves per pass). Fix shape: compute on a clamped index and select.
+  serial    in any loop, >= SERIAL_LINKS independent links in a run of lone loads: each issued with nothing pending on its counter
+            and retired before the next load of that counter (vmcnt for vector loads, lgkmcnt for scalar ones), the
+            next load's address not computed from the previous load's data. One load in flight pays the whole latency per load
+            (E109: KV8 loads retired 2-26 instructions after issue; E254: g_attention_split's 7 per pass, llama.cpp NVFP4
+            mul_mat_q's per-byte scales). Pointer chases and scratch reloads (the scratch flag) are not counted.
+  [ldsser]  a NOTE until a counter run shows its cost (E254, E61's hypothesis): in the hot loop (>= 8 WMMAs, >= 8 ds_loads), at
+            least half the WMMAs sit within 3 instructions after an lgkmcnt(0) that retires a ds_load issued at most 12
+            instructions earlier: no LDS fragment kept in flight across a multiply (the 256-row GEMMs: 48 of 64; their 128-row
+            siblings keep one with lgkmcnt(2)). Column ldsser = that share.
   [outlier] a NOTE, not a flag (E251: 0 of 2 confirmed on llama.cpp, where one template spans formats of different cost):
             non-MMA instructions per MMA (or dot) > OUTLIER x the median of its peers (same family, place, MMA kind and MMA
             count, >= 3 kernels): a kernel doing much more per multiply than its siblings (E233: q6_k's matvec 616 vs q5_k's 261).
@@ -48,10 +57,17 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from loop_census import cover, disasm, loops, moves  # noqa: E402
 
-FLAGS = ("select", "repack", "scratch", "copies", "join")
+FLAGS = ("select", "repack", "scratch", "copies", "join", "serial")
 MM = ("v_wmma", "v_dot4", "v_dot2", "v_dot8")
 COPY_RUN = 16
 JOIN_RUN = 32
+SERIAL_LINKS = 4
+LDSSER = 0.5
+VMLOAD = re.compile(r"(?:global|buffer|flat)_load_")
+SMLOAD = re.compile(r"s_(?:load|buffer_load)_")
+REG = re.compile(r"\b([vs])(\d+)\b|\b([vs])\[(\d+):(\d+)\]|\b(vcc|exec|scc|m0)(?:_lo|_hi)?\b")
+NO_DEF = re.compile(r"(?:global|buffer|flat|scratch)_store|ds_store|ds_write|s_waitcnt|s_cbranch|s_branch|s_barrier|s_nop|s_delay_alu|"
+                    r"s_endpgm|s_cmp|s_bitcmp|v_cmpx|s_clause|s_sleep|s_set|s_trap|s_wait")
 OUTLIER = 2.0
 GROW = 1.10
 
@@ -102,6 +118,89 @@ def copy_moves(x):
         if m and re.match(r"v\d+(?:\.[lh])?$|v\[", m.group(1)):            # 16-bit halves too (gfx11.5 true16: v_mov_b16 vN.l, vM.h)
             n += 1
     return n
+
+
+def regs(text):
+    """registers named in an operand text: v12, s[4:5] -> s4 s5, vcc / exec / scc / m0"""
+    out = set()
+    for m in REG.finditer(text):
+        if m.group(1):
+            out.add(m.group(1) + m.group(2))
+        elif m.group(3):
+            out.update(f"{m.group(3)}{k}" for k in range(int(m.group(4)), int(m.group(5)) + 1))
+        else:
+            out.add(m.group(6))
+    return out
+
+
+def defs_uses(x):
+    """(registers written, registers read) of one instruction, approximately (the first operand is the destination; enough for
+    the taint of one load's data); VOPD halves joined by '::' together"""
+    if "::" in x:
+        d, u = set(), set()
+        for h in x.split("::"):
+            a, b = defs_uses(h.strip())
+            d |= a
+            u |= b
+        return d, u
+    op, _, rest = x.partition(" ")
+    ops = [o.strip() for o in re.split(r",(?![^\[]*\])", rest)] if rest.strip() else []
+    if not ops or NO_DEF.match(op):
+        return ({"scc"} if op.startswith(("s_cmp", "s_bitcmp")) else set()), regs(rest)
+    return regs(ops[0]), set().union(*[regs(o) for o in ops[1:]])
+
+
+def serial_links(ins, lo, hi, kind):
+    """the most independent links in one run of lone loads of `kind` ('vm' vector, 'sm' scalar) in ins[lo..hi]: a lone load is
+    issued with nothing pending on its counter and retired before the next load of that counter is issued; a run is lone loads
+    consecutive in load order; a link is independent when the next load's address registers carry none of the previous load's
+    data (taint followed through the instructions between them)"""
+    is_load = (VMLOAD if kind == "vm" else SMLOAD).match
+    cnt = "vmcnt" if kind == "vm" else "lgkmcnt"
+    pend, lone, order = [], [], []
+    for i in range(lo, hi + 1):
+        x = ins[i]
+        if is_load(x):
+            for p in pend:
+                p[2] = True
+            pend.append([i, not pend, False])
+            order.append(i)
+        w = re.search(cnt + r"\((\d+)\)", x) if x.startswith("s_waitcnt") else None
+        if w:
+            n = int(w.group(1))                          # scalar loads return out of order, but lgkmcnt(N > 0) leaves N pending,
+            while len(pend) > n:                         # so it never makes a lone one: counting it as retiring is exact here
+                p = pend.pop(0)
+                if p[1] and not p[2]:
+                    lone.append(p[0])
+    pos = {j: k for k, j in enumerate(order)}
+    best, cur = 0, []
+    for j in lone + [None]:
+        if j is not None and cur and pos[j] == pos[cur[-1]] + 1:
+            cur.append(j)
+            continue
+        links = 0
+        for a, b in zip(cur, cur[1:]):
+            taint = set(defs_uses(ins[a])[0])
+            for k in range(a + 1, b):
+                d, u = defs_uses(ins[k])
+                taint = (taint | d) if u & taint else (taint - d)
+            links += not (defs_uses(ins[b])[1] & taint)
+        best = max(best, links)
+        cur = [j] if j is not None else []
+    return best
+
+
+def lds_serialized(b):
+    """share of the WMMAs in b that sit within 3 instructions after an lgkmcnt(0) retiring a ds_load issued at most 12 earlier
+    (None below 8 WMMAs or 8 ds_loads)"""
+    w = [j for j, x in enumerate(b) if x.startswith("v_wmma")]
+    if len(w) < 8 or sum(1 for x in b if x.startswith("ds_load")) < 8:
+        return None
+    hit = 0
+    for j in w:
+        z = next((k for k in range(j - 1, max(-1, j - 4), -1) if b[k].startswith("s_waitcnt") and "lgkmcnt(0)" in b[k]), None)
+        hit += z is not None and any(b[k].startswith("ds_load") for k in range(max(0, z - 12), z))
+    return round(hit / len(w), 2)
 
 
 def longest_move_run(body):
@@ -257,6 +356,12 @@ def lint_listing(name, ins, addr, res=(None, None, None)):
         r["flags"].append("scratch")
     if r["where"] == "loop" and r["run"] >= COPY_RUN:
         r["flags"].append("copies")
+    r["serial"] = max([serial_links(ins, a, z, k) for a, z in loops(ins, addr) for k in ("vm", "sm")] or [0])
+    if r["serial"] >= SERIAL_LINKS:
+        r["flags"].append("serial")
+    r["ldsser"] = lds_serialized(b) if r["where"] == "loop" else None
+    if r["ldsser"] is not None and r["ldsser"] >= LDSSER:
+        r.setdefault("notes", []).append("ldsser")             # a prompt to measure, not a flag (E254: cost unproven)
     r["join"] = join_runs(ins)
     if r["join"] >= JOIN_RUN:
         r["flags"].append("join")

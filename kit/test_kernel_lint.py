@@ -16,6 +16,13 @@
   - accumulator zero-inits counted as copies, or 16-bit half-register copies missed (E251, llama.cpp's blind review: 3 of 4
     copies flags were `v_mov vN, 0` runs; a real 36-move run was v_mov_b16 vN.l, vM.h): constants do not count, true16 moves do;
   - outlier presented as a defect (E251: 0 of 2 confirmed): it is a note, not a flag;
+  - loads issued one at a time, each waited before the next independent one (E109: KV8 loads retired 2-26 instructions after
+    issue; E254 scout: g_attention_split's 7 per pass, llama.cpp NVFP4 mul_mat_q's per-byte scales) not flagged `serial`: five
+    independent lone vector loads in a loop flag it, so do five lone scalar loads; staggered waits, a pointer chase and the same
+    loads in a prologue do not;
+  - the 256-row GEMMs' LDS-to-WMMA serialization (E254: 48 of 64 WMMAs right after lgkmcnt(0), queue item 6 / E152) not
+    reported: a loop whose WMMAs each wait lgkmcnt(0) on a fragment just loaded gets the `ldsser` note (a note until a counter
+    run shows its cost), one that keeps a fragment in flight with lgkmcnt(2) does not;
   - a branch-join copy not flagged (E247: the norm's idle-lane zero branch, 61-64 moves after an exec restore, every pass):
     a run of 40 moves right after an exec restore flags `join`, one of 20 does not;
   - a regression against another build missed (E226 0.3.0's longer loop and move run, E230 a new spill, E236 fewer waves);
@@ -115,6 +122,44 @@ def main():
     h16 = ["s_mov_b32 s0, 0", "v_dot4_i32_iu8 v1, v2, v3, v1"] + [f"v_mov_b16_e64 v{10 + i}.l, v{60 + i}.h op_sel:[1,0]" for i in range(20)] + [back(22, 1)]
     r = kl.lint_listing("true16", *listing(h16))
     ok("copies" in r["flags"] and r["run"] == 20, f"20 half-register copies are copies (run {r['run']})")
+    def loop_of(body):                                                  # body as one loop after a prologue instruction
+        b = ["s_mov_b32 s0, 0"] + body
+        return b + [back(len(b), 1)]
+    vm_lone = sum(([f"global_load_b32 v{10 + k}, v[2:3], off offset:{4 * k}", "s_waitcnt vmcnt(0)", f"v_add_f32_e32 v1, v1, v{10 + k}"]
+                   for k in range(5)), [])
+    r = kl.lint_listing("serial_vm", *listing(loop_of(vm_lone)))
+    ok("serial" in r["flags"] and r["serial"] == 4, f"five lone independent vector loads in a loop flag serial (links {r.get('serial')})")
+    sm_lone = sum(([f"s_load_b32 s{10 + k}, s[4:5], 0x{4 * k:x}", "s_waitcnt lgkmcnt(0)", f"v_add_f32_e32 v1, s{10 + k}, v1"]
+                   for k in range(5)), [])
+    r = kl.lint_listing("serial_sm", *listing(loop_of(sm_lone)))
+    ok("serial" in r["flags"], f"five lone scalar loads flag serial too (links {r.get('serial')})")
+    stag = [f"global_load_b32 v{10 + k}, v[2:3], off offset:{4 * k}" for k in range(5)]
+    stag += sum(([f"s_waitcnt vmcnt({4 - k})", f"v_add_f32_e32 v1, v1, v{10 + k}"] for k in range(5)), [])
+    r = kl.lint_listing("staggered", *listing(loop_of(stag)))
+    ok("serial" not in r["flags"], f"the same loads issued together with staggered waits do not (links {r.get('serial')})")
+    chase = sum((["global_load_b64 v[2:3], v[2:3], off", "s_waitcnt vmcnt(0)", "v_add_f32_e32 v1, v1, v2"] for k in range(5)), [])
+    r = kl.lint_listing("chase", *listing(loop_of(chase)))
+    ok("serial" not in r["flags"], f"a pointer chase (each address the previous load's data) does not (links {r.get('serial')})")
+    pro = vm_lone + ["s_mov_b32 s0, 0", "v_dot4_i32_iu8 v1, v2, v3, v1", "s_add_u32 s0, s0, 1"]
+    pro.append(back(len(pro), len(vm_lone) + 1))
+    r = kl.lint_listing("prologue", *listing(pro))
+    ok("serial" not in r["flags"], f"lone loads in a prologue, outside every loop, do not (links {r.get('serial')})")
+    def wm(k):
+        return f"v_wmma_f32_16x16x16_f16 v[{40 + 8 * (k % 4)}:{47 + 8 * (k % 4)}], v[20:27], v[30:37], v[{40 + 8 * (k % 4)}:{47 + 8 * (k % 4)}]"
+    ser = sum((["ds_load_b128 v[30:33], v8 offset:" + str(32 * k), "ds_load_b128 v[34:37], v8 offset:" + str(32 * k + 16),
+                "s_waitcnt lgkmcnt(0)", wm(k)] for k in range(8)), [])
+    r = kl.lint_listing("ldsser", *listing(loop_of(ser)))
+    ok("ldsser" in r.get("notes", []) and "ldsser" not in r["flags"] and r["ldsser"] == 1.0,
+       f"WMMAs each waiting lgkmcnt(0) on a just-loaded fragment get the ldsser note, not a flag (share {r.get('ldsser')})")
+    kept = ["ds_load_b128 v[30:33], v8", "ds_load_b128 v[34:37], v8 offset:16"]
+    for k in range(8):
+        kept += [f"ds_load_b128 v[50:53], v8 offset:{32 * k + 32}", f"ds_load_b128 v[54:57], v8 offset:{32 * k + 48}", "s_waitcnt lgkmcnt(2)", wm(k)]
+    r = kl.lint_listing("ldskept", *listing(loop_of(kept)))
+    ok("ldsser" not in r.get("notes", []), f"one fragment kept in flight with lgkmcnt(2): no note (share {r.get('ldsser')})")
+    far = [f"ds_load_b128 v[{30 + 4 * (k % 2)}:{33 + 4 * (k % 2)}], v8 offset:{16 * k}" for k in range(8)] + ["v_add_f32_e32 v1, v1, v2"] * 14
+    far += sum(([f"s_load_b32 s{10 + k}, s[4:5], 0x{4 * k:x}", "s_waitcnt lgkmcnt(0)", wm(k)] for k in range(8)), [])
+    r = kl.lint_listing("ldsfar", *listing(loop_of(far)))
+    ok("ldsser" not in r.get("notes", []), f"lgkmcnt(0) waits on scalar loads, the LDS loads long before: no note (share {r.get('ldsser')})")
     r = kl.lint_listing("run10", *listing(moves_loop(10)))
     ok("copies" not in r["flags"], f"a 10-move run does not (run {r['run']}, flags {r['flags']})")
     row = lambda k, op, wm=0, dt=8: {"kernel": k, "where": "loop", "wmma": wm, "dot": dt, "other_per_op": op, "flags": []}
