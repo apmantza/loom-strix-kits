@@ -46,6 +46,19 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
 | MTP / DSpark | library Flash-Next MTP + adaptive DFlash proposal programs (0.3.0) | the DSpark head (3 layers + Markov head) |
 | Checkpoint | safetensors read in place by key (loom-kb facet/safetensors) | an hf_names map for Inkling's keys |
 
+## Weights: what the header and the GGUFs show (11-22)
+- Names: kit/hf_names/inkling2.json maps the native text keys (model.llm.*, 822) to llama.cpp's inkling2 GGUF names (734),
+  checked by kit/test_hf_names_inkling2.py. Two matrices are transposed by the converter (relative-bias table, global layers'
+  static conv weights); the loop layers 6-17 add 12 controller matrices each; block-attention-residual queries live outside
+  the layers (blk.i takes attn_queries.(i-1); [3, 2304] on layers 5, 11, 17, 23).
+- Unsloth UD-Q8_K_XL keeps the native NVFP4 experts of layers 0-19 (llama.cpp has an NVFP4 type), with each expert's amax and
+  outer denominator folded into one f32 `.scale`; the MXFP8 experts of layers 20-23 become **BF16** (2x their native bytes).
+  So only the native route keeps those experts 8-bit.
+- Still to check on values (fetch a byte range, no full download): the norms' prep (copy or add1), the `.scale` formula, and
+  whether the converter de-interleaves w13's gate and up rows.
+- Prior art on this ROCm: hipBLASLt 10.2 ships hand-written gfx1151 kernels for 4-bit-weight GEMMs with bf16/fp16 activations.
+- References: Unsloth's official gfx1151 build of its fork (b12588-mix-c0c3de8, release asset, digest checked).
+
 ## Plan, cheapest evidence first
 1. Static: compile the NVFP4 and MXFP8 decode schemas for gfx1151 (the one unproven Loom capability).
 2. Reference: the Transformers implementation on CPU for per-layer outputs at short prompts; Unsloth's llama.cpp build for

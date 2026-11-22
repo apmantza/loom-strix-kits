@@ -1,0 +1,267 @@
+{
+ "family": "inkling2",
+ "doc": "HF Inkling2Loop (Thinking Machines Inkling 2 Mini; text model only, model.llm.*) -> internal names = llama.cpp's inkling2 GGUF names (unsloth b12588-mix), so the native and GGUF routes share one vocabulary. Read by kit/test_hf_names_inkling2.py for coverage (each text key maps once, each GGUF name has an entry); not yet by inspect_safetensors.py, which has no MoE, loop or NVFP4 path. `prep` as in qwen35.json; `shape: true` = conv1d [C, 1, K] -> [K, C]; `transpose: true` = the converter transposes the matrix (internal shape = the HF shape, not its reverse); `verify` = a value-level fact not yet checked against the GGUF. The vision tower (model.visual.*) and mtp.safetensors (DSpark) are out of scope here.",
+ "architectures": [
+  "Inkling2LoopForConditionalGeneration"
+ ],
+ "arch": "inkling2",
+ "layers": 24,
+ "global_layers": [
+  5,
+  11,
+  17,
+  23
+ ],
+ "loop": {
+  "first": 6,
+  "last": 17,
+  "passes": 3
+ },
+ "expert_formats": {
+  "nvfp4": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   16,
+   17,
+   18,
+   19
+  ],
+  "mxfp8": [
+   20,
+   21,
+   22,
+   23
+  ]
+ },
+ "global": {
+  "token_embd.weight": {
+   "hf": "model.llm.embed.weight"
+  },
+  "token_embd_norm.weight": {
+   "hf": "model.llm.embed_norm.weight",
+   "prep": "copy",
+   "verify": "copy vs add1: compare with the GGUF's token_embd_norm"
+  },
+  "output.weight": {
+   "hf": "model.llm.unembed.weight"
+  },
+  "output_norm.weight": {
+   "hf": "model.llm.norm.weight",
+   "prep": "copy",
+   "verify": "copy vs add1"
+  },
+  "output_res_query.weight": {
+   "hf": "model.llm.attn_res.output_query"
+  },
+  "loop_res_query.weight": {
+   "hf": "model.llm.middle_cycle_cross_pass_queries"
+  },
+  "loop_kv_res_query.weight": {
+   "hf": "model.llm.middle_cycle_cross_pass_kv_queries"
+  }
+ },
+ "indexed": {
+  "_doc": "model.llm.attn_res.* is indexed by layer outside the layer prefix: blk.{i}.attn_res_query = attn_queries.{i-1} (none on blk.0; [3, 2304] on the block-boundary layers 5, 11, 17, 23), blk.{i}.ffn_res_query = mlp_queries.{i}",
+  "attn_res_query.weight": {
+   "hf": "model.llm.attn_res.attn_queries.{im1}",
+   "first": 1
+  },
+  "ffn_res_query.weight": {
+   "hf": "model.llm.attn_res.mlp_queries.{i}"
+  }
+ },
+ "layer": {
+  "prefix": "model.llm.layers.{i}.",
+  "common": {
+   "attn_q.weight": {
+    "hf": "attn.wq_du.weight"
+   },
+   "attn_k.weight": {
+    "hf": "attn.wk_dv.weight"
+   },
+   "attn_v.weight": {
+    "hf": "attn.wv_dv.weight"
+   },
+   "attn_output.weight": {
+    "hf": "attn.wo_ud.weight"
+   },
+   "attn_gate.weight": {
+    "hf": "attn.gate_attn.weight"
+   },
+   "attn_rel.weight": {
+    "hf": "attn.wr_du.weight"
+   },
+   "attn_sink_proj.weight": {
+    "hf": "attn.attn_sink_proj.weight"
+   },
+   "attn_q_clip.weight": {
+    "hf": "attn.q_l2_clip.scale",
+    "prep": "copy"
+   },
+   "attn_rel_clip.weight": {
+    "hf": "attn.rel_l2_clip.scale",
+    "prep": "copy"
+   },
+   "attn_rel_bias.weight": {
+    "hf": "attn.rel_logits_proj.proj",
+    "prep": "copy",
+    "transpose": true
+   },
+   "attn_post_conv.weight": {
+    "hf": "attn_sconv.weight",
+    "prep": "copy",
+    "shape": true
+   },
+   "ffn_post_conv.weight": {
+    "hf": "mlp_sconv.weight",
+    "prep": "copy",
+    "shape": true
+   },
+   "ffn_norm.weight": {
+    "hf": "mlp_norm.weight",
+    "prep": "copy",
+    "verify": "copy vs add1"
+   },
+   "ffn_gate_inp.weight": {
+    "hf": "mlp.gate.weight",
+    "prep": "copy"
+   },
+   "exp_probs_b.bias": {
+    "hf": "mlp.gate.bias"
+   }
+  },
+  "local": {
+   "attn_norm.weight": {
+    "hf": "attn_norm.weight",
+    "prep": "copy",
+    "verify": "copy vs add1"
+   },
+   "attn_k_conv.weight": {
+    "hf": "attn.k_sconv.weight",
+    "prep": "copy",
+    "shape": true
+   },
+   "attn_v_conv.weight": {
+    "hf": "attn.v_sconv.weight",
+    "prep": "copy",
+    "shape": true
+   }
+  },
+  "global": {
+   "attn_q_inp_norm.weight": {
+    "hf": "q_input_norm.weight",
+    "prep": "copy",
+    "verify": "copy vs add1"
+   },
+   "attn_k_inp_norm.weight": {
+    "hf": "k_input_norm.weight",
+    "prep": "copy",
+    "verify": "copy vs add1"
+   },
+   "attn_v_inp_norm.weight": {
+    "hf": "v_input_norm.weight",
+    "prep": "copy",
+    "verify": "copy vs add1"
+   },
+   "attn_k_conv.weight": {
+    "hf": "attn.k_sconv.static_w",
+    "prep": "copy",
+    "transpose": true
+   },
+   "attn_v_conv.weight": {
+    "hf": "attn.v_sconv.static_w",
+    "prep": "copy",
+    "transpose": true
+   },
+   "attn_k_conv_proj.weight": {
+    "hf": "attn.k_sconv.weight_proj"
+   },
+   "attn_v_conv_proj.weight": {
+    "hf": "attn.v_sconv.weight_proj"
+   }
+  },
+  "loop": {
+   "loop_attn_down.weight": {
+    "hf": "controllers.attn.down_weight"
+   },
+   "loop_attn_forget.weight": {
+    "hf": "controllers.attn.forget_weight"
+   },
+   "loop_attn_gain.weight": {
+    "hf": "controllers.attn.gain_weight"
+   },
+   "loop_k_down.weight": {
+    "hf": "controllers.k.down_weight"
+   },
+   "loop_k_forget.weight": {
+    "hf": "controllers.k.forget_weight"
+   },
+   "loop_k_gain.weight": {
+    "hf": "controllers.k.gain_weight"
+   },
+   "loop_v_down.weight": {
+    "hf": "controllers.v.down_weight"
+   },
+   "loop_v_forget.weight": {
+    "hf": "controllers.v.forget_weight"
+   },
+   "loop_v_gain.weight": {
+    "hf": "controllers.v.gain_weight"
+   },
+   "loop_mlp_down.weight": {
+    "hf": "controllers.mlp.down_weight"
+   },
+   "loop_mlp_forget.weight": {
+    "hf": "controllers.mlp.forget_weight"
+   },
+   "loop_mlp_gain.weight": {
+    "hf": "controllers.mlp.gain_weight"
+   }
+  },
+  "nvfp4": {
+   "_doc": "NVFP4 (modelopt layout): U8 = two e2m1 per byte, F8_E4M3 scale per 16 values, per-expert F32 amax and one outer-scale denominator; GGUF folds amax and the denominator into one F32 .scale per expert (formula: verify). w13 = gate and up rows interleaved (Inkling's reference): whether the GGUF converter de-interleaves them: verify; `gguf_scale` names that derived GGUF tensor (F32 [128]), from amax and outer",
+   "ffn_gate_up_exps.weight": {
+    "hf": "mlp.experts.w13_weight",
+    "scale": "mlp.experts.w13_weight_scale",
+    "amax": "mlp.experts.w13_weight_amax",
+    "outer": "mlp.experts.w13_weight_outer_scale_denominator",
+    "verify": "gate/up row order; .scale formula",
+    "gguf_scale": "ffn_gate_up_exps.scale"
+   },
+   "ffn_down_exps.weight": {
+    "hf": "mlp.experts.w2_weight",
+    "scale": "mlp.experts.w2_weight_scale",
+    "amax": "mlp.experts.w2_weight_amax",
+    "outer": "mlp.experts.w2_weight_outer_scale_denominator",
+    "verify": ".scale formula",
+    "gguf_scale": "ffn_down_exps.scale"
+   }
+  },
+  "mxfp8": {
+   "_doc": "MXFP8: F8_E4M3 values, U8 E8M0 scale per 32. Unsloth's GGUFs carry these experts as BF16 (upcast), so the native route is the only one that keeps them 8-bit",
+   "ffn_gate_up_exps.weight": {
+    "hf": "mlp.experts.w13_weight",
+    "scale": "mlp.experts.w13_weight_scale",
+    "verify": "gate/up row order"
+   },
+   "ffn_down_exps.weight": {
+    "hf": "mlp.experts.w2_weight",
+    "scale": "mlp.experts.w2_weight_scale"
+   }
+  }
+ }
+}
