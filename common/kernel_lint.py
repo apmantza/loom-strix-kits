@@ -2,8 +2,10 @@
 """Static lint of compiled gfx11 kernels: per kernel, the hot loop's instruction mix and the compiler's residency, flagged
 against thresholds that each caught a real defect. A flag is a candidate to read, not a verdict: read the loop before acting.
 Flags (the recurrence each one names); shares are of the hot loop's common path (nested loops excluded: rare masked paths):
-  select    compares + selects >= 25 % of the common path: a vector.table.lookup scalarised into a select chain because the
-            index range was hidden (E229/E230: IQ4 masked as i32 words, 960 of 1,544 loop instructions).
+  select    compares + selects >= 25 % of the common path, with equality compares against >= 8 distinct constants (an index
+            tested against each table entry): a vector.table.lookup scalarised into a select chain because the index range was
+            hidden (E229/E230: IQ4 masked as i32 words, 960 of 1,544 loop instructions, 15 constants). Selects that are the
+            algorithm (index scatter, butterflies, quantizers: llama.cpp, E244) compare against no constants and are not flagged.
   repack    packed 16-bit shifts (v_pk_lshrrev/lshlrev_b16) >= 8 and byte extracts (v_bfe_*) >= 32 in the hot loop: byte
             vectors shifted by a runtime amount, every byte extracted and repacked (E233: q6_k / q3_k codes, 616 vs 290).
   scratch   any scratch load/store in the hot loop: a spill; on gfx11 spills share vmcnt with the loads (E230: 2,464 B).
@@ -21,6 +23,7 @@ v_mul_lo_u32 (address math) and a drain alone are not defects.
 Decoding goes through loop_census.disasm (ROCm 10.2 llvm-objdump; it refuses undecoded words).
 Also reported: LDS waits (lgkmcnt) per MMA (E61), the shortest load-to-wait distance and the loads still in flight at the
 back-edge (E109), the extra LDS bank-service rounds of Loom's gfx1151 bank model, and with --profile each kernel's served ms.
+A code object holding many kernels (another engine's build: *.co / *.hsaco) is linted kernel by kernel (lint_object).
 usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--profile RUN] [--flagged] [--strict]
        kernel_lint.py --package PKG | --program FILE.loom ... --out DIR [--loom-compile PATH] [--roots REGEX] [--jobs N] [...]
          (compiles every gfx11 kernel root into DIR first; two compilers: run twice with --loom-compile and pass the first
@@ -115,6 +118,63 @@ def bank(js):
     return st.get("conflicted_packet_count"), st.get("extra_round_count")
 
 
+def kernel_symbols(path):
+    """(name, start address, size) of every kernel function in a code object, from its symbol table"""
+    tool = __import__("loop_census").objdump()
+    t = subprocess.run([tool, "-t", path], capture_output=True, text=True, check=True).stdout
+    kds = set(re.findall(r"\s(\S+)\.kd$", t, re.M))
+    out = []
+    for m in re.finditer(r"(?m)^([0-9a-f]+)\s.*?\bF\s+\.text\s+([0-9a-f]+)\s+(?:\.\w+\s+)?(\S+)$", t):
+        if m.group(3) in kds:
+            out.append((m.group(3), int(m.group(1), 16), int(m.group(2), 16)))
+    return out
+
+
+def demangle(names):
+    """C++ names demangled with the ROCm SDK's llvm-cxxfilt (the names unchanged when it is missing)"""
+    tool = os.path.join(os.path.dirname(__import__("loop_census").objdump()), "llvm-cxxfilt")
+    if not os.access(tool, os.X_OK):
+        return list(names)
+    r = subprocess.run([tool], input="\n".join(names), capture_output=True, text=True)
+    out = r.stdout.split("\n")
+    return out[:len(names)] if r.returncode == 0 and len(out) >= len(names) else list(names)
+
+
+def lint_object(path):
+    """every kernel of a code object holding several (another engine's build): each kernel's instructions sliced from the
+    disassembly by its symbol's address range, VGPRs from its metadata note, its family from the demangled function name
+    (template arguments dropped) so that `outlier` compares instances of one kernel template"""
+    syms = kernel_symbols(path)
+    ins, addr = disasm(path)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import hsaco_run
+    names = demangle([n for n, _, _ in syms])
+    rows = []
+    for (n, a0, size), dn in zip(syms, names):
+        idx = [j for j, x in enumerate(addr) if a0 <= x < a0 + size]
+        if not idx:
+            continue
+        sl, sa = ins[idx[0]:idx[-1] + 1], addr[idx[0]:idx[-1] + 1]
+        try:
+            vg = hsaco_run.kernel_meta(path, n).get(".vgpr_count")
+        except SystemExit:
+            vg = None
+        r = lint_listing(n, sl, sa, (vg, None, None))
+        r["family"] = re.split(r"[<(]", dn, maxsplit=1)[0].split("::")[-1].strip() or n
+        r["object"] = os.path.basename(path)
+        r["bank_conf"] = r["bank_extra"] = None
+        rows.append(r)
+    return rows
+
+
+def lint_file(path):
+    """the rows of one code object: one kernel (a Loom compile) or several (another engine's build)"""
+    syms = kernel_symbols(path)
+    if len(syms) == 1 and syms[0][0] == os.path.basename(path).rsplit(".", 1)[0]:
+        return [lint(path)]
+    return lint_object(path)
+
+
 def lint(path):
     ins, addr = disasm(path)
     r = lint_listing(os.path.basename(path)[:-6], ins, addr, residency(path[:-6] + ".json"))
@@ -146,7 +206,9 @@ def lint_listing(name, ins, addr, res=(None, None, None)):
     r["lds_waits_per_op"] = round(lgkm / per, 2) if per else None      # E61: lgkmcnt(0) after each LDS read pair before the MMAs
     cv, pend = cover(full, 0, len(full) - 1)
     r["cover_min"], r["in_flight"] = (min(cv) if cv else None), pend     # E109: loads waited right after issue; carried across
-    if r["select"] >= 0.25 * len(b):
+    eq_imm = {m.group(1) for x in b for m in [re.match(r"v_cmp_eq_[iu](?:16|32)_e(?:32|64)\s.*,\s*(-?\d+)$", x)] if m}
+    r["eq_imm"] = len(eq_imm)
+    if r["select"] >= 0.25 * len(b) and r["eq_imm"] >= 8:       # a lookup chain compares its index with each table entry
         r["flags"].append("select")
     if r["pk"] >= 8 and r["bfe"] >= 32:
         r["flags"].append("repack")
@@ -170,10 +232,15 @@ def family(name):
     return m.group(1) if m else name
 
 
+def row_family(r):
+    """a row's family: the demangled function name for other engines' kernels (set by lint_object), else family(name)"""
+    return r.get("family") or family(r["kernel"])
+
+
 def peer_key(r):
     """kernels comparable per multiply: same family, place (loop / kernel), MMA kind and MMA count. The family keeps attention
     from being judged against GEMMs with the same WMMA count (E241 calibration)."""
-    return (family(r["kernel"]), r["where"], "wmma" if r["wmma"] else "dot", r["wmma"] or r["dot"])
+    return (row_family(r), r["where"], "wmma" if r["wmma"] else "dot", r["wmma"] or r["dot"])
 
 
 def outliers(rows):
@@ -295,10 +362,11 @@ def main():
     ms, prompt = served_ms(a.profile) if a.profile else ({}, None)
     files = []
     for p in a.paths:
-        files += sorted(glob.glob(os.path.join(p, "*.hsaco"))) if os.path.isdir(p) else [p]
+        files += sorted(glob.glob(os.path.join(p, "*.hsaco")) + glob.glob(os.path.join(p, "*.co"))) if os.path.isdir(p) else [p]
     if not files:
         sys.exit("kernel_lint: no code objects")
-    rows = [lint(f) for f in files]
+    with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
+        rows = [r for rs in ex.map(lint_file, files) for r in rs]
     outl = outliers(rows)
     if a.baseline:
         for r in rows:

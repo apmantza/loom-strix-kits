@@ -9,6 +9,10 @@
     `copies`, one with 10 does not;
   - a kernel doing far more per multiply than its peers not flagged (E233: q6_k 616 vs q5_k 261), or attention judged against
     GEMMs with the same WMMA count (E241 calibration): `outlier` within a family only;
+  - selects that are an algorithm flagged as a scalarised lookup (E244: llama.cpp's index scatter and Walsh-Hadamard kernels):
+    a lookup chain compares against the table's entries;
+  - another engine's code object (many kernels in one file, E244: llama.cpp's 147 objects hold 8,374 kernels) linted as one
+    kernel or sliced wrongly: a two-kernel object must give two rows, each equal to that kernel compiled alone;
   - a regression against another build missed (E226 0.3.0's longer loop and move run, E230 a new spill, E236 fewer waves);
   - launch sites miscounted (E241: launches without a grid were missed): direct launches with and without a grid, through
     dual-target selectors, and none inside template bodies;
@@ -69,6 +73,12 @@ def main():
     with tempfile.TemporaryDirectory() as t:
         r = compile_lint(lc, t, "iq4_old", qv + old, "g_deq16_iq4_nl")
         ok("select" in r["flags"], f"pre-E230 IQ4 dequant flags select ({r['select']} of {r['common']})")
+        two = os.path.join(t, "two.loom")
+        open(two, "w").write("target.decl @device\namdgpu.target<gfx11-generic> @rdna3\n\n" + qv + old + old.replace("g_deq16_iq4_nl", "g_deq16_iq4_nl2"))
+        subprocess.run([lc, two, "--target=amdgpu:gfx1151", f"--output={t}/two.hsaco"], capture_output=True, text=True, check=True)
+        rows = kl.lint_file(os.path.join(t, "two.hsaco"))
+        ok(len(rows) == 2 and all(x["select"] == r["select"] and x["loop"] == r["loop"] and "select" in x["flags"] for x in rows),
+           f"a two-kernel object gives two rows equal to the kernel alone ({[(x['kernel'], x['select'], x['loop']) for x in rows]} vs {r['select']}, {r['loop']})")
         r = compile_lint(lc, t, "iq4_new", qv + new, "g_deq16_iq4_nl")
         ok(not r["flags"], f"IQ4 dequant with the byte mask: no flag ({r['select']} of {r['common']}, flags {r['flags']})")
         r = compile_lint(lc, t, "q6_old", q6_old + kernel("g_q6_k_icodes", False), "t_g_q6_k_icodes")
@@ -126,6 +136,10 @@ def main():
         open(os.path.join(run, "x.req.json"), "w").write(json.dumps({"requests": [{"prompt_tokens": 81430}]}))
         ms, prompt = kl.served_ms(run)
         ok(ms == {"g_a": 3.0, "g_b": 0.5} and prompt == 81430, f"served ms per kernel from valid events only ({dict(ms)}, {prompt})")
+    algo = ["s_mov_b32 s0, 0", "v_dot4_i32_iu8 v1, v2, v3, v1"] + ["v_cmp_lt_i32_e64 s1, v4, v5", "v_cndmask_b32_e64 v6, v7, v8, s1"] * 10
+    algo.append(back(len(algo), 1))
+    r = kl.lint_listing("algo", *listing(algo))
+    ok("select" not in r["flags"], f"selects without equality constants (an algorithm, not a lookup) do not flag select (E244: {r['eq_imm']} constants)")
     pf = ["s_mov_b32 s0, 0", "global_load_b128 v[1:4], v0, s[2:3]", "global_load_b128 v[5:8], v0, s[2:3]"] + \
          ["v_dot4_i32_iu8 v9, v10, v11, v9"] * 6 + ["s_waitcnt vmcnt(1)", "v_add_nc_u32_e32 v1, v1, v2"]
     pf.append(back(len(pf), 1))
