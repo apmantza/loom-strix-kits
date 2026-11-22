@@ -22,6 +22,9 @@ Keep a log: one entry per try (what ran, where the data is, the result, the deci
    workgroup count. One kernel's mean hid two populations (aligned and straddling verify tokens) at 1.62 and 3.01 ms.
 3. **Classify the bound** (rules section 1): bytes / time against bandwidth, FLOPs / time against the WMMA peak, latency
    (a timing ablation without loads and one with cache-resident loads), or registers (the compile report).
+   Before designing, run `common/kernel_lint.py` over the package's compiled kernels: it flags the defect shapes already
+   found (a scalarised lookup, byte-vector repacking, a hot-loop spill) and prints instructions per MMA and the registers to
+   the next residency tier.
 4. **Read the SDK and this repository's generator before designing around a limit** (rules section 6): grep an hrx-system
    checkout at the installed tag (loom/docs/src, loom/py/loom/dialect) and kit/.
 5. **Prior art at the diagnosis step** (rules section 3), with the measured diagnosis in the brief; spot-check key claims.

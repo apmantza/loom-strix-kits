@@ -15,6 +15,25 @@ make it worse. Classify first, with numbers:
 - **latency**: a timing ablation that removes the loads (zeros staged instead) and one that keeps them cache-resident.
   L18/E52: prefill attention ran 0.57x without K/V loads and 0.85x with cache-resident loads: latency, not bandwidth.
 - **registers**: final VGPRs and the occupancy tier from the compile report; spills share the load counter on gfx11.
+- **counters first, once they are calibrated on the machine** (ROCm 10.2 rocprofv3; `common/counters.sh OUT calibrate` must
+  show MemReadBytes matching the bytes a probe reads): wait reasons (vmem, ALU dependency, LDS), load latency and loads in flight
+  answer the classification directly for any kernel a HIP harness can launch (common/hsaco_run.py); the ablations above stay the
+  check when counters are not available or disagree.
+- **Occupancy is latency hiding, not a throughput model**: read VGPRs and the VGPRs to free for the next residency tier from the
+  compile report (`common/kernel_lint.py` prints both); a rewrite that frees registers is worth a tier only if the kernel waits on
+  latency. Loom kernels run in WGP mode (a workgroup over 4 SIMDs). A model of part-empty last rounds of workgroups predicted
+  14-29 % idle on decode matvecs measured at the bandwidth ceiling (E234): do not rank work by it.
+
+What each kernel class was bound by here, and the number to watch (one model, Qwen3.8-27B; re-classify for another):
+
+| Kernel class | Bound by (evidence) | Watch |
+|---|---|---|
+| Decode weight matvecs, bulk shapes | DRAM bytes: 204-216 GB/s of a 235 GB/s read ceiling (E192) | GB/s against the floor; bytes per token |
+| Decode matvecs that lag their format's peers | open: per-wave issue suspected (q6_k: 616 loop instructions vs q5_k's 261, E233/E235) | instructions per weight, wait reasons |
+| Prefill GEMMs | WMMA issue; VALU does not overlap WMMA on gfx11, so dequant VALU competes with the MMAs (E61, E198) | non-MMA instructions per MMA |
+| Prefill attention | memory latency: reads waited right after issue (E52, E80, E109); instruction cuts did nothing (E77) | load-to-wait distance (load_cover.py) |
+| Decode / verify attention (split-K) | issue: moves and staging dominate the common path (E168, E184) | instructions per key; moves |
+
 
 **On a latency-bound kernel, count reads, not bytes or instructions.** What costs is how many separate memory
 transactions a tile waits on: distinct cache lines, extra address streams, loads whose address depends on another load
