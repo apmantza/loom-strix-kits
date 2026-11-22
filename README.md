@@ -14,7 +14,7 @@ The repository has three parts:
 - `kits/<model>/` holds what is specific to one model:
   - a manifest (`kit.env`: model id, recipe switches, build and serve flags, reference GGUF);
   - the model config;
-  - a fetch script that pins the weights by revision and sha256.
+  - pins (`pins.json`: the hrx-loom version measured, each file's repository, revision and sha256) and a fetch script;
 - `common/` holds tools that work for any kit: build, serve, kernel tests, output equality, gates, an agent-session A/B,
   and code-object analysis.
 - `skills/` holds agent-readable procedures (plain markdown, any coding agent): `skills/loom-strix-optimise/` is how we
@@ -62,6 +62,8 @@ common/serve.sh qwen38-27b pkg                        # OpenAI-compatible API, t
 | `common/agent_run_summary.py` | summarizes server-side numbers of an agent run from /metrics snapshots |
 | `common/events_ab.sh KIT OUT LEN PKG...` | served per-dispatch profiles (ABBA order) at one prompt size, then every lane against its hardware floor (`kits/<kit>/lanes.json`) |
 | `common/events_summary.py`, `lane_breakdown.py`, `ceiling.py` | the lane table, one lane kernel by kernel (with GB/s for matvecs), the floors themselves |
+| `common/fresh.py KIT` | is the kit still current: installed and measured hrx-loom against PyPI, each pinned file's sha256 against its repository's main (exit 1 stale, 2 check failed) |
+| `common/fetch.py KIT` | downloads the kit's pinned files (`kits/<kit>/pins.json`) and verifies every sha256 |
 | `common/checks.py` | A/B verdict checks (paired bootstrap CI, ABBA neighbour rule), a loop flag, GPU memory per process from fdinfo |
 
 `build.sh`, `state.sh`, `ktest.sh` and `events_summary.py` (on a real served profile) have run in this layout. `serve_as.sh`, `eq.sh`,

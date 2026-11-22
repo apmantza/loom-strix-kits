@@ -150,8 +150,8 @@ more bytes than Strata's' after checking only Strata's file; our generator's doc
 - Loom elastic backing needs power-of-two text-cache pages (E73-E74: 16,640-B pages faulted the GPU; 16,384-B pages
   pass). Fixed backing (`--pool_backing=fixed`) ties elastic on speed here (E69).
 - loom-serve needs unlimited memlock (io_uring pinning; E1).
-- Check freshness at the start of a session and before blaming the SDK or the model (hrx-loom on PyPI, the model GGUF's
-  Hugging Face revision): we ran two weeks behind hrx-loom once, and two months behind Unsloth's UD3.1
+- Check freshness at the start of a session and before blaming the SDK or the model (`common/fresh.py KIT`: hrx-loom on
+  PyPI, each pinned file at its repository's main): we ran two weeks behind hrx-loom once, and two months behind Unsloth's UD3.1
   re-upload (E113). Read upstream source at the installed tag (E105 read v0.1.0 source against a
   0.2.0 server). hrx-loom 0.3.0 (11-21) went unnoticed for a day when the check was skipped.
 - Loom's prefix cache on a hybrid (GDN) model: a row cannot roll back, so reuse below the tip needs a checkpoint;

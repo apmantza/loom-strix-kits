@@ -1,0 +1,35 @@
+{
+ "_doc": "What this kit was built and measured with. common/fetch.py downloads and verifies these; common/fresh.py compares them with upstream.",
+ "hrx_loom": "0.2.0",
+ "files": [
+  {
+   "repo": "unsloth/Qwen3.8-27B-GGUF",
+   "revision": "4af51b3542f775b0a8e4b310bfb3f17e01c306c9",
+   "path": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+   "sha256": "2a5f3565f39cf885103da591182c1266da64745737b42b452fd3e675369f1211",
+   "dest": "models",
+   "note": "the UD3.1 re-upload"
+  },
+  {
+   "repo": "unsloth/Qwen3.8-27B-GGUF",
+   "revision": "4af51b3542f775b0a8e4b310bfb3f17e01c306c9",
+   "path": "mmproj-F16.gguf",
+   "sha256": "cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e",
+   "dest": "models"
+  },
+  {
+   "repo": "z-lab/Qwen3.8-27B-DFlash2-GGUF",
+   "revision": "2d9571f8ce46e151f61c6499c99dee6079e1d610",
+   "path": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+   "sha256": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd",
+   "dest": "models"
+  },
+  {
+   "repo": "Qwen/Qwen3.8-27B",
+   "revision": "37561816e66b5b9153b1b64c10968c18c1e6f4a0",
+   "path": "tokenizer.json",
+   "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+   "dest": "tok"
+  }
+ ]
+}

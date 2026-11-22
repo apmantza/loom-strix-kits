@@ -2,7 +2,7 @@
 
 > **Work in progress.** This is the recipe our daily-driver server runs. Its numbers come from one Strix Halo box.
 
-## Weights (pinned in fetch.sh)
+## Weights (pinned in pins.json; fetch.sh downloads and verifies them)
 
 | File | Repository @ revision | License |
 |---|---|---|
