@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Model constants for the hardware floors (common/ceiling.py, events_summary.py) computed from the weights, not by hand.
 
-Reads tensor names, shapes and byte sizes from a GGUF (the gguf package) or a safetensors file (its JSON header only: a local
-file, or a Hugging Face URL read with two HTTP range requests, so a 20 GB checkpoint is never downloaded). Prints the "model"
+Reads tensor names, shapes and byte sizes from a GGUF (the gguf package) or safetensors headers (a local file, or
+hf:REPO[@REVISION] through huggingface_hub, which reads every shard's header remotely: a 20 GB checkpoint is never downloaded). Prints the "model"
 block of kits/<kit>/lanes.json with a _src line saying how each number was made, or writes it into a lanes.json (--write).
 
   decode_weight_bytes   bytes one decode step reads: every matrix except the token embedding (read one row per token); MoE
@@ -21,7 +21,6 @@ import os
 import re
 import struct
 import sys
-import urllib.request
 
 EMBED = re.compile(r"(^|\.)(token_embd|embed_tokens|wte|tok_embeddings|embed)(\.|$)")
 HEAD = re.compile(r"(^|\.)(output|lm_head|unembed)\.weight$|^output\.weight$")
@@ -46,18 +45,21 @@ def read_gguf(path):
     return tensors, meta
 
 
-def _header(path):
-    if path.startswith("http"):
-        get = lambda a, b: urllib.request.urlopen(urllib.request.Request(path, headers={"Range": f"bytes={a}-{b}", "User-Agent": "make_lanes"}), timeout=60).read()
-        n = struct.unpack("<Q", get(0, 7))[0]
-        return json.loads(get(8, 8 + n - 1))
+def read_safetensors(path):
+    """a local .safetensors file (its JSON header), or hf:REPO[@REVISION] (huggingface_hub reads every shard's header remotely;
+    sharded checkpoints and gated repos included)"""
+    if path.startswith("hf:"):
+        from huggingface_hub import get_safetensors_metadata
+        repo, _, rev = path[3:].partition("@")
+        md = get_safetensors_metadata(repo, revision=rev or None)
+        tensors = {}
+        for fm in md.files_metadata.values():
+            for name, ti in fm.tensors.items():
+                tensors[name] = {"shape": list(ti.shape), "bytes": ti.data_offsets[1] - ti.data_offsets[0], "dtype": ti.dtype}
+        return tensors, {}
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
-        return json.loads(f.read(n))
-
-
-def read_safetensors(path):
-    h = _header(path)
+        h = json.loads(f.read(n))
     tensors = {k: {"shape": v["shape"], "bytes": v["data_offsets"][1] - v["data_offsets"][0], "dtype": v["dtype"]}
                for k, v in h.items() if k != "__metadata__"}
     return tensors, h.get("__metadata__", {})
@@ -150,7 +152,7 @@ def drafter_constants(path, verify_tokens):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("weights", help="a .gguf, a .safetensors, or an https URL of a .safetensors file")
+    ap.add_argument("weights", help="a .gguf, a .safetensors, or hf:REPO[@REVISION] (remote safetensors headers)")
     ap.add_argument("--config", help="HF config.json (heads, head_dim) when the weights do not carry them")
     ap.add_argument("--experts", type=int); ap.add_argument("--top-k", type=int)
     ap.add_argument("--loop", help="FIRST:LAST:TIMES, e.g. 6:17:3 (layers run TIMES per token, shared weights)")
