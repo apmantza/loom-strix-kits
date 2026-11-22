@@ -35,7 +35,11 @@ https://huggingface.co/strata-engine/Hy4-Flash-Strata (a speed baseline, not a c
 - Native BF16, 148 shards, 440.5 GB; an official FP8 variant.
 - AngelSlim (Tencent) GGUFs, arch `hy_v4_flash`, the Engram table in its own shard (63.4 GB): Q4_K_M 156.8 GiB (experts
   q4_k / q6_k, **non-expert tensors q8_0**), Q3_K 144.7 GiB, NVFP4 "SPARK" ~150 GiB, IQ2-AH 125.7 GiB (non-expert bf16).
-  No Unsloth or bartowski quants yet (11-22).
+  No Unsloth or bartowski quants yet (11-22). Other GGUFs on Hugging Face by 22 Nov (sizes as listed, GiB; whether the
+  Engram table is included differs by repo): Xylolabs (imatrix, IQ2_XXS 77.4 ... Q8_0 213.1, incl. NVFP4 144.3 and Q4_K_M
+  150.1), nace-ai (IQ3_XXS 81.8, Q3_K_M 100.1, IQ4_XS 114.2, Q4_K_M 118.5), AtomicChat (IQ2_S/IQ2_XXS 78.9), zephel01
+  (86.5, sized for 32 GB VRAM + 96 GB RAM), Baekpica (Q5/Q8 mixes with the Engram table kept in FP8 on SSD, 96.8-98.9, with
+  DFly2 drafter GGUFs). Plus EXL3, MLX, NVFP4 / W4A16 / INT8 safetensors variants.
 - llama.cpp: PR #32517 open, not merged (new KV cache and memory classes for the pooled index); main already has the
   neighbours (hy-v4: MLA + indexer + HC; deepseek41: Engram + compressed indexer + HC). Transformers, vLLM and SGLang
   support: open PRs plus vendor images serving FP8 at tensor parallel 8.

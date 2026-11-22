@@ -30,6 +30,7 @@ The weights are never redistributed; each kit downloads them from their original
 | [qwen38-27b](kits/qwen38-27b/) | Qwen3.8-27B (hybrid Gated DeltaNet + attention, DFlash2 speculative decoding) | unsloth UD-Q4_K_XL GGUF | used daily for agent work; tuning ongoing |
 | [inkling-2-mini](kits/inkling-2-mini/) | Thinking Machines Inkling 2 Mini (26B MoE, ~3.4B active, looped layers) | native NVFP4/MXFP8 release; Unsloth GGUFs as variants | scoping (NOTES.md) |
 | [hy4-flash](kits/hy4-flash/) | Tencent Hy4 Flash (220B MoE incl. 63.5B Engram tables, ~11.3B active, MLA + sparse indexer) | AngelSlim GGUFs (non-expert q8_0); native BF16 / FP8 | scoping (NOTES.md) |
+| [nemotron-bolt](kits/nemotron-bolt/) | NVIDIA Nemotron 3.5 Bolt 74B-A9B (Mamba-2 / LatentMoE / NoPE attention hybrid, ~9.1B active, C-RADIO vision) | NVIDIA's QAD 2-bit GGUF (experts IQ2_XXS, Mamba NVFP4) + LiLiCorr drafter | scoping (NOTES.md) |
 
 ## Requirements
 
