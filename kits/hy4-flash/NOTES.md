@@ -105,6 +105,14 @@ Worth a kit, as the second large port after Inkling's plain decode: the stronger
 band, but five new subsystems, a memory footprint that needs the whole GPU, and references that are not merged yet. Strata
 already reaches 51-60 tok/s with DFly2, so a competitive kit needs the drafter.
 
+## From a DGX Spark recipe (github.com/sxuff/Hy4-Flash-Spark-recipe, MIT; read 22 Nov)
+- llama.cpp + AngelSlim's patch with the SPARK-4Bit-Fast GGUF (NVFP4 experts: Blackwell FP4, not usable on gfx1151; non-expert Q8_0;
+  Engram Q8_0 62.7 GiB on the SSD via mmap; research/nvme-streaming.md). ~87 GiB on the GPU, 256K context, f16 KV, MLA as absorbed
+  MQA over the 576-wide latent even in prefill; the sparse layers run a dense masked pass (prefill 765 tok/s at 8K -> 542 at 200K)
+  [theirs, GB10]. Decode 40.6 tok/s at temperature 0 with MTP depth 4 on short prompts [theirs].
+- **Drafter**: these GGUFs carry the 1-layer MTP block, not DFly2: MTP (depth 3-4: +17 % over depth 1 at T 0 [theirs]) is the first
+  drafter to plan for. The non-expert weights stayed Q8_0 there too, so the largest decode lever (above) is untested by anyone.
+
 ## Plan, cheapest evidence first
 1. Static, no weights: a hy_v4_flash name map from the shard headers and the PR's converter; one MLA absorbed-decode probe
    (576-wide latent, 64 heads, sink + elementwise gate) compiled for gfx1151, to see its register and LDS cost.

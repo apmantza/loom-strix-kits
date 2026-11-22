@@ -113,6 +113,14 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    residuals, the loop messages and the output query (gen_loop.depth_mix: states RMS-normalised, softmax over learned-query scores,
    the normalised states mixed; each state read once, two barriers per call). Still to write: the 48-slot schedule in the program, a
    multi-token controller for verify spans.
+   **Controller weights are BF16 in disguise (22 Nov)**: all 28.3M f32 values of the GGUF's 144 loop-controller tensors have zero low
+   16 bits (exact BF16 upcasts; the native checkpoint stores them in BF16), so storing them as BF16 halves the ~226 MB per token with
+   bit-identical results.
+   **From vLLM's Inkling backend (read via github.com/sxuff/inkling-2-mini-spark, 22 Nov)**: conv history keyed by absolute position
+   like KV (speculative rollback free); K / V convolutions fused into the attention prologue with the clips and the KV write; decode
+   attention with one workgroup per (KV head, all verify tokens x its GQA group); the expert activations are quantised per token as
+   the checkpoint's hf_quant_config asks (NVFP4 layers 0-19, MXFP8 20-23), which llama.cpp does not do. Its GB10 step time suggests
+   an 8-token verify reads ~1.9x one token's bytes, not the 2.8x estimated above: measure the expert union on real windows.
    **Short convolutions (22 Nov)**: kit/gen_sconv.py, the four per-layer causal convolutions with residual and 1/sqrt(n) scale, the
    global layers' K / V with per-head dynamic taps; one lane per channel, history read and written once, a decode or verify span
    per call. kit/test_sconv.py executes the generated kernel text in float32 and matches ggml's convolve() bit for bit. As
