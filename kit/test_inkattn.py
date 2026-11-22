@@ -4,9 +4,10 @@
     clamped to [0, 1]), v not RMS-normalised (or with the wrong length), r's padded lanes (16 of 32) leaking into its norm;
   - tau wrong or applied on local layers (global only: 1 + alpha log(max(1, (pos + 1) / floor)), on q and r, after the clip);
   - heads or waves mixed up (each of 8 waves owns 3 q heads, 1 k, 1 v, 3 r heads).
-decode_swa (the sliding-window decode attention):
+decode_swa (the sliding-window decode attention) and decode_global (the global layers' split-K form: chunk + combine kernels):
   - the bias at the wrong distance or the window edge off (distance < 1024: n_kv 1,500 checks the cut), GQA heads mixed up, the
-    zero-logit sink left out of the softmax (heads with large sink logits, where it dominates the denominator), the gate missing.
+    zero-logit sink left out of the softmax (heads with large sink logits, where it dominates the denominator), the gate missing;
+    on global layers the bias past distance 1024 not zero (n_kv 1,300), or the chunks combined without the sink.
 How: kit/loomsim.py runs the emitted kernels (all lanes of a workgroup at once, in float32) and the results are compared with numpy
 transcriptions of inkling2.cpp's clip() / rms_norm / tau and of its attention (scores + r . rel_bias[d] - sink, softmax with a zero sink,
 sigmoid gate). Summation order differs from ggml's: prep to 2e-6 relative, attention to 1e-5 of the output's RMS. The kernels compile with no lint flag.
@@ -50,14 +51,16 @@ def reference(q, k, v, r, qc, rc, pos, glob, qk_clip=22.627416610717773, rel_cli
 
 
 def attention_reference(n_kv, q, r, sinks, gate, rb, kc, vc, W=1024):
-    """one token's sliding-window attention, as the fork: s = q . k / sqrt(128) + r . rel_bias[d] - sink over distances d < W, softmax
-    with a zero-logit sink (max over the scores and 0), the output times sigmoid(gate); GQA: kv head = h / 3"""
+    """one token's attention, as the fork: s = q . k / sqrt(128) + r . rel_bias[d] - sink (the bias 0 past distance 1024: the zero pad
+    row), over distances d < W (W None: all keys, the global layers), softmax with a zero-logit sink (max over the scores and 0), the
+    output times sigmoid(gate); GQA: kv head = h / 3"""
     out = np.zeros((24, 128), np.float64)
     for h in range(24):
         kvh = h // 3
-        d = np.arange(min(n_kv, W))
+        d = np.arange(n_kv if W is None else min(n_kv, W))
         j = n_kv - 1 - d
-        s = kc[j, kvh].astype(np.float64) @ q[h] / np.sqrt(128) + rb[d].astype(np.float64) @ r[h] - sinks[h]
+        bias = np.where(d < 1024, rb[np.minimum(d, 1023)].astype(np.float64) @ r[h], 0.0)
+        s = kc[j, kvh].astype(np.float64) @ q[h] / np.sqrt(128) + bias - sinks[h]
         m = max(0.0, s.max())
         p = np.exp(s - m)
         out[h] = (p @ vc[j, kvh]) / (np.exp(-m) + p.sum()) / (1 + np.exp(-gate[h]))
@@ -95,10 +98,29 @@ def main():
         ref = attention_reference(n_kv, q, r, sinks, gate, rb, kc, vc)
         err = float(np.max(np.abs(out - ref)) / np.sqrt((ref ** 2).mean()))   # max abs error over the output's RMS (scale-free)
         ok(err < 1e-5, f"decode_swa n_kv {n_kv}: equals the fork's attention (bias, window, zero sink, gate; max err / rms {err:.1e})")
+    for n_kv in (300, 1300):
+        q = rng.standard_normal((24, 128)).astype(f32)
+        r = rng.standard_normal((24, 16)).astype(f32)
+        sinks = rng.standard_normal(24).astype(f32)
+        sinks[::3] += f32(12)
+        gate = rng.standard_normal((24, 128)).astype(f32)
+        rb = (rng.standard_normal((1024, 16)) * 0.3).astype(f32)
+        kc = rng.standard_normal((n_kv, 8, 128)).astype(f32)
+        vc = rng.standard_normal((n_kv, 8, 128)).astype(f32)
+        part = np.zeros((24, 4096, 130), f32)
+        out = np.zeros((24, 128), f32)
+        ptext, ctext = gen_inkattn.decode_global()
+        loomsim.run(ptext, {"q": q, "r": r, "sinks": sinks, "rel_bias": rb, "kc": kc, "vc": vc, "part": part}, {"n_kv_arg": n_kv},
+                    (24, (n_kv + 255) // 256, 1), 256)
+        loomsim.run(ctext, {"part": part, "gate": gate, "out": out}, {"n_kv_arg": n_kv}, (24, 1, 1), 128)
+        ref = attention_reference(n_kv, q, r, sinks, gate, rb, kc, vc, W=None)
+        err = float(np.max(np.abs(out - ref)) / np.sqrt((ref ** 2).mean()))
+        ok(err < 1e-5, f"decode_global n_kv {n_kv}: chunks + combine equal the fork's attention (max err / rms {err:.1e})")
     import kernel_lint as kl
     with tempfile.TemporaryDirectory() as t:
         for name, text in [(f"g_ink_attn_prep_t{T}" + ("_global" if glob else ""), gen_inkattn.prep(T, glob)) for T, glob in ((1, False), (8, True))] + \
-                [("g_ink_attn_dec_swa1024", gen_inkattn.decode_swa())]:
+                [("g_ink_attn_dec_swa1024", gen_inkattn.decode_swa()), ("g_ink_attn_dec_glob_part", "".join(gen_inkattn.decode_global())),
+                 ("g_ink_attn_dec_glob_comb", "".join(gen_inkattn.decode_global()))]:
             p = os.path.join(t, "p.loom")
             open(p, "w").write("target.decl @device\namdgpu.target<gfx11-generic> @rdna3\n" + text)
             o = os.path.join(t, "p.hsaco")

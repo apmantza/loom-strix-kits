@@ -125,5 +125,15 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
    matched to the fork's math (kit/test_inkattn.py). gen_inkattn.decode_swa: the sliding-window decode attention (one workgroup per
    query head: scores with the bias into LDS, softmax with the zero-logit sink, 2 x 128 lanes for the output dims, sigmoid gate;
    f32 K / V for now): 630 instructions, 68 VGPRs, 16 waves, lint-clean; equal to the fork's attention within float32 accumulation
-   (window cut at 1,024, sink-dominated heads, GQA) on kit/loomsim.py. Next: KV8 in-tile, the global layers' split-K form, verify spans.
+   (window cut at 1,024, sink-dominated heads, GQA) on kit/loomsim.py. gen_inkattn.decode_global: the global layers' split-K form
+   (256-key chunks, then a combine with the zero-logit sink; the bias 0 past distance 1024), checked the same way. Next: KV8
+   in-tile, verify spans.
+   **Strata 0.2.19 (MIT; read 22 Nov, techniques only)**: it materialises the bias as a 24 x 1024 f32 table per token and layer
+   visit (ours: 16 multiply-adds per key in the kernel); decode attention splits keys 4 ways, 8 waves per query head, the 3 heads
+   of a KV group reading K / V separately; prefill f16 WMMA 64 x 64; KV paged f16 (FP8 only at >= 16 parallel requests), per-pass
+   caches; controller weights converted to BF16 at load (half the bytes; changes numerics), q/k/v controllers in one launch; the
+   depth mix reads each state twice; the attention-output convolution fused into the output-projection matvec and the FFN one
+   into the expert reduce; NVFP4 through LDS byte -> f16-pair tables with f16 dots; DSpark verify size from cost(M) = 1 + 4.2 (1 -
+   (15/16)^M). Vendor numbers: 47.3 tok/s (native-weight pack) and 48.0 (smallest pack) with drafting, prompt 1,466 tok/s; the
+   near-equal speed of packs 2x apart suggests decode there is not bandwidth-bound.
 4. Weights route: UD-Q4_K_XL chosen 22 Nov (see Weights); confirm with our own KLD run against UD-Q8_K_XL (step 2).
