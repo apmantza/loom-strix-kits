@@ -61,7 +61,13 @@ the patterns below. Strata 0.2.19 (an engine with an Inkling backend on gfx1151)
 - References: Unsloth's official gfx1151 build of its fork (b12588-mix-c0c3de8, release asset, digest checked).
 
 ## Plan, cheapest evidence first
-1. Static: compile the NVFP4 and MXFP8 decode schemas for gfx1151 (the one unproven Loom capability).
+1. Static: compile the NVFP4 and MXFP8 decode schemas for gfx1151 (the one unproven Loom capability). **Done 11-22**: both
+   compile on Loom 0.2.0 and 0.3.0 for gfx1151 (one-lane probes: `vector.decode` with `#encoding.f4e2m1<scale_format=f8e4m3fn,
+   scale_group_elements=16>` and `#encoding.f8e4m3fn<scale_format=e8m0, scale_group_elements=32>`). NVFP4 to f16: ~5.3 VALU per
+   value including the store (e2m1 by `v_perm_b32` table, scale by `v_pk_mul_f16`). MXFP8 to f16 or f32: ~12.7 VALU per value
+   (gfx11 has no fp8 convert: software e4m3 decode, `v_bfi_b32` / packed 16-bit arithmetic). For decode matvecs, kit/gen_mxfp4s.py's
+   int8 path (e2m1 as doubled integer codes for dot4) is the nearest existing route for NVFP4: it differs in the scale (e4m3 per 16,
+   plus the per-expert fp32 factor, against e8m0 per 32).
 2. Reference: the Transformers implementation on CPU for per-layer outputs at short prompts; Unsloth's llama.cpp build for
    GGUF references and `common/quant_eval.sh` (UD-Q4_K_XL against UD-Q8_K_XL, which keeps the native experts).
 3. Generator (kit/, behind an `inkling2` architecture path): plain decode first, no speculation; then prefill; then DSpark.
