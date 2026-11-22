@@ -6,15 +6,10 @@ import sys
 
 
 def loom_compile():
-    venv = os.environ.get("VENV")
-    if not venv:
-        f = os.environ.get("LSK_ENV") or os.path.expanduser("~/.config/loom-strix-kits/env")
-        m = re.search(r"(?m)^VENV=(\S+)", open(f).read()) if os.path.exists(f) else None
-        venv = m.group(1) if m else None
-    p = os.path.join(venv, "bin", "loom-compile") if venv else None
-    if not (p and os.access(p, os.X_OK)):
-        sys.exit("test_iq4_lookup: no loom-compile (set VENV); not a pass")
-    return p
+    """the machine's loom-compile (one resolver for the kit's tests and common/kernel_lint.py)"""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "common"))
+    from kernel_lint import loom_compile as lc
+    return lc()
 
 
 def helper(src, name):
