@@ -2,14 +2,19 @@
 factor. Split planes as the native checkpoint stores them: the nibble plane %w (16 bytes per 32 values, the low nibble the even
 element: checked on Inkling's values) and the scale plane %ws (2 e4m3 bytes per 32 values).
 
-@g_nvfp4_icodes(%w, %ws, %origin, %scale_origin, %group) -> (codes, s_lo, s_hi): the signed codes 2 * e2m1 (0 1 2 3 4 6 8 12 and
+@g_nvfp4s_icodes(%w, %ws, %origin, %scale_origin, %group) -> (codes, s_lo, s_hi), split planes (native safetensors): the signed codes 2 * e2m1 (0 1 2 3 4 6 8 12 and
 negatives, the MXFP4 table of gen_mxfp4s: a v_perm lookup on bytes) of the 32-value group at byte %origin of %w, and its two
 half scales e4m3 / 2 (the codes carry the factor 2) for values 0-15 and 16-31: the two-scale call shape of gen_llm.iq_dot (as q6_k).
 The per-expert factor is applied by the caller once per row. gfx11 has no fp8 conversion: the e4m3 byte is decoded on integers
 (normal: (exp - 7 + 127) << 23 | mant << 20; subnormal: mant * 2^-9; checked over all 256 bytes in test_nvfp4.py).
 
 probe(): a single-token matvec over one expert's rows (one workgroup per row, one lane per 32-value group, the int8 dot of
-ACT_Q8 activations), for static compiles and the kernel lint before the MoE wiring (HRX-like E250)."""
+ACT_Q8 activations), for static compiles and the kernel lint before the MoE wiring (HRX-like E250).
+GGUF NVFP4 (ggml block_nvfp4, the layout of Unsloth's Inkling GGUFs, HRX-like E270): 64 values in 36 bytes, 4 UE4M3 scale bytes (one
+per 16 values) then 32 bytes of e2m1 nibbles; within a 16-value sub-block byte j holds element j (low nibble) and j + 8 (high).
+@g_nvfp4_icodes(%w, %origin, %group) -> (codes, s_lo, s_hi) for the 32-value half %group (0 or 1) of the block at %origin: the
+doubled codes (kvalues_mxfp4) and the two half scales ggml_ue4m3_to_fp32 gives (x 0.5 for the doubled codes, 0x7F and 0 decode to
+0, the sign bit ignored), the two-scale call shape of gen_llm.iq_dot. Each tensor's per-expert f32 '.scale' is applied by the caller."""
 
 
 def e4m3_scalar(byte_var, out):
@@ -39,7 +44,7 @@ def e4m3_scalar(byte_var, out):
 
 def nvfp4_icodes():
     return f"""
-func.def inline @g_nvfp4_icodes(%w: buffer, %ws: buffer, %origin: offset, %scale_origin: offset, %group: index) -> (vector<32xi8>, f32, f32) {{
+func.def inline @g_nvfp4s_icodes(%w: buffer, %ws: buffer, %origin: offset, %scale_origin: offset, %group: index) -> (vector<32xi8>, f32, f32) {{
   %q_view = buffer.view %w[%origin] : buffer -> view<16xi8>
   %s_view = buffer.view %ws[%scale_origin] : buffer -> view<2xi8>
   %sb = vector.load %s_view[0] : view<2xi8> -> vector<2xi8>
@@ -75,6 +80,74 @@ func.def inline @g_nvfp4_icodes(%w: buffer, %ws: buffer, %origin: offset, %scale
   %lo_codes = vector.table.lookup %codebook[%lower] : vector<16xi8>, vector<16xi8> -> vector<16xi8>
   %hi_codes = vector.table.lookup %codebook[%upper] : vector<16xi8>, vector<16xi8> -> vector<16xi8>
   %codes = vector.interleave<0> %lo_codes, %hi_codes : vector<16xi8>, vector<16xi8> -> vector<32xi8>
+  func.return %codes, %s_lo, %s_hi : vector<32xi8>, f32, f32
+}}
+"""
+
+
+CODEBOOK = """  %k0 = scalar.constant 0 : i8
+  %k1 = scalar.constant 1 : i8
+  %k2 = scalar.constant 2 : i8
+  %k3 = scalar.constant 3 : i8
+  %k4 = scalar.constant 4 : i8
+  %k5 = scalar.constant 6 : i8
+  %k6 = scalar.constant 8 : i8
+  %k7 = scalar.constant 12 : i8
+  %k9 = scalar.constant -1 : i8
+  %k10 = scalar.constant -2 : i8
+  %k11 = scalar.constant -3 : i8
+  %k12 = scalar.constant -4 : i8
+  %k13 = scalar.constant -6 : i8
+  %k14 = scalar.constant -8 : i8
+  %k15 = scalar.constant -12 : i8
+  %codebook = vector.from_elements %k0, %k1, %k2, %k3, %k4, %k5, %k6, %k7, %k0, %k9, %k10, %k11, %k12, %k13, %k14, %k15 : vector<16xi8>
+"""
+
+
+def ue4m3(byte_var, out):
+    """Loom text: f32 %{out} = ggml_ue4m3_to_fp32 of the i32 byte %{byte_var}: the e4m3 magnitude x 0.5, 0 for 0x7F"""
+    return e4m3_scalar(byte_var, f"{out}_m") + f"""  %{out}_half = scalar.constant 0.5 : f32
+  %{out}_h = scalar.mulf %{out}_m, %{out}_half : f32
+  %{out}_c127 = scalar.constant 127 : i32
+  %{out}_nan = scalar.cmpi eq, %{byte_var}, %{out}_c127 : i32
+  %{out}_zero = scalar.constant 0.0 : f32
+  %{out} = scf.select %{out}_nan, %{out}_zero, %{out}_h : f32
+"""
+
+
+def gguf_icodes():
+    return f"""
+func.def inline @g_nvfp4_icodes(%w: buffer, %origin: offset, %group: index) -> (vector<32xi8>, f32, f32) {{
+  %two = index.constant 2 : offset
+  %four = index.constant 4 : offset
+  %sixteen = index.constant 16 : offset
+  %s_off = index.scale %group, %two : index, offset -> offset
+  %s_origin = index.add %origin, %s_off : offset
+  %s_view = buffer.view %w[%s_origin] : buffer -> view<2xi8>
+  %sb = vector.load %s_view[0] : view<2xi8> -> vector<2xi8>
+  %sb0 = vector.extract %sb[0] : vector<2xi8> -> i8
+  %sb1 = vector.extract %sb[1] : vector<2xi8> -> i8
+  %b0 = scalar.extui %sb0 : i8 to i32
+  %b1 = scalar.extui %sb1 : i8 to i32
+{ue4m3("b0", "s_lo")}{ue4m3("b1", "s_hi")}  %q_off = index.scale %group, %sixteen : index, offset -> offset
+  %q_base = index.add %origin, %four : offset
+  %q_origin = index.add %q_base, %q_off : offset
+  %q_view = buffer.view %w[%q_origin] : buffer -> view<16xi8>
+  %payload = vector.load %q_view[0] : view<16xi8> -> vector<16xi8>
+  %mask = vector.splati 15 : vector<16xi8>
+  %shift4 = vector.splati 4 : vector<16xi8>
+  %lower = vector.andi %payload, %mask : vector<16xi8>
+  %shifted = vector.shrui %payload, %shift4 : vector<16xi8>
+  %upper = vector.andi %shifted, %mask : vector<16xi8>
+{CODEBOOK}  %lo = vector.table.lookup %codebook[%lower] : vector<16xi8>, vector<16xi8> -> vector<16xi8>
+  %hi = vector.table.lookup %codebook[%upper] : vector<16xi8>, vector<16xi8> -> vector<16xi8>
+  %lo_a = vector.slice %lo[0] : vector<16xi8> -> vector<8xi8>
+  %hi_a = vector.slice %hi[0] : vector<16xi8> -> vector<8xi8>
+  %lo_b = vector.slice %lo[8] : vector<16xi8> -> vector<8xi8>
+  %hi_b = vector.slice %hi[8] : vector<16xi8> -> vector<8xi8>
+  %sub_a = vector.concat<0> %lo_a, %hi_a : vector<8xi8>, vector<8xi8> -> vector<16xi8>
+  %sub_b = vector.concat<0> %lo_b, %hi_b : vector<8xi8>, vector<8xi8> -> vector<16xi8>
+  %codes = vector.concat<0> %sub_a, %sub_b : vector<16xi8>, vector<16xi8> -> vector<32xi8>
   func.return %codes, %s_lo, %s_hi : vector<32xi8>, f32, f32
 }}
 """
@@ -124,7 +197,7 @@ kernel.def export("g_mv_nvfp4_probe") @g_mv_nvfp4_probe(%rows: index) {{
   %sro = index.scale %row, %srow_bytes : index, offset -> offset
   %sgo = index.scale %g, %two : index, offset -> offset
   %sorigin = index.add %sro, %sgo : offset
-  %codes, %s_lo, %s_hi = func.call @g_nvfp4_icodes(%w, %ws, %origin, %sorigin, %g) : (buffer, buffer, offset, offset, index) -> (vector<32xi8>, f32, f32)
+  %codes, %s_lo, %s_hi = func.call @g_nvfp4s_icodes(%w, %ws, %origin, %sorigin, %g) : (buffer, buffer, offset, offset, index) -> (vector<32xi8>, f32, f32)
   %xq_view = buffer.view %xq[%zero] : buffer -> view<{G}x32xi8>
   %xd_view = buffer.view %xd[%zero] : buffer -> view<{G}xf32>
   %xc = vector.load %xq_view[%g, %c0] : view<{G}x32xi8> -> vector<32xi8>

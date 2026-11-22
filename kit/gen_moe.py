@@ -14,21 +14,40 @@ g_moe_combine      y[t, H]   = sg[t] * y[t, :] + sum_k wts[t, k] ys[t*KU + k, :]
 """
 import os
 import re
-FMT = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "q8_0": 34, "q5_0": 22, "mxfp4": 17}
+from formats import FMT, SB  # noqa: E402  one table of block bytes / values for every format (was a private copy here)
 ROUTE_TR = int(__import__("os").environ.get("ROUTE_TR", "0"))   # router tokens per workgroup (0: largest of 1/2/4/8 whose LDS fits 48 KiB)
-SB = {"q4_k": 256, "q5_k": 256, "q6_k": 256, "q8_0": 32, "q5_0": 32, "mxfp4": 32}
 GATE_NAME = {1: "softmax(logits)", 2: "sigmoid(logit)", 3: "logit"}   # llama.cpp's expert_gating_func values
 # gating 3 (SOFTMAX_WEIGHT): `bias` is the router's own bias (ffn_gate_inp.bias, added to the logits before the top-k)
 # and the k weights are a softmax over the k picked logits.
 # Expert activations (cfg moe.act): "silu" (silu(g) * u), "swiglu_oai" (gpt-oss: x = min(g, limit),
-# y = clamp(u, -limit, limit), x * sigmoid(alpha x) * (y + 1); llama.cpp ggml_swiglu_oai).
+# y = clamp(u, -limit, limit), x * sigmoid(alpha x) * (y + 1); llama.cpp ggml_swiglu_oai), ("situ", beta, lb) (Inkling 2:
+# beta tanh(g / beta) sigmoid(g) * lb tanh(u / lb), lb <= 0: u as is; llama.cpp build_moe_ffn LLM_FFN_SITU, Unsloth's fork).
+
+
+def situ(kind, ty, g, u, out, pre, beta, lb, ind):
+    """Loom lines: %out = beta tanh(g / beta) sigmoid(g) * lb tanh(u / lb) in ggml's op order (scale by 1/beta, tanh, scale by beta, times
+    sigmoid(g); the same on u with lb, skipped when lb <= 0), on f32 scalars (kind "scalar") or vectors (kind "vector")."""
+    k = (lambda v: f"scalar.constant {v!r} : f32") if kind == "scalar" else (lambda v: f"vector.splatf {v!r} : {ty}")
+    L = [f"%{pre}ib = {k(1.0 / float(beta))}", f"%{pre}b = {k(float(beta))}",
+         f"%{pre}gs = {kind}.mulf {g}, %{pre}ib : {ty}", f"%{pre}gt = {kind}.tanhf<afn> %{pre}gs : {ty}",
+         f"%{pre}gb = {kind}.mulf %{pre}gt, %{pre}b : {ty}", f"%{pre}sg = {kind}.logisticf<afn> {g} : {ty}",
+         f"%{pre}act = {kind}.mulf %{pre}gb, %{pre}sg : {ty}"]
+    up = u
+    if float(lb) > 0:
+        L += [f"%{pre}il = {k(1.0 / float(lb))}", f"%{pre}l = {k(float(lb))}", f"%{pre}us = {kind}.mulf {u}, %{pre}il : {ty}",
+              f"%{pre}ut = {kind}.tanhf<afn> %{pre}us : {ty}", f"%{pre}ul = {kind}.mulf %{pre}ut, %{pre}l : {ty}"]
+        up = f"%{pre}ul"
+    L.append(f"%{out} = {kind}.mulf %{pre}act, {up} : {ty}")
+    return "\n".join(ind + x for x in L)
 
 
 def act_scalar(act, g, u, out, pre):
-    """Loom lines computing %out = act(%g, %u) on f32 scalars (act: None/"silu" or ("swiglu_oai", alpha, limit))."""
+    """Loom lines computing %out = act(%g, %u) on f32 scalars (act: None/"silu", ("swiglu_oai", alpha, limit), ("situ", beta, lb))."""
     if not act or act == "silu":
         return f"""    %{pre}silu = scalar.siluf<afn> {g} : f32
     %{out} = scalar.mulf %{pre}silu, {u} : f32"""
+    if act[0] == "situ":
+        return situ("scalar", "f32", g, u, out, pre, act[1], act[2], "    ")
     _, alpha, limit = act
     return f"""    %{pre}lim = scalar.constant {float(limit)!r} : f32
     %{pre}nlim = scalar.constant {-float(limit)!r} : f32
@@ -49,6 +68,8 @@ def act_vector(act, g, u, out, pre, n=8):
     if not act or act == "silu":
         return f"""  %{pre}sg = vector.siluf<afn> {g} : vector<{n}xf32>
   %{out} = vector.mulf %{pre}sg, {u} : vector<{n}xf32>"""
+    if act[0] == "situ":
+        return situ("vector", f"vector<{n}xf32>", g, u, out, pre, act[1], act[2], "  ")
     _, alpha, limit = act
     return f"""  %{pre}lim = vector.splatf {float(limit)!r} : vector<{n}xf32>
   %{pre}nlim = vector.splatf {-float(limit)!r} : vector<{n}xf32>
@@ -532,12 +553,15 @@ def route(H, E, KU, gating, norm, bias, wty="f32", scale=1.0):
     return route_decode(H, E, KU, gating, norm, bias, wty, scale) + route_prefill(H, E, KU, gating, norm, bias, wty, scale)
 
 
-def expert_mv(fmt, K, N, E, KU, R, mode, fused=False, bias=False, act=None, iq=None):
+def expert_mv(fmt, K, N, E, KU, R, mode, fused=False, bias=False, act=None, iq=None, gu_scale=False):
     """mode 'gu': act[a] = silu(Wg[e] x[a/KU]) * Wu[e] x[a/KU]; mode 'dn': ys[a] = Wd[e] x[a].
     fmt "GATE+UP" ('gu'): gate and up weights in different formats, each with its own strides and dequant.
     fused ('gu'): one gate_up tensor passed as both weights, expert e's N gate rows then its N up rows.
     bias: per-expert output biases (gpt-oss ffn_{gate,up,down}_exps.bias, [E, N] f32) added before the activation;
     act: the gate/up activation (see act_scalar).
+    gu_scale ('gu'): a per-expert f32 scale %gus [E] (Inkling's NVFP4 ffn_gate_up_exps.scale) multiplying both the gate and the up dot
+    products before the activation, as llama.cpp's build_lora_mm_id applies a mul_mat_id weight scale (the down projection's scale
+    folds into the combine weights instead: wscale).
     iq: (iq_decode, iq_dot, iq_load) of gen_llm (ACT_Q8): the activation is read as int8 codes + (scale, code sum) written by
     g_quant_q8 (layout: rows x groups x 32 int8, then rows x groups x (d, sum)) and contracted with the weight codes by
     integer dot4, as llama.cpp's mul_mat_vec_q does for expert matvecs; kernel name g_moe_{mode}_{fmt}_q8_k{K}_r{R}."""
@@ -553,6 +577,9 @@ def expert_mv(fmt, K, N, E, KU, R, mode, fused=False, bias=False, act=None, iq=N
     wargs = "%w: buffer, %w2: buffer" if nw == 2 else "%w: buffer"
     if bias:
         wargs += ", %bg: buffer, %bu: buffer" if nw == 2 else ", %bd: buffer"
+    assert not gu_scale or mode == "gu", "gu_scale: the gate/up matvec only"
+    if gu_scale:
+        wargs += ", %gus: buffer"
     xrows = "%xrows" if mode == "gu" else "%tokens"
     L = [f"""
 kernel.def export("{name}") @{name}(%n: index, %tokens: index) {{
@@ -711,6 +738,12 @@ kernel.def export("{name}") @{name}(%n: index, %tokens: index) {{
     %bval{wi} = view.load %bview{wi}[%e, %brow] : view<{E}x{N}xf32> -> f32
     %tb{wi} = scalar.addf %t{wi}, %bval{wi} : f32""")
     t0, t1 = ("%tb0", "%tb1") if bias else ("%t0", "%t1")
+    if gu_scale:   # the expert's scale on both dot products, before the activation
+        L.append(f"""    %gus_view = buffer.view %gus[%zero] : buffer -> view<{E}xf32>
+    %gus_e = view.load %gus_view[%e] : view<{E}xf32> -> f32
+    %ts0 = scalar.mulf {t0}, %gus_e : f32
+    %ts1 = scalar.mulf {t1}, %gus_e : f32""")
+        t0, t1 = "%ts0", "%ts1"
     if nw == 2 and act and act != "silu":
         L.append(act_scalar(act, t0, t1, "value", "oa_"))
     elif nw == 2:

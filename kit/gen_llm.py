@@ -1058,7 +1058,7 @@ def iq_dot(fmt, wi, j, out):
             acc = f"%ac{j}_{k}_{wi}{name}"
         t.append(f"    %ie{wi}_{j}{name} = vector.extract {acc}[0] : vector<1xi32> -> i32")
         return t, f"%ie{wi}_{j}{name}"
-    if fmt in ("q6_k", "q3_k"):   # two 16-value half scales per group
+    if fmt in ("q6_k", "q3_k", "nvfp4"):   # two 16-value half scales per group
         t0, ilo = chain(0, 4, "l"); t1, ihi = chain(4, 8, "h")
         t = t0 + t1
         t.append(f"""    %flo{wi}_{j} = scalar.sitofp {ilo} : i32 to f32
@@ -5362,7 +5362,8 @@ def moe_kernels(row_scale, gemm_fn):
     a = (H, MOE["experts"], MOE["used"], MOE["gating"], MOE["norm_weights"], MOE["probs_bias"] or MOE.get("router_bias", False), rty)
     parts = [GM.route(*a, scale=MOE.get("scale", 1.0)), GM.route_prefill_live(*a, scale=MOE.get("scale", 1.0)), GM.row_scale_tiles(row_scale)]
     # gate/up activation: silu (default) or gpt-oss's clamped swiglu (cfg moe.act, alpha and limit from llama.cpp)
-    act = ("swiglu_oai", MOE.get("swiglu_alpha", 1.702), MOE.get("swiglu_limit", 7.0)) if MOE.get("act") == "swiglu_oai" else None
+    act = (("swiglu_oai", MOE.get("swiglu_alpha", 1.702), MOE.get("swiglu_limit", 7.0)) if MOE.get("act") == "swiglu_oai" else
+           ("situ", MOE["situ_beta"], MOE["situ_linear_beta"]) if MOE.get("act") == "situ" else None)
     xb = dict(bias=True, act=act) if MOE.get("expert_bias") else dict(act=act) if act else {}
     for fmt, K, N, mode in sorted(USED_MOE):
       key = (fmt, K, N, mode)
@@ -6344,6 +6345,9 @@ if __name__ == "__main__":
         COMMON += Q5_0
     if any(t["type"] == "mxfp4" for t in TENS.values()):
         COMMON += MXFP4
+    if any(t["type"] == "nvfp4" for t in TENS.values()):   # ggml NVFP4 (Inkling 2 experts): int8 codes for the ACT_Q8 matvecs
+        import gen_nvfp4
+        COMMON += gen_nvfp4.gguf_icodes()
     if any(t["type"] in SPLIT for t in TENS.values()):
         COMMON += MXFP4S
     if (CFG.get("source") or {}).get("kind") == "safetensors" and any(t["type"] == "bf16" for t in TENS.values()) and "func.def inline @g_bf16_values" not in COMMON:   # bf16 embedding / head / MTP block (safetensors)

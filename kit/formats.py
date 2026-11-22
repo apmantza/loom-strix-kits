@@ -14,15 +14,18 @@ FMT = {  # bytes per superblock of SB[fmt] values
     # low nibble, 2j+1 high) and the E8M0 scales, one byte per 32 values, in a second tensor: gen_llm.MXFP4S, emitted when used. The
     # kernels take two operands (nibbles, scales); the block size below counts the nibble plane only.
     "mxfp4s": 16,
+    # NVFP4 as ggml stores it (block_nvfp4; Unsloth's Inkling 2 GGUF experts): 4 UE4M3 scale bytes (one per 16 values) + 32 bytes of
+    # E2M1 nibbles per 64 values, a per-tensor-per-expert f32 '.scale' beside it: gen_nvfp4.gguf_icodes, emitted when used.
+    "nvfp4": 36,
 }
 SB = {"q4_k": 256, "q5_k": 256, "q6_k": 256, "q8_0": 32, "f32": 32,
-      "q4_0": 32, "iq4_nl": 32, "iq4_xs": 256, "q3_k": 256, "iq3_s": 256, "q5_0": 32, "f16": 32, "bf16": 32, "mxfp4": 32, "mxfp4s": 32}
+      "q4_0": 32, "iq4_nl": 32, "iq4_xs": 256, "q3_k": 256, "iq3_s": 256, "q5_0": 32, "f16": 32, "bf16": 32, "mxfp4": 32, "mxfp4s": 32, "nvfp4": 64}
 LOWBIT = {"q4_0", "iq4_nl", "iq4_xs", "q3_k", "iq3_s"}
 # Formats whose decode matvecs and head take int8 activations (ACT_Q8): gen_llm.py has their @g_<fmt>_icodes.
 import os as _os
 # IQ4_NL / IQ4_XS (env IQ4_Q8, default on; 0 = the f32 path): signed kvalues_iq4nl codes, one scale per 32 values, no minimum.
 # MXFP4 split planes (choice decode.mxfp4s.act_q8, env MXFP4S_Q8): opt-in per model, gen_mxfp4s.mxfp4s_icodes.
-ICODES = frozenset({"q8_0", "q4_k", "q5_k", "q6_k", "q5_0"} | ({"mxfp4s"} if _os.environ.get("MXFP4S_Q8", "0").lower() not in ("", "0", "false", "no", "off") else set()) | ({"iq4_nl", "iq4_xs"} if _os.environ.get("IQ4_Q8", "1").lower() not in ("", "0", "false", "no", "off") else set())
+ICODES = frozenset({"q8_0", "q4_k", "q5_k", "q6_k", "q5_0", "nvfp4"} | ({"mxfp4s"} if _os.environ.get("MXFP4S_Q8", "0").lower() not in ("", "0", "false", "no", "off") else set()) | ({"iq4_nl", "iq4_xs"} if _os.environ.get("IQ4_Q8", "1").lower() not in ("", "0", "false", "no", "off") else set())
                    | ({"q3_k", "iq3_s"} if _os.environ.get("IQ3_Q8", "1").lower() not in ("", "0", "false", "no", "off") else set()))
 # Formats stored as two tensors (weight plane + scale plane): a call site passes two views, the second named <weight>_sc.
 SPLIT = frozenset({"mxfp4s"})
