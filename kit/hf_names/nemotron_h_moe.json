@@ -1,0 +1,196 @@
+{
+ "family": "nemotron_h_moe",
+ "doc": "NVIDIA Nemotron 3.5 Bolt 74B-A9B (kits/nemotron-bolt/NOTES.md): GGUF internal name <-> the BF16 release's safetensors key, per block kind ('kinds', the config's llm_config.layers_block_type: one mixer per block). ggml shapes are the HF shapes reversed after 'prep': squeeze (drop size-1 dims), groups:N (reshape [N*k] -> [N, k], so reversed [k, N]), row (a [n] vector as [1, n]), neg_exp (values -exp(x): A from A_log; shape as row). 'stack' entries gather the routed experts experts.{e} (e = 0 .. count-1) into one [E, ...] tensor. 'gguf_only' tensors have no HF key (the NVFP4 per-tensor factor of the shipping quantisation). The vision tower and projector live in the separate mmproj GGUF and are not mapped here.",
+ "architectures": [
+  "NemotronH_Omni_Reasoning_V3"
+ ],
+ "arch": "nemotron_h_moe",
+ "layers": 88,
+ "kinds": [
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "attention",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "attention",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "attention",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "attention",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "attention",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "attention",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "attention",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "attention",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe",
+  "mamba",
+  "moe"
+ ],
+ "global": {
+  "token_embd.weight": {
+   "hf": "language_model.backbone.embeddings.weight"
+  },
+  "output_norm.weight": {
+   "hf": "language_model.backbone.norm_f.weight"
+  },
+  "output.weight": {
+   "hf": "language_model.lm_head.weight"
+  }
+ },
+ "layer": {
+  "prefix": "language_model.backbone.layers.{i}.",
+  "common": {
+   "attn_norm.weight": {
+    "hf": "norm.weight"
+   }
+  },
+  "mamba": {
+   "ssm_in.weight": {
+    "hf": "mixer.in_proj.weight"
+   },
+   "ssm_in.scale": {
+    "gguf_only": "NVFP4 per-tensor factor"
+   },
+   "ssm_out.weight": {
+    "hf": "mixer.out_proj.weight"
+   },
+   "ssm_out.scale": {
+    "gguf_only": "NVFP4 per-tensor factor"
+   },
+   "ssm_conv1d.weight": {
+    "hf": "mixer.conv1d.weight",
+    "prep": "squeeze"
+   },
+   "ssm_conv1d.bias": {
+    "hf": "mixer.conv1d.bias"
+   },
+   "ssm_dt.bias": {
+    "hf": "mixer.dt_bias"
+   },
+   "ssm_a": {
+    "hf": "mixer.A_log",
+    "prep": "neg_exp"
+   },
+   "ssm_d": {
+    "hf": "mixer.D",
+    "prep": "row"
+   },
+   "ssm_norm.weight": {
+    "hf": "mixer.norm.weight",
+    "prep": "groups:8"
+   }
+  },
+  "attention": {
+   "attn_q.weight": {
+    "hf": "mixer.q_proj.weight"
+   },
+   "attn_k.weight": {
+    "hf": "mixer.k_proj.weight"
+   },
+   "attn_v.weight": {
+    "hf": "mixer.v_proj.weight"
+   },
+   "attn_output.weight": {
+    "hf": "mixer.o_proj.weight"
+   }
+  },
+  "moe": {
+   "ffn_gate_inp.weight": {
+    "hf": "mixer.gate.weight"
+   },
+   "exp_probs_b.bias": {
+    "hf": "mixer.gate.e_score_correction_bias"
+   },
+   "ffn_latent_down.weight": {
+    "hf": "mixer.fc1_latent_proj.weight"
+   },
+   "ffn_latent_up.weight": {
+    "hf": "mixer.fc2_latent_proj.weight"
+   },
+   "ffn_up_exps.weight": {
+    "hf": "mixer.experts.{e}.up_proj.weight",
+    "stack": "experts"
+   },
+   "ffn_down_exps.weight": {
+    "hf": "mixer.experts.{e}.down_proj.weight",
+    "stack": "experts"
+   },
+   "ffn_up_shexp.weight": {
+    "hf": "mixer.shared_experts.up_proj.weight"
+   },
+   "ffn_down_shexp.weight": {
+    "hf": "mixer.shared_experts.down_proj.weight"
+   }
+  }
+ }
+}
