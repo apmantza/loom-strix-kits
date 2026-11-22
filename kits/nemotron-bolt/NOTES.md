@@ -148,7 +148,11 @@ Run the shipping QAD 2-bit file, not a requant of the BF16 release: it is NVIDIA
 Q4 recipes read more bytes for no measured gain.
 
 ## Plan, cheapest evidence first
-1. Static, no weights: a nemotron_h_moe name map from the GGUF tensor table; one
+1. **Started 22 Nov**: kit/gen_iq2xxs.py, IQ2_XXS codes for the int8 decode path (@g_iq2xxs_icodes: grid magnitudes with
+   their signs applied on 32-bit words, the sign table computed from parity, one scale per 32 values) and a single-token probe
+   matvec with the 2 KB grid read from constant memory or staged in LDS: both compile on Loom 0.2.0 and 0.3.0 for gfx1151
+   (225 / 230 instructions, 37 / 30 VGPRs, 8 dot4, no lint flag; kit/test_iq2xxs.py). Which grid placement is faster is a GPU
+   question. Remaining in step 1: a nemotron_h_moe name map from the GGUF tensor table; one
    IQ2_XXS probe matvec (grid + sign lookups to int8 for dot4, as gen_nvfp4's probe) and one Mamba-2 decode-step probe adapted
    from gen_gdn's recurrence, compiled for gfx1151 with the kernel lint, to see VALU per value and register cost.
 2. Reference on the machine (a 24 GB download, a short GPU window beside live): llama.cpp main built for gfx1151 with the
