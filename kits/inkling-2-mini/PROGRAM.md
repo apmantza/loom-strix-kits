@@ -37,6 +37,10 @@ Separate kernels as listed are ~20 launches per application, ~960 per token: at 
 milliseconds against a 24 ms weight floor (NOTES Floors). The fusions planned above (conv into epilogues, prologue fusion of
 step 6, q/k/v controllers in one launch, depth mix with the norm) aim at ~10 per application. Measure per-launch overhead on this
 machine before deciding how far to fuse (the Qwen kit's served profile gives the gap between back-to-back launches).
+Measured 23 Nov (HRX-like E328, the Qwen kit's served decode events): 0.72 us from one dispatch's end to the next one's start inside
+a command buffer (p10 0.72, p90 0.76; 1,196 dispatches per decode step, 0.87 ms of a 115 ms step). For ~960 launches that is ~0.7 ms
+against the 24 ms floor: launch count alone does not justify fusion here. What does is each small kernel's fill and drain (a grid that
+cannot fill the chip, q112) and the bytes a fusion saves (a conv epilogue that does not re-read its input); judge each fusion by those.
 
 ## Controller and single-workgroup kernels
 
