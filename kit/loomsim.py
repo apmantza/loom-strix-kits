@@ -16,7 +16,7 @@ import re
 import numpy as np
 
 f32 = np.float32
-TY = {"f32": np.float32, "f16": np.float16, "i32": np.int32, "i8": np.int8, "i64": np.int64}
+TY = {"f32": np.float32, "f16": np.float16, "i32": np.int32, "i8": np.int8, "i64": np.int64, "bf16": np.uint16}   # bf16 kept as raw words
 
 
 def _blocks(lines):
@@ -206,14 +206,22 @@ class Sim:
             a, b, c = (env[m.group(k)].astype(np.float64) for k in (2, 3, 4))
             env[m.group(1)] = (a * b + c).astype(f32)                        # one rounding, as a fused multiply-add
             return
-        m = re.match(r"%(\w+) = scalar\.(sqrtf|rsqrtf|expf<afn>|logf<afn>|logisticf<afn>|tanhf<afn>|siluf<afn>) %(\w+) : f32$", ln)
+        m = re.match(r"%(\w+) = scalar\.(sqrtf|rsqrtf|expf<afn>|logf<afn>|logisticf<afn>|tanhf<afn>|siluf<afn>|softplusf<afn>) %(\w+) : f32$", ln)
         if m:
             a = env[m.group(3)].astype(np.float64)
             op = m.group(2).split("<")[0]
             with np.errstate(all="ignore"):
                 r = {"sqrtf": np.sqrt(a), "rsqrtf": 1 / np.sqrt(a), "expf": np.exp(a), "logf": np.log(a), "tanhf": np.tanh(a),
-                     "logisticf": 1 / (1 + np.exp(-a)), "siluf": a / (1 + np.exp(-a))}[op]
+                     "logisticf": 1 / (1 + np.exp(-a)), "siluf": a / (1 + np.exp(-a)), "softplusf": np.logaddexp(0, a)}[op]
             env[m.group(1)] = r.astype(f32)
+            return
+        m = re.match(r"%(\w+) = scalar\.extsi %(\w+) : i8 to i32$", ln)
+        if m:
+            env[m.group(1)] = env[m.group(2)].astype(np.int8).astype(np.int64)
+            return
+        m = re.match(r"%(\w+) = vector\.sitofp %(\w+) : vector<(\d+)xi8> to vector<\d+xf32>$", ln)
+        if m:
+            env[m.group(1)] = env[m.group(2)].astype(np.int8).astype(np.float32)
             return
         m = re.match(r"%(\w+) = scalar\.sitofp %(\w+) : i32 to f32$", ln)
         if m:
@@ -253,6 +261,34 @@ class Sim:
             n = int(m.group(4))
             safe = np.where(mask, flat, 0)
             env[m.group(1)] = arr[np.clip(safe[:, None] + np.arange(n), 0, arr.size - 1)].copy()
+            return
+        m = re.match(r"%(\w+) = vector\.(mulf|addf|subf) %(\w+), %(\w+) : vector<\d+xf32>$", ln)
+        if m:
+            a, b = env[m.group(3)].astype(f32), env[m.group(4)].astype(f32)
+            env[m.group(1)] = {"mulf": a * b, "addf": a + b, "subf": a - b}[m.group(2)].astype(f32)
+            return
+        m = re.match(r"%(\w+) = vector\.splat %(\w+) : vector<(\d+)xf32>$", ln)
+        if m:
+            env[m.group(1)] = np.repeat(env[m.group(2)].astype(f32)[:, None], int(m.group(3)), 1)
+            return
+        m = re.match(r"vector\.store %(\w+), %(\w+)\[([^\]]+)\] : vector<(\d+)x\w+>, ", ln)
+        if m:
+            arr, flat = self.mem(m.group(2), m.group(3).split(","), env)
+            v, n = env[m.group(1)], int(m.group(4))
+            for i in np.nonzero(mask)[0]:
+                arr[flat[i]:flat[i] + n] = v[i]
+            return
+        m = re.match(r"%(\w+), %(\w+) = kernel\.subgroup\.shuffle<xor> %(\w+), %(\w+), %(\w+) : f32, i32, i32$", ln)
+        if m:
+            v, x = env[m.group(3)], env[m.group(4)]
+            lanes = np.arange(self.N)
+            env[m.group(1)] = v[(lanes & ~31) | ((lanes & 31) ^ x)].astype(f32)
+            env[m.group(2)] = np.zeros(self.N, np.int64)
+            return
+        m = re.match(r"%(\w+) = vector\.extf %(\w+) : vector<(\d+)x(bf16|f16)> to vector<\d+xf32>$", ln)
+        if m:
+            v = env[m.group(2)]
+            env[m.group(1)] = ((v.astype(np.uint32) << 16).view(np.float32) if m.group(4) == "bf16" else v.astype(np.float32)).copy()
             return
         m = re.match(r"%(\w+) = vector\.slice %(\w+)\[(\d+)\] : vector<\d+x\w+> -> vector<(\d+)x\w+>$", ln)
         if m:

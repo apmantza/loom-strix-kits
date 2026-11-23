@@ -150,6 +150,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--gguf")
+    ap.add_argument("--device", default="amdgpu", help="loom-run device (a CPU device checks the harness without a GPU window)")
     a = ap.parse_args()
     blocks = synthetic() + (gguf_blocks(a.gguf) if a.gguf else [])
     src = "target.decl @device\namdgpu.target<gfx11-generic> @rdna3\n\n" + kernel(len(blocks))
@@ -177,13 +178,17 @@ def main():
         np.save(os.path.join(t, "w.npy"), w)
         np.save(os.path.join(t, "codes.npy"), np.array(codes, dtype=np.int8).reshape(G, 32))
         np.save(os.path.join(t, "scales.npy"), np.array(scales, dtype=np.float32).reshape(G, 2))
+        # outputs start as zero npy files of the expected dtype and shape: an inline "Gx32xi8=0" input against an int8 npy expectation
+        # was refused before any value was compared ("binding[1]: buffer view metadata does not match", q106 11-22)
+        np.save(os.path.join(t, "codes0.npy"), np.zeros((G, 32), np.int8))
+        np.save(os.path.join(t, "scales0.npy"), np.zeros((G, 2), np.float32))
         run = os.path.join(os.path.dirname(kl.loom_compile()), "loom-run")
-        cmd = [run, p, "--device=amdgpu", "--root=t_nvfp4_gguf",
-               f"--kernel-input-buffer=@{t}/w.npy", f"--kernel-input-buffer={G}x32xi8=0", f"--kernel-input-buffer={G}x2xf32=0",
+        cmd = [run, p, f"--device={a.device}", "--root=t_nvfp4_gguf",
+               f"--kernel-input-buffer=@{t}/w.npy", f"--kernel-input-buffer=@{t}/codes0.npy", f"--kernel-input-buffer=@{t}/scales0.npy",
                f"--expected-kernel-buffer=@{t}/w.npy", f"--expected-kernel-buffer=@{t}/codes.npy", f"--expected-kernel-buffer=@{t}/scales.npy"]
         r = subprocess.run(cmd, capture_output=True, text=True)
         tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
-        ok(r.returncode == 0, f"loom-run on amdgpu: {G} groups ({len(blocks) - 64} real blocks) equal ggml's decode (rc {r.returncode}: {tail})")
+        ok(r.returncode == 0, f"loom-run on {a.device}: {G} groups ({len(blocks) - 64} real blocks) equal ggml's decode (rc {r.returncode}: {tail})")
     sys.exit(1 if fails else 0)
 
 

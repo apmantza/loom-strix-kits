@@ -5,6 +5,8 @@
     the window's last n_conv - 1 inputs;
   - a summation order other than ggml's (each sum term by term, the dynamic lags added one at a time after the static taps), so outputs
     match llama.cpp's bit for bit.
+sconv_pos (history keyed by absolute position, E287): after a rejected speculative step the next span must read the right positions
+from the ring with no rollback, equal bit for bit to sconv given that history explicitly.
 How: kit/loomsim.py runs the emitted kernel (all lanes at once, float32; the kernel uses only * and +, so results are bit-exact for its
 operation order) and its outputs and new history are compared bit for bit with a float32 transcription of the fork's convolve()
 (src/models/inkling2.cpp). The kernels also compile for gfx1151 with no lint flag.
@@ -70,6 +72,32 @@ def main():
         ok(np.array_equal(arrays["out"].view(np.uint32), y_ref.view(np.uint32)) and
            np.array_equal(arrays["history"].view(np.uint32), h_ref.astype(f32).view(np.uint32)),
            f"C {C} T {T} heads {heads}: outputs and new history equal ggml's bit for bit")
+    C, ring = 64, 16
+    for heads in (0, 4):
+        w = rng.standard_normal((C, 4)).astype(f32)
+        ringbuf = np.zeros((ring, C), f32)
+        seq = rng.standard_normal((16, C)).astype(f32)                       # inputs of positions 0 .. 15
+        for p0 in range(0, 10):                                               # positions 0 .. 9 already accepted: write them
+            ringbuf[p0 % ring] = seq[p0]
+        taps1 = rng.standard_normal((3, heads, 4)).astype(f32) if heads else None
+        b1 = {"cur": seq[10:13].copy(), "weight": w, "ringbuf": ringbuf, "out": np.zeros((3, C), f32)}
+        if heads:
+            b1["taps"] = taps1
+        loomsim.run(gen_sconv.sconv_pos(C, 3, heads), b1, {"pos0_arg": 10}, (1, 1, 1), 256)    # span 1: positions 10 .. 12
+        alt = rng.standard_normal((2, C)).astype(f32)                         # only position 10 accepted; 11, 12 re-drafted
+        cur2 = np.concatenate([alt, seq[13:14]]).astype(f32)
+        taps2 = rng.standard_normal((3, heads, 4)).astype(f32) if heads else None
+        b2 = {"cur": cur2.copy(), "weight": w, "ringbuf": ringbuf, "out": np.zeros((3, C), f32)}
+        if heads:
+            b2["taps"] = taps2
+        loomsim.run(gen_sconv.sconv_pos(C, 3, heads), b2, {"pos0_arg": 11}, (1, 1, 1), 256)    # span 2: positions 11 .. 13
+        hist = np.stack([seq[8], seq[9], seq[10]], 1).astype(f32)             # [C][3]: positions 8, 9, 10
+        b3 = {"cur": cur2.copy(), "weight": w, "history": hist.copy(), "out": np.zeros((3, C), f32)}
+        if heads:
+            b3["taps"] = taps2
+        loomsim.run(gen_sconv.sconv(C, 3, heads), b3, {}, (1, 1, 1), 256)
+        ok(np.array_equal(b2["out"].view(np.uint32), b3["out"].view(np.uint32)),
+           f"sconv_pos heads {heads}: after a rejected step the next span reads positions 8-10 from the ring, equal to sconv bit for bit")
     import kernel_lint as kl
     with tempfile.TemporaryDirectory() as t:
         for C, T, heads in ((2304, 1, 0), (1024, 8, 8)):
