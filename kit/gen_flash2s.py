@@ -72,6 +72,27 @@ if D == 256 and B_MODE != "2" and os.environ.get("FLASH2_NG256"):   # experiment
     assert G % NG == 0
 GW = G // NG                      # query heads per workgroup
 WAVES = WPH * GW
+# FLASH2_HEADPACK=1 (vsplit only: FLASH2_ROLE=partial FLASH2_SPLITK=1; HRX-like DESIGN-vsplit-headpack.md): a wave's 16 WMMA columns
+# are 2 query heads x 8 tokens (flash2_headpack.py), so a workgroup is 3 head pairs x 2 dim halves = 6 waves, and K / V^T are staged
+# by 4 segments of 64 dims (128 lanes) instead of 8 of 32. Ignored by the other roles (gen_llm passes one env to every flash
+# generator); refused for any vsplit configuration it cannot serve exactly.
+HEADPACK = (os.environ.get("FLASH2_HEADPACK", "0") == "1" and os.environ.get("FLASH2_ROLE") == "partial"
+            and os.environ.get("FLASH2_SPLITK") == "1")
+if HEADPACK:
+    for _bad, _why in ((os.environ.get("FLASH2_ARCH") == "rdna4", "gfx11 only (FLASH2_ARCH=rdna4)"),
+                       (B_MODE != "0", "B_MODE 0 only (FLASH2_B)"),
+                       ((D, G) != (256, 6), f"head_dim 256 with 6 query heads per KV head only (have {D}, {G})"),
+                       ((WPH, KT, KB, NG, GW) != (2, 32, 2, 1, 6), f"2 waves x 128 dims per head, 32-key tiles, one head group (have WPH {WPH}, KT {KT}, NG {NG})"),
+                       (any(os.environ.get(k) for k in ("FLASH2_HALF256", "FLASH2_KT256", "FLASH2_NG256")), "no FLASH2_HALF256 / KT256 / NG256"),
+                       (bool(_c.get("sliding_window")), "no sliding window (the window edge's cut invariance is not argued for packing)"),
+                       (os.environ.get("FLASH2_SPLITK_SELF", "1") != "1" or os.environ.get("FLASH2_SPLITK_ANY", "0") != "1",
+                        "needs FLASH2_SPLITK_ANY=1 (self-listing, off = 0: its leader grid is what limits a tile to 8 tokens)"),
+                       (os.environ.get("FLASH2_EDGE_ZERO", "0") == "1", "no FLASH2_EDGE_ZERO"),
+                       (os.environ.get("FLASH2_VS_PF", "0") == "1", "no FLASH2_VS_PF (its prefetch assumes the 32-dim staging)"),
+                       (os.environ.get("FLASH2_VS_KV8LATE", "0") == "1", "no FLASH2_VS_KV8LATE (kv8_late assumes the 32-dim staging)")):
+        if _bad:
+            sys.exit(f"FLASH2_HEADPACK: {_why}")
+    WAVES = WPH * GW // 2
 if B_MODE == "2":   # two heads per wave: a workgroup is the four waves of a head pair
     WAVES = WPH * (3 if WG3 else 1)
 LANES = 32 * WAVES
@@ -81,6 +102,8 @@ LANES = 32 * WAVES
 SEG_N = 16 if WAVES >= 16 else 8
 if KT == 16:
     SEG_N = 2 * SEG_N
+if HEADPACK:   # 6 waves = 192 lanes < 32 keys x 8 segments: 4 segments of 64 dims on the first 128 lanes (each (key, dim) staged once)
+    SEG_N = 4
 SEG_W = D // SEG_N
 assert WPH == 2 or KB == 1, "head_dim 512: 16-key tiles"
 assert LANES >= KT * SEG_N or B_MODE == "2", "need at least 8 waves (head_dim * G >= 1024)"
@@ -730,6 +753,9 @@ R4 =os.environ.get("FLASH2_ARCH") == "rdna4"   # the gfx12 twin (flash2_rdna4.py
 # The split-K kernel (L17 vsplit) had neither pass (its loop runs a key split [sk_lo, sk_hi), no prologue tile 0): opt-in
 # FLASH2_VS_KVH=1 (kvhoist) and FLASH2_VS_PF=1 (prefetch_split with the split's bounds; needs FLASH2_PF11_SPLIT's helpers).
 if SPLITK and not R4 and B_MODE != "2":
+    if HEADPACK:   # before the trims below: they keep the column sites as generated
+        from flash2_headpack import headpack
+        text = headpack(text, NFH, KB)
     if os.environ.get("FLASH2_VS_KVH", "0") == "1":
         from flash2_trim import kvhoist
         text = kvhoist(text)
