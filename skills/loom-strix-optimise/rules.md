@@ -158,6 +158,10 @@ more bytes than Strata's' after checking only Strata's file; our generator's doc
   result (common/checks.py, E212; from sybil-solutions/inference-optimisation-skill: a 117 tok/s 'record' there was a list stuck in a loop).
 - Decide sub-noise changes on device time per verify step, not tokens/s (sub-noise gains tie in a 5-round A/B; the per-kernel profile shows them in minutes).
 - Ablate with realistic data on a power-limited chip; constant operands raise clocks (E15 vs E24).
+- Time kernels at the power level the server runs at (auto), never at profile_standard (the level for counters): at
+  profile_standard decode matvecs turned compute-bound and two rewrites looked 2x faster (54 -> 102 GB/s); at auto both ran
+  at 196-211 GB/s and the gain was 3-8 %, which is what serving showed. Before a harness figure feeds a decision, check that it
+  reproduces the kernel's served bandwidth (common/hsaco_run.py prints the level; HRX-like E300 / E302).
 - Wait for memory to be released between server runs (common/wait_quiet.sh, E69); the first request after a
   restart is cold.
 - Judge agent-facing changes at agent context lengths (50-130k) and on the replay, not on 2-16k prompts (E34). Use a real
