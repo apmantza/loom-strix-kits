@@ -68,6 +68,14 @@ w(a) (24: 0-5, 6-17 three times, 18-23) for the parameter names. The large part 
 convolutions, the relative-bias attention with sink and gate, the sigmoid router and SITU experts) wired through the same program
 skeleton (embedding, head, sampling, drafter hooks). Plan: an `inkling2_layer_text(a)` beside layer_text, selected by arch.
 
+## Prefill attention: scores in registers (23 Nov, prior art)
+
+strix-halo-engine-lab PR #991 (Apache-2.0; research/engine-lab-inkling.md): when one wave covers a whole head (head_dim 128 here, one slice),
+use K as WMMA operand A and Q as operand B so a query row sits in the lane and its keys in registers; exchange four registers between
+half-waves, keep the same products and accumulation order, and drop the LDS round trip and one barrier per key tile (bit-identical).
+Qwen3.8's 256-wide heads split over two waves cannot use it (the partial sums cross waves: Qwen's flash2 exchanges them through LDS,
+FLASH2_SX11); Inkling's 128-wide heads can, so the Inkling flash prefill starts from this layout.
+
 ## Order of work
 
 1. Generate the dense matvecs and norms at Inkling's shapes from the Qwen kit's generators, and the router / experts from gen_moe with
