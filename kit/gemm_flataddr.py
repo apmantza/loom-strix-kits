@@ -54,9 +54,15 @@ def flataddr(text):
                       text, re.S)
     if not old_w or old_w.group(0).count("vector.load") != 2:
         raise SystemExit("GEMM256_FLATADDR: in-loop weight loads not in the expected form")
+    # the buffer the loads read: %w (store) or %wsel (swiglu: a per-lane choice between gate %w and up %w2, kit 718c339 hardcoded %w and the
+    # f16o11 swiglu m256 kernel tests caught it, HRX-like E372); both loads must read the same one
+    bufs = set(re.findall(r"buffer\.view (%\w+)\[%dq[ab]n_origin\]", old_w.group(0)))
+    if len(bufs) != 1:
+        raise SystemExit(f"GEMM256_FLATADDR: the weight loads read {sorted(bufs)} (want one buffer)")
+    wbuf = bufs.pop()
     one(old_w.group(0),
         "    %w_kb = index.scale %k_next, %two : index, offset -> offset\n"
-        "    %w_sv = buffer.view %w[%w_kb] : buffer -> view<[%w_flat_np]xi32>\n"
+        f"    %w_sv = buffer.view {wbuf}[%w_kb] : buffer -> view<[%w_flat_np]xi32>\n"
         "      %dqan_raw = vector.load %w_sv[%w_lanea] : view<[%w_flat_np]xi32> -> vector<8xi32>\n"
         "      %dqbn_raw = vector.load %w_sv[%w_laneb] : view<[%w_flat_np]xi32> -> vector<8xi32>\n", "weight loads")
     for gone in ("%dqan_origin", "%dqbn_origin"):
