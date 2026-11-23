@@ -19,10 +19,12 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
             next load's address not computed from the previous load's data. One load in flight pays the whole latency per load
             (E109: KV8 loads retired 2-26 instructions after issue; E254: g_attention_split's 7 per pass, llama.cpp NVFP4
             mul_mat_q's per-byte scales). Pointer chases and scratch reloads (the scratch flag) are not counted.
-  [ldsser]  a NOTE until a counter run shows its cost (E254, E61's hypothesis; blind check E284: 3 of 4 hits confirmed, 1 unclear): in the hot loop (>= 8 WMMAs, >= 8 ds_loads), at
-            least half the WMMAs sit within 3 instructions after an lgkmcnt(0) that retires a ds_load issued at most 12
-            instructions earlier: no LDS fragment kept in flight across a multiply (the 256-row GEMMs: 48 of 64; their 128-row
-            siblings keep one with lgkmcnt(2)). Column ldsser = that share.
+  [addr64]  a NOTE until a served A/B prices its fix (E345): in the hot loop's common path, min(global loads taking a 64-bit per-lane
+            VGPR address `v[a:b], off`, 64-bit carry adds v_add_co_ci_u32) >= 2: the loop rebuilds 64-bit load addresses every
+            iteration where a uniform base + loop-invariant 32-bit lane offset (the SGPR-base form) would not (the f16 GEMMs:
+            39 -> 15 VALU, 248 -> 209 instructions). Fire 11-23 on live: every GEMM (38) and flash2 / flash2_partial / vsplit; no matvec.
+  (an 'ldsser' note, WMMAs each right after an lgkmcnt(0) on a just-loaded fragment, was removed 11-23: its lever was measured four
+  times on the 256-row GEMMs and never gained (E293, E309, E335, E340): their WMMA phase already runs at the hardware rate, E341.)
   (a 'barriers' note, >= 8 straight-line barriers, was removed after a blind check: 1 of 9 hits on llama.cpp were serialised
   reductions, the rest tile staging or a peeled last iteration; E284. Barrier counts stay in the kit's own kernel tests.)
   [reread] a NOTE (blind check E284: 2 of 5 hits confirmed): >= REREAD global loads repeating an earlier load's operands while its address registers are unchanged and no store
@@ -72,7 +74,6 @@ SERIAL_LINKS = 4
 TINY_CALLS = 1000
 REREAD = 2
 TINY_US = 10.0
-LDSSER = 0.5
 VMLOAD = re.compile(r"(?:global|buffer|flat)_load_")
 SMLOAD = re.compile(r"s_(?:load|buffer_load)_")
 REG = re.compile(r"\b([vs])(\d+)\b|\b([vs])\[(\d+):(\d+)\]|\b(vcc|exec|scc|m0)(?:_lo|_hi)?\b")
@@ -200,19 +201,6 @@ def serial_links(ins, lo, hi, kind):
     return best
 
 
-def lds_serialized(b):
-    """share of the WMMAs in b that sit within 3 instructions after an lgkmcnt(0) retiring a ds_load issued at most 12 earlier
-    (None below 8 WMMAs or 8 ds_loads)"""
-    w = [j for j, x in enumerate(b) if x.startswith("v_wmma")]
-    if len(w) < 8 or sum(1 for x in b if x.startswith("ds_load")) < 8:
-        return None
-    hit = 0
-    for j in w:
-        z = next((k for k in range(j - 1, max(-1, j - 4), -1) if b[k].startswith("s_waitcnt") and "lgkmcnt(0)" in b[k]), None)
-        hit += z is not None and any(b[k].startswith("ds_load") for k in range(max(0, z - 12), z))
-    return round(hit / len(w), 2)
-
-
 def longest_move_run(body):
     """the most register-to-register moves in one run (moves at most 3 instructions apart), as loop_census.census groups them"""
     best = cur = 0
@@ -288,6 +276,18 @@ def demangle(names):
     r = subprocess.run([tool], input="\n".join(names), capture_output=True, text=True)
     out = r.stdout.split("\n")
     return out[:len(names)] if r.returncode == 0 and len(out) >= len(names) else list(names)
+
+
+ADDR64 = 2   # E345: g_gemm_f16_store_m256 had 4 such loads and 4 carry adds per iteration; the SGPR-base form has 0
+
+
+def addr64(b):
+    """global loads in the hot loop's common path that take a 64-bit per-lane VGPR address (`global_load ... v[a:b], off`), when the
+    loop also does 64-bit carry adds (v_add_co_ci_u32) to build them: min(loads, carry adds). The SGPR-base form (`v_off, s[a:b]`)
+    computes the per-lane part once and needs neither (HRX-like E345: the f16 GEMM's activation and weight addresses, 39 -> 15 VALU)."""
+    loads = sum(1 for x in b if re.match(r"global_load\w*\s+v\[?\d+[:\d\]]*,\s*v\[\d+:\d+\],\s*off\b", x))
+    carries = sum(1 for x in b if x.startswith("v_add_co_ci_u32"))
+    return min(loads, carries)
 
 
 def lint_object(path):
@@ -369,12 +369,12 @@ def lint_listing(name, ins, addr, res=(None, None, None)):
     r["serial"] = max([serial_links(ins, a, z, k) for a, z in loops(ins, addr) for k in ("vm", "sm")] or [0])
     if r["serial"] >= SERIAL_LINKS:
         r["flags"].append("serial")
-    r["ldsser"] = lds_serialized(b) if r["where"] == "loop" else None
-    if r["ldsser"] is not None and r["ldsser"] >= LDSSER:
-        r.setdefault("notes", []).append("ldsser")             # a prompt to measure, not a flag (E254: cost unproven)
     r["reread"] = rereads(ins)
     if r["reread"] >= REREAD:
         r.setdefault("notes", []).append("reread")              # E278: the same bytes loaded twice
+    r["addr64"] = addr64(b) if r["where"] == "loop" else 0
+    if r["addr64"] >= ADDR64:
+        r.setdefault("notes", []).append("addr64")              # E345: per-iteration 64-bit address math feeding the loop's global loads
     r["join"] = join_runs(ins)
     if r["join"] >= JOIN_RUN:
         r["flags"].append("join")

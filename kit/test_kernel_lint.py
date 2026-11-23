@@ -20,9 +20,8 @@
     issue; E254 scout: g_attention_split's 7 per pass, llama.cpp NVFP4 mul_mat_q's per-byte scales) not flagged `serial`: five
     independent lone vector loads in a loop flag it, so do five lone scalar loads; staggered waits, a pointer chase and the same
     loads in a prologue do not;
-  - the 256-row GEMMs' LDS-to-WMMA serialization (E254: 48 of 64 WMMAs right after lgkmcnt(0), queue item 6 / E152) not
-    reported: a loop whose WMMAs each wait lgkmcnt(0) on a fragment just loaded gets the `ldsser` note (a note until a counter
-    run shows its cost), one that keeps a fragment in flight with lgkmcnt(2) does not;
+  - per-iteration 64-bit load addresses not noted `addr64` (E345: the f16 GEMMs rebuilt them every k step, 39 -> 15 VALU when hoisted):
+    four such loads with carry adds get the note; the SGPR-base form and 64-bit addresses without carry adds do not;
   - the same bytes loaded twice not noted `reread` (E278: Strata's depth mix; llama.cpp's head-256 flash_attn_ext_vec repeats 24
     loads): two repeated loads with unchanged addresses get the note; a moved address, an intervening store or a pointer chase
     do not count;
@@ -179,20 +178,19 @@ def main():
     ok("serial" not in r["flags"], f"lone loads in a prologue, outside every loop, do not (links {r.get('serial')})")
     def wm(k):
         return f"v_wmma_f32_16x16x16_f16 v[{40 + 8 * (k % 4)}:{47 + 8 * (k % 4)}], v[20:27], v[30:37], v[{40 + 8 * (k % 4)}:{47 + 8 * (k % 4)}]"
-    ser = sum((["ds_load_b128 v[30:33], v8 offset:" + str(32 * k), "ds_load_b128 v[34:37], v8 offset:" + str(32 * k + 16),
-                "s_waitcnt lgkmcnt(0)", wm(k)] for k in range(8)), [])
-    r = kl.lint_listing("ldsser", *listing(loop_of(ser)))
-    ok("ldsser" in r.get("notes", []) and "ldsser" not in r["flags"] and r["ldsser"] == 1.0,
-       f"WMMAs each waiting lgkmcnt(0) on a just-loaded fragment get the ldsser note, not a flag (share {r.get('ldsser')})")
-    kept = ["ds_load_b128 v[30:33], v8", "ds_load_b128 v[34:37], v8 offset:16"]
-    for k in range(8):
-        kept += [f"ds_load_b128 v[50:53], v8 offset:{32 * k + 32}", f"ds_load_b128 v[54:57], v8 offset:{32 * k + 48}", "s_waitcnt lgkmcnt(2)", wm(k)]
-    r = kl.lint_listing("ldskept", *listing(loop_of(kept)))
-    ok("ldsser" not in r.get("notes", []), f"one fragment kept in flight with lgkmcnt(2): no note (share {r.get('ldsser')})")
-    far = [f"ds_load_b128 v[{30 + 4 * (k % 2)}:{33 + 4 * (k % 2)}], v8 offset:{16 * k}" for k in range(8)] + ["v_add_f32_e32 v1, v1, v2"] * 14
-    far += sum(([f"s_load_b32 s{10 + k}, s[4:5], 0x{4 * k:x}", "s_waitcnt lgkmcnt(0)", wm(k)] for k in range(8)), [])
-    r = kl.lint_listing("ldsfar", *listing(loop_of(far)))
-    ok("ldsser" not in r.get("notes", []), f"lgkmcnt(0) waits on scalar loads, the LDS loads long before: no note (share {r.get('ldsser')})")
+    # addr64 (E345): 64-bit per-lane load addresses rebuilt every iteration get the note; the SGPR-base form and 64-bit loads
+    # without per-iteration carry adds do not
+    a64 = sum(([f"v_add_co_u32 v{20 + 2 * k}, s18, s12, v12", f"v_add_co_ci_u32_e64 v{21 + 2 * k}, s18, s13, v13, s18",
+                f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v[{20 + 2 * k}:{21 + 2 * k}], off"] for k in range(4)), [])
+    r = kl.lint_listing("addr64", *listing(loop_of(a64 + [wm(0)])))
+    ok("addr64" in r.get("notes", []) and "addr64" not in r["flags"] and r["addr64"] == 4,
+       f"four 64-bit-address loads rebuilt with carry adds each iteration get the addr64 note, not a flag ({r.get('addr64')})")
+    sb = [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(4)]
+    r = kl.lint_listing("saddr", *listing(loop_of(sb + [wm(0)])))
+    ok("addr64" not in r.get("notes", []), f"the SGPR-base form: no note ({r.get('addr64')})")
+    nc = [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v[20:21], off offset:{16 * k}" for k in range(4)]
+    r = kl.lint_listing("a64nocarry", *listing(loop_of(nc + [wm(0)])))
+    ok("addr64" not in r.get("notes", []), f"64-bit addresses kept across iterations (no carry adds in the loop): no note ({r.get('addr64')})")
     rr = ["global_load_b128 v[0:3], v4, off", "global_load_b128 v[8:11], v5, off", "v_add_f32_e32 v10, v0, v1",
           "global_load_b128 v[20:23], v4, off", "global_load_b128 v[24:27], v5, off", "s_endpgm"]
     r = kl.lint_listing("reread", *listing(rr))
