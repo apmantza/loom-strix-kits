@@ -49,6 +49,18 @@ PF16 = os.environ.get("PREFILL_F16_SCRATCH", "0") not in ("", "0", "false", "no"
 if PF16:
     HELPER = HELPER - {"f16"}
 
+# 256-row GEMMs whose activation prefetch is loaded at a clamped step (E242). Chosen under the served recipe, GEMM_SKIP_PADDING=1
+# (gen_llm's default): its kernel-wide scf.if plus the prefetch's own scf.if made these drain (vmcnt(0) + 32 moves before the
+# WMMAs). Without the padding skip the if-form is the better one for q6_k (436 vs 475 loop instructions), and the clamp lengthens
+# the q4_k / q5_k / q8_0 kernels' back-edge copies (runs of 24-56 moves): measured per format with common/kernel_lint.py --baseline.
+# GEMM256_LDS_PF=1 (HRX-like E280): in the 256-row GEMMs, keep one weight fragment in flight from LDS: column c + 1's fragment is
+# loaded before column c's WMMAs, the order pinned by scf.schedule.fence (unset: unchanged program; the compiler otherwise sinks
+# each load to just before its WMMAs and waits lgkmcnt(0) on it, E254 / E256 'ldsser').
+LDS_PF = os.environ.get("GEMM256_LDS_PF", "0") not in ("", "0", "false", "no", "off")
+X_CLAMP = ("q6_k", "iq4_xs", "iq4_nl")
+NOTE = ("    // The next tile's activations at a clamped step, not under scf.if (HRX-like E242; X_CLAMP formats): with the load inside an if whose else\n    // yields the carried value, Loom 0.2.0 waits on it at the join (vmcnt(0)) and shifts it with 32 moves before the WMMAs in\n    // the high-pressure kernels (q6_k, iq4_xs m256). The last step reloads an in-bounds tile it never uses: outputs are unchanged.\n")
+
+
 def dequant16(fmt, w, view_name, out):
     """Loom snippet: dequantize 16 consecutive weights of row %w_row at column %w_col into F16 vector %{out}."""
     if fmt == "f16" and fmt not in HELPER:   # PREFILL_F16_SCRATCH: 16 halves loaded as 8 words (the load stays prefetchable)
@@ -84,6 +96,9 @@ def dequant16(fmt, w, view_name, out):
         # IQ4: 16 consecutive weights are the low (values 0-15) or high (16-31) nibbles of a 32-value group's 16 code
         # bytes, looked up in kvalues_iq4nl (@g_iq4_codes16, quant_values.loom). The value is code * scale in f32 (exact:
         # 7-bit code x 17-bit d*(ls-32)), rounded once to f16, as @g_<fmt>_values + fptrunc does.
+        # The nibble mask is applied to the bytes, after the bitcast (bit-identical to masking the i32 words with
+        # 0x0f0f0f0f): masked as i32 words, the compiler cannot see each byte index is < 16 and expands table.lookup
+        # into a v_cndmask select tree (972 of the 1544 instructions in the m256 GEMM's K loop, E229).
         xs = fmt == "iq4_xs"
         bv, bb, qs = (256, 136, 8) if xs else (32, 18, 2)
         head = (f"""      %{out}_header_view = buffer.view %{w}[%{out}_block_origin] : buffer -> view<2xi32>
@@ -137,14 +152,14 @@ def dequant16(fmt, w, view_name, out):
 {head}
       %{out}_packed = vector.load %{out}_code_view[0] : view<4xi32> -> vector<4xi32>
 {scale}
-      %{out}_nmask = vector.splati 252645135 : vector<4xi32>
+      %{out}_nmask = vector.splati 15 : vector<16xi8>
       %{out}_k4i = index.constant 4 : index
       %{out}_sh_idx = index.mul %{out}_half, %{out}_k4i : index
       %{out}_sh_i32 = index.cast %{out}_sh_idx : index to i32
       %{out}_shift = vector.splat %{out}_sh_i32 : vector<4xi32>
       %{out}_shifted = vector.shrui %{out}_packed, %{out}_shift : vector<4xi32>
-      %{out}_masked = vector.andi %{out}_shifted, %{out}_nmask : vector<4xi32>
-      %{out}_idx = vector.bitcast %{out}_masked : vector<4xi32> to vector<16xi8>
+      %{out}_sbytes = vector.bitcast %{out}_shifted : vector<4xi32> to vector<16xi8>
+      %{out}_idx = vector.andi %{out}_sbytes, %{out}_nmask : vector<16xi8>
       %{out}_codes = func.call @g_iq4_codes16(%{out}_idx) : (vector<16xi8>) -> (vector<16xi8>)
       %{out}_codes_f = vector.sitofp %{out}_codes : vector<16xi8> to vector<16xf32>
       %{out}_dls = vector.splat %{out}_dl : vector<16xf32>
@@ -959,7 +974,16 @@ def gemm_big256(fmt, mode):
     %x_rawp = vector.load %x_view[%x_row, %x_colp] : view<[%rows]x[%k]xf16> -> vector<{KT // 2}xf16>
     %x_rawp1 = vector.load %x_view[%x_row1, %x_colp] : view<[%rows]x[%k]xf16> -> vector<{KT // 2}xf16>""")
         else:
-            t.append(f"""    %x_more = index.cmp ult, %x_next_step, %k_steps : index
+            if fmt in X_CLAMP:   # E242: the if-form drains the prefetch at its join in these kernels
+                t.append(f"""{NOTE}    %x_last = index.sub %k_steps, %c1 : index
+    %x_ns_raw = index.min %x_next_step, %x_last : index
+    %x_ns = index.assume %x_ns_raw [lt(%x_ns_raw, %k_steps)] : index
+    %x_ko = index.mul %x_ns, %c{KT} : index
+    %x_coln = index.add %x_ko, %x_stage_col : index
+    %x_rawn = vector.load %x_view[%x_row, %x_coln] : view<[%rows]x[%k]xf16> -> vector<{KT // 2}xf16>
+    %x_rawn1 = vector.load %x_view[%x_row1, %x_coln] : view<[%rows]x[%k]xf16> -> vector<{KT // 2}xf16>""")
+            else:
+                t.append(f"""    %x_more = index.cmp ult, %x_next_step, %k_steps : index
     %x_rawn, %x_rawn1 = scf.if %x_more -> (vector<{KT // 2}xf16>, vector<{KT // 2}xf16>) {{
       %x_ns = index.assume %x_next_step [lt(%x_next_step, %k_steps)] : index
       %x_ko = index.mul %x_ns, %c{KT} : index
@@ -1002,17 +1026,35 @@ def gemm_big256(fmt, mode):
         L.append(f"    %fk{kk} = index.constant {kk * 16} : index")
         for r in range(RF):
             L.append(f"    %l{r}_{kk} = vector.fragment.load<lhs> %x_stage_view[{rowv[r]}, %fk{kk}] shape [%c16, %c16] : view<256x{PADW}xf16> -> vector<16xf16>")
-        for wi in range(len(weights)):
-            for c in range(cfr):
-                L.append(f'''    %wr{wi}{c}_{kk} = index.constant {wi * TN + c * 16} : index
+        units = [(wi, c) for wi in range(len(weights)) for c in range(cfr)]
+
+        def rhs(u):
+            wi, c = u
+            return f'''    %wr{wi}{c}_{kk} = index.constant {wi * TN + c * 16} : index
     %rv{wi}{c}_{kk} = vector.load %w_wave_view[%wr{wi}{c}_{kk}, %fk{kk}] : view<{WVR}x{PADW}xf16> -> vector<16xf16>
-    %rf{wi}{c}_{kk} = vector.fragment<rhs> %rv{wi}{c}_{kk} shape [%c16, %c16] : vector<16xf16>''')
-        for wi in range(len(weights)):
-            for c in range(cfr):
-                for r in range(RF):
-                    a = f"{wi}r{r}c{c}"
-                    L.append(f"    %m{a}_{kk} = vector.mma %l{r}_{kk}, %rf{wi}{c}_{kk}, {cur[a]} : vector<16xf16>, vector<16xf16>, vector<8xf32>")
-                    cur[a] = f"%m{a}_{kk}"
+    %rf{wi}{c}_{kk} = vector.fragment<rhs> %rv{wi}{c}_{kk} shape [%c16, %c16] : vector<16xf16>'''
+
+        def mmas(u):
+            wi, c = u
+            for r in range(RF):
+                a = f"{wi}r{r}c{c}"
+                L.append(f"    %m{a}_{kk} = vector.mma %l{r}_{kk}, %rf{wi}{c}_{kk}, {cur[a]} : vector<16xf16>, vector<16xf16>, vector<8xf32>")
+                cur[a] = f"%m{a}_{kk}"
+        if LDS_PF:   # GEMM256_LDS_PF: the next column's weight fragment is issued before this column's WMMAs, fenced (HRX-like E280)
+            L.append(rhs(units[0]))
+            if len(units) > 1:
+                L.append(rhs(units[1]))
+            L.append("    scf.schedule.fence")
+            for i, u in enumerate(units):
+                mmas(u)
+                if i + 2 < len(units):
+                    L.append(rhs(units[i + 2]))
+                L.append("    scf.schedule.fence")
+        else:
+            for u in units:
+                L.append(rhs(u))
+            for u in units:
+                mmas(u)
     L.append("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     L.append("    scf.yield " + ", ".join(cur[a] for a in accs) + ", " + ", ".join(c[2] for c in carried) + " : " + ", ".join("vector<8xf32>" for _ in accs) + ", " + ", ".join(c[3] for c in carried) + "\n  }")
     L.append(f'''  %inv_view = buffer.view %x_stage[%origin] : buffer -> view<256x16xf32>

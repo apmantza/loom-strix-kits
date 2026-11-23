@@ -403,9 +403,9 @@ func.def inline @g_q6_k_values(%w: buffer, %origin: offset, %group: index) -> (v
   %sc_base = index.constant 192 : index
   %d_bytes = index.constant 208 : offset
   %thirty_two = vector.splatf 32.0 : vector<32xf32>
-  %low_mask = vector.splati 15 : vector<32xi8>
-  %two_bits = vector.splati 3 : vector<32xi8>
-  %four8 = vector.splati 4 : vector<32xi8>
+  %nibbles = vector.splati 252645135 : vector<8xi32>
+  %two_bits = vector.splati 50529027 : vector<8xi32>
+  %four = vector.splati 4 : vector<8xi32>
   %bounded = index.assume %group [range(%group, 0, 7)] : index
   %half = index.div %bounded, %c4 : index
   %j = index.rem %bounded, %c4 : index
@@ -440,16 +440,19 @@ func.def inline @g_q6_k_values(%w: buffer, %origin: offset, %group: index) -> (v
   %shift_high = index.mul %j, %c2 : index
   %shift_low32 = index.cast %shift_low : index to i32
   %shift_high32 = index.cast %shift_high : index to i32
-  %shift_low8 = scalar.trunci %shift_low32 : i32 to i8
-  %shift_high8 = scalar.trunci %shift_high32 : i32 to i8
-  %shift_low_v = vector.splat %shift_low8 : vector<32xi8>
-  %shift_high_v = vector.splat %shift_high8 : vector<32xi8>
-  %ql_shifted = vector.shrui %ql, %shift_low_v : vector<32xi8>
-  %low = vector.andi %ql_shifted, %low_mask : vector<32xi8>
-  %qh_shifted = vector.shrui %qh, %shift_high_v : vector<32xi8>
-  %qh_bits = vector.andi %qh_shifted, %two_bits : vector<32xi8>
-  %high = vector.shli %qh_bits, %four8 : vector<32xi8>
-  %combined = vector.ori %low, %high : vector<32xi8>
+  // The 6-bit codes are assembled on 32-bit words, as in @g_q6_k_icodes (HRX-like E233 / E239): byte-vector shifts make the
+  // compiler extract and repack every byte; word shifts are exact here (the bits a byte keeps never come from its neighbour).
+  %qlw = vector.bitcast %ql : vector<32xi8> to vector<8xi32>
+  %qhw = vector.bitcast %qh : vector<32xi8> to vector<8xi32>
+  %shift_low_v = vector.splat %shift_low32 : vector<8xi32>
+  %shift_high_v = vector.splat %shift_high32 : vector<8xi32>
+  %ql_shifted = vector.shrui %qlw, %shift_low_v : vector<8xi32>
+  %low = vector.andi %ql_shifted, %nibbles : vector<8xi32>
+  %qh_shifted = vector.shrui %qhw, %shift_high_v : vector<8xi32>
+  %qh_bits = vector.andi %qh_shifted, %two_bits : vector<8xi32>
+  %high = vector.shli %qh_bits, %four : vector<8xi32>
+  %combined_w = vector.ori %low, %high : vector<8xi32>
+  %combined = vector.bitcast %combined_w : vector<8xi32> to vector<32xi8>
   %codes = vector.uitofp %combined : vector<32xi8> to vector<32xf32>
   %centered = vector.subf %codes, %thirty_two : vector<32xf32>
   %s0_i8 = vector.extract %sc[0] : vector<2xi8> -> i8
@@ -692,10 +695,11 @@ func.def inline @g_q6_k_icodes(%w: buffer, %origin: offset, %group: index) -> (v
   %qh_base = index.constant 128 : index
   %sc_base = index.constant 192 : index
   %d_bytes = index.constant 208 : offset
-  %thirty_two = vector.splati 32 : vector<32xi8>
-  %low_mask = vector.splati 15 : vector<32xi8>
-  %two_bits = vector.splati 3 : vector<32xi8>
-  %four8 = vector.splati 4 : vector<32xi8>
+  %nibbles = vector.splati 252645135 : vector<8xi32>
+  %two_bits = vector.splati 50529027 : vector<8xi32>
+  %four = vector.splati 4 : vector<8xi32>
+  %top_bits = vector.splati -2139062144 : vector<8xi32>
+  %thirty_two = vector.splati 538976288 : vector<8xi32>
   %bounded = index.assume %group [range(%group, 0, 7)] : index
   %half = index.div %bounded, %c4 : index
   %j = index.rem %bounded, %c4 : index
@@ -730,17 +734,24 @@ func.def inline @g_q6_k_icodes(%w: buffer, %origin: offset, %group: index) -> (v
   %shift_high = index.mul %j, %c2 : index
   %shift_low32 = index.cast %shift_low : index to i32
   %shift_high32 = index.cast %shift_high : index to i32
-  %shift_low8 = scalar.trunci %shift_low32 : i32 to i8
-  %shift_high8 = scalar.trunci %shift_high32 : i32 to i8
-  %shift_low_v = vector.splat %shift_low8 : vector<32xi8>
-  %shift_high_v = vector.splat %shift_high8 : vector<32xi8>
-  %ql_shifted = vector.shrui %ql, %shift_low_v : vector<32xi8>
-  %low = vector.andi %ql_shifted, %low_mask : vector<32xi8>
-  %qh_shifted = vector.shrui %qh, %shift_high_v : vector<32xi8>
-  %qh_bits = vector.andi %qh_shifted, %two_bits : vector<32xi8>
-  %high = vector.shli %qh_bits, %four8 : vector<32xi8>
-  %combined = vector.ori %low, %high : vector<32xi8>
-  %signed = vector.subi %combined, %thirty_two : vector<32xi8>
+  // The 6-bit codes are assembled on 32-bit words (HRX-like E233): as vector<32xi8> shifts the compiler extracts and repacks
+  // every byte (~350 extra instructions per group). Word shifts are exact here: the bits a byte keeps after its shift never
+  // come from its neighbour (low nibble: shift 0 or 4, mask 0x0f; high pair: shift 0-6, mask 0x03). code - 32 per byte
+  // without borrows: (c | 0x80) - 0x20, then ^ 0x80 (c <= 63, so c | 0x80 >= 0x80 > 0x20).
+  %qlw = vector.bitcast %ql : vector<32xi8> to vector<8xi32>
+  %qhw = vector.bitcast %qh : vector<32xi8> to vector<8xi32>
+  %shift_low_v = vector.splat %shift_low32 : vector<8xi32>
+  %shift_high_v = vector.splat %shift_high32 : vector<8xi32>
+  %ql_shifted = vector.shrui %qlw, %shift_low_v : vector<8xi32>
+  %low = vector.andi %ql_shifted, %nibbles : vector<8xi32>
+  %qh_shifted = vector.shrui %qhw, %shift_high_v : vector<8xi32>
+  %qh_bits = vector.andi %qh_shifted, %two_bits : vector<8xi32>
+  %high = vector.shli %qh_bits, %four : vector<8xi32>
+  %combined = vector.ori %low, %high : vector<8xi32>
+  %raised = vector.ori %combined, %top_bits : vector<8xi32>
+  %lowered = vector.subi %raised, %thirty_two : vector<8xi32>
+  %signed_w = vector.xori %lowered, %top_bits : vector<8xi32>
+  %signed = vector.bitcast %signed_w : vector<8xi32> to vector<32xi8>
   %s0_i8 = vector.extract %sc[0] : vector<2xi8> -> i8
   %s1_i8 = vector.extract %sc[1] : vector<2xi8> -> i8
   %s0f = scalar.sitofp %s0_i8 : i8 to f32
