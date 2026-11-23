@@ -13,11 +13,14 @@ computed `command.parameter "blk.{}..."[%index]` (docs guide/command-programs.md
 
 ## One application (decode, T = 1; verify spans use the `_t{T}` / span forms)
 
+Before application 0: embedding lookup, then an RMS norm with weight `token_embd_norm.weight` (F32 [2304], eps 1e-6; found in the GGUF
+23 Nov, not in gen_llm: the NORMS kernel with that weight, one launch per token). Its output is the depth mix's embedding input.
+
 | # | step | kernel | state |
 |---|---|---|---|
 | 1 | layer input: block attention residual mix over [embedding, finished 6-layer block sums, running partial] | gen_loop.depth_mix | built |
 | 2 | (passes 2-3, core layers) message = depth mix over the previous pass's block states | gen_loop.depth_mix | built |
-| 3 | attention norm | gen_llm NORMS (RMS) | in the Qwen kit; Inkling eps / no-gamma check open |
+| 3 | attention norm | gen_llm NORMS (RMS) | in the Qwen kit; checked 23 Nov: weighted (blk.N.attn_norm / ffn_norm F32 [2304]), eps 1e-6 (rms_eps in config.draft.json, read by gen_llm) |
 | 4 | (passes 2-3) controllers on the q, k, v inputs | gen_loop.controller_split (z + out), BF16 | built; batching q/k/v in one launch open |
 | 5 | q, k, v, r, gate projections (dense, K-quant rows) | gen_llm mv (Qwen formats) | in the Qwen kit; Inkling shapes (2304 in) to generate |
 | 6 | K / V short convolutions (dynamic taps on global layers) + prep (clips, value norm, tau) + KV write | gen_sconv.sconv_pos + gen_inkattn.prep | built separately; fusion into one prologue planned (NOTES) |
