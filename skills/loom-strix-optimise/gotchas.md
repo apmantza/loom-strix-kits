@@ -53,3 +53,8 @@
   makes the compiler wait for every outstanding LDS load (lgkmcnt(0)) at each read: it slowed a GEMM 41 % and flash2 3.2x, so its
   phase shares described another kernel; the cycle counter cost +1.7 % / +3.4 % with exact outputs (kit/stamp_loop.py; HRX-like E304 / E305).
   `low.invoke` results need parentheses (`: () -> (i32)`).
+- A static instruction count is not executed cost: an `scf.if` on a workgroup-uniform condition compiles to a scalar branch, and
+  everything behind it runs only when it is taken. Attention's masked P.V path (V zeroed per query column for a block that straddles
+  the causal diagonal) held 384 of a decode kernel's 496 selects, yet runs once per split, so a change that removed selects there
+  was worth ~0 (HRX-like E334). Before attributing time to a count, check which branch guards it (common/loop_census.py prints the
+  guarded regions) or time it (stamps, ablations).
