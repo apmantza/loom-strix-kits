@@ -11,10 +11,21 @@ in ggml NVFP4 / MXFP8 blocks).
 `w(a)` (0-5, then 6-17 repeated, then 18-23) and cache / conv slot `a` (per-pass state, exact). In Loom the weight index is a
 computed `command.parameter "blk.{}..."[%index]` (docs guide/command-programs.md); the state index is the application.
 
+Checked against llama.cpp upstream (src/models/inkling2.cpp, inkling2-loop.cpp, read 23 Nov):
+- Passes do not chain: passes 2 and 3 restart from the prelude's output with the block list reset to the prelude's blocks; the
+  previous pass reaches the next only through the message (a mix over its bank: its blocks after the first core block, and its output).
+  The coda continues from the last pass.
+- Block starts follow the physical index ip (0, 6, 12, 18; the same ip in every pass): at a block's first layer the attention
+  output starts a new residual stream (blocks gets the layer input, the output is not added to it); elsewhere it is added.
+- llama.cpp's slot numbering differs from execution order: prelude 0-5, pass 1 6-17, pass 2 24-35, pass 3 36-47, coda 18-23
+  (slots >= 24 alias the weights of 6-17: layer_phys). Per-layer comparisons against its dumps map our application a to that slot.
+- The embedding is RMS-normed with token_embd_norm for text tokens (not for image embeddings) and enters blocks as its first entry.
+
 ## One application (decode, T = 1; verify spans use the `_t{T}` / span forms)
 
 Before application 0: embedding lookup, then an RMS norm with weight `token_embd_norm.weight` (F32 [2304], eps 1e-6; found in the GGUF
-23 Nov, not in gen_llm: the NORMS kernel with that weight, one launch per token). Its output is the depth mix's embedding input.
+23 Nov, not in gen_llm: the NORMS kernel with that weight, one launch per token). Its output is the depth mix's embedding input
+(checked in llama.cpp: blocks' first entry).
 
 | # | step | kernel | state |
 |---|---|---|---|
