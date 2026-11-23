@@ -2,7 +2,7 @@
 # Build (if needed) and run common/bw_probe.hip: read, write and copy DRAM bandwidth on the GPU, best and median GB/s.
 # Measure on a quiet machine (no other server or build: common/wait_quiet.sh first); compare the read figure with
 # lanes.json's hardware.bw_practical_gbs and devices/<gfx>.md.
-# usage: bw_probe.sh [GiB=4] [reps=20] [blocks_per_CU=8]
+# usage: bw_probe.sh [GiB=4] [reps=20] [blocks_per_CU=8] [blocks: > 0 sets the grid directly]
 #   machine env: ROCM_SDK = a ROCm root with hipcc and gfx device libraries (default /opt/rocm); GFX (default gfx1151)
 set -u -o pipefail
 H=$(cd "$(dirname "$0")" && pwd)

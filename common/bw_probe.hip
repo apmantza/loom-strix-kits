@@ -2,7 +2,7 @@
 // kernels with 128-bit accesses (read also with four loads in flight per iteration) over a buffer far larger than any cache, grid-stride, timed with HIP events after a warm-up.
 // Reports best and median GB/s per kernel. The read kernel is the one that bounds decode (weights and KV are read, not written).
 // build: common/bw_probe.sh (hipcc; the machine env may name ROCM_SDK for a toolchain with gfx device libraries)
-// usage: bw_probe [GiB=4] [reps=20] [blocks_per_CU=8]
+// usage: bw_probe [GiB=4] [reps=20] [blocks_per_CU=8] [blocks=0: CUs x blocks_per_CU]
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cstdio>
@@ -56,7 +56,9 @@ int main(int argc, char** argv) {
   CHECK(hipMalloc(&sink, 1 << 20));
   CHECK(hipMemset(a, 0x5a, bytes));
   CHECK(hipMemset(b, 0, bytes));
-  int threads = 256, blocks = p.multiProcessorCount * per_cu;
+  // blocks: a fourth argument > 0 sets the grid directly (HRX-like E297: what one or a few workgroups can read, e.g. a kernel
+  // launched one workgroup per token at decode); otherwise CUs x blocks_per_CU
+  int threads = 256, blocks = argc > 4 && atoi(argv[4]) > 0 ? atoi(argv[4]) : p.multiProcessorCount * per_cu;
   hipEvent_t t0, t1;
   CHECK(hipEventCreate(&t0));
   CHECK(hipEventCreate(&t1));
