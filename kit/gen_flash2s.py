@@ -783,6 +783,11 @@ if os.environ.get("FLASH2_PEEL", "1") == "1" and not EDGE_ZERO and B_MODE != "2"
     if R4 and os.environ.get("FLASH2_HOT", os.environ.get("FLASH2_TRIM", "0")) == "1":   # gfx12 twin: the hot copy skips the validity / mask selects (flash2_trim.py)
         from flash2_trim import hot as _trim_hot
         _hot = lambda ls: _trim_hot(ls, D == 512)
+    _h11 = os.environ.get("FLASH2_HOT11", "0")
+    if not R4 and not PARTIAL and _h11 not in ("", "0"):   # gfx11 g_attention_flash2 only (the kernel q123 measured exact; not the split-K partial): the hot copy without the key-validity compare (kv) and the masks (kvmask; flash2_trim.hot11)
+        assert _h11 in ("kv", "kvmask"), f"FLASH2_HOT11={_h11}: kv or kvmask"
+        from flash2_trim import hot11 as _trim_hot11
+        _hot = lambda ls: _trim_hot11(ls, _h11 == "kvmask")
     text = peel_last_tile(text, _hot)
 if os.environ.get("FLASH2_ENTRY") == "bcast" and os.environ.get("FLASH2_ROLE") != "partial":   # experiment: the listed entry broadcast from lane 0
     _old = "  %entry32 = view.load %tiles_view[%entry_slot] : view<[%tokens]xi32> -> i32\n  %entry = index.cast %entry32 : i32 to index\n"
