@@ -59,6 +59,15 @@ per-expert scales. Dense projections are Q8_0 and the head Q8_0 (kit formats); e
 Not yet buildable: 'layers' 48 counts applications over 24 blocks, so gen_llm needs the application -> block map for weights
 and the application index for caches; the chat block is filled by hand.
 
+## Where it plugs into gen_llm (23 Nov, read)
+
+gen_llm.layer_text(i) builds trunk layer i from tensors `blk.{i}.*` (`command.parameter %weights, "blk.{i}..."`) and gives it a KV-plane
+ordinal (`%layer_{i}`). For the loop the change is small: an application index a (48) for ordinals, caches and conv slots, and a block index
+w(a) (24: 0-5, 6-17 three times, 18-23) for the parameter names. The large part is the layer body: layer_text emits Qwen-style layers
+(norm, projections, flash / GDN, dense or MoE FFN); Inkling needs its own body (steps 1-12 above: depth mix, controllers, the four
+convolutions, the relative-bias attention with sink and gate, the sigmoid router and SITU experts) wired through the same program
+skeleton (embedding, head, sampling, drafter hooks). Plan: an `inkling2_layer_text(a)` beside layer_text, selected by arch.
+
 ## Order of work
 
 1. Generate the dense matvecs and norms at Inkling's shapes from the Qwen kit's generators, and the router / experts from gen_moe with
