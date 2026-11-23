@@ -14,7 +14,7 @@ Every clock read waits for outstanding LDS loads (lgkmcnt(0)), so the stamped ke
 f16 GEMM, E302): compare shares, and report the perturbation (stamped vs unstamped time) with them. Fixes carried over from
 stamp_gemm: low.invoke results in parentheses (PARSE/003 otherwise); the tail inside the region that holds the loop (served
 kernels wrap the tile in an unindented `scf.if %tile_live {`); slots from the real grid (x-major slots collided, q111).
-usage: python3 kit/stamp_loop.py PROGRAM.loom KERNEL IV GX GY WAVES OUT.loom [realtime|cycles]   (OUT holds KERNEL unchanged and KERNEL_stamped)"""
+usage: python3 kit/stamp_loop.py PROGRAM.loom KERNEL IV GX GY WAVES OUT.loom [cycles (default)|realtime]   (OUT holds KERNEL unchanged and KERNEL_stamped)"""
 import re
 import sys
 
@@ -162,7 +162,7 @@ def helpers(src, block):
 def main():
     global MASK
     prog, kernel, iv, gx, gy, waves, dst = sys.argv[1:8]
-    clock = sys.argv[8] if len(sys.argv) > 8 else "realtime"
+    clock = sys.argv[8] if len(sys.argv) > 8 else "cycles"   # default: the cycle counter (realtime waits for every LDS load: +41 % / 3.2x, E304)
     assert clock in ("realtime", "cycles"), clock
     MASK = (1 << 20) - 1 if clock == "cycles" else None
     src = open(prog).read()

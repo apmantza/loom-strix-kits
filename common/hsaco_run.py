@@ -17,6 +17,7 @@ raise clocks on this power-limited chip, E15) | byte:0xNN | f32:VALUE. Every buf
 --compare NAME[:f32|f16] after one launch per object: bytes equal, else the max absolute difference (exit 1 when they differ).
 usage: hsaco_run.py [--loom FILE --workload k=v,...] [--grid X,Y,Z] --kernel NAME [--scalar k=v ...] --buf NAME=BYTES[:FILL] ...
                     [--reps 20] [--warmup 3] [--bytes N (GB/s)] [--compare NAME] [--dry-run] LABEL=OBJ.hsaco [LABEL=OBJ ...]"""
+import os
 import argparse, ctypes as C, math, re, statistics, struct, sys
 
 import msgpack
@@ -71,6 +72,14 @@ def loom_kernel(src, name):
                     return work, body, dev
                 body.append(lines[j].strip())
     sys.exit(f"--loom: no kernel.def for {name}")
+
+
+def power_levels():
+    """the GPU power level(s); HSACO_RUN_LEVEL_FILE overrides the sysfs path (tests)"""
+    import glob as _g, os
+    paths = [os.environ["HSACO_RUN_LEVEL_FILE"]] if os.environ.get("HSACO_RUN_LEVEL_FILE") else \
+        _g.glob("/sys/class/drm/card*/device/power_dpm_force_performance_level")
+    return sorted({open(f).read().strip() for f in paths}) or ["unknown"]
 
 
 ESIZE = {"f64": 8, "i64": 8, "f32": 4, "i32": 4, "f16": 2, "bf16": 2, "i16": 2, "i8": 1}
@@ -301,9 +310,12 @@ def main():
         sz, _, how = rest.partition(":")
         bufspec[n] = (int(float(sz)), how or "zero")
     print(f"kernel {a.kernel}: grid {grid} x workgroup {block}; kernarg {metas[0]['.kernarg_segment_size']} B")
-    import glob as _g
-    lv = sorted({open(f).read().strip() for f in _g.glob("/sys/class/drm/card*/device/power_dpm_force_performance_level")}) or ["unknown"]
+    lv = power_levels()
     print(f"  power level {'/'.join(lv)}" + ("" if lv == ["auto"] else "  ** NOT the serving level (auto): times here need not hold in service (HRX-like E300) **"))
+    if lv != ["auto"] and not a.dry_run and os.environ.get("HSACO_RUN_ANY_LEVEL") != "1":
+        # timings at another level misled two nights of decisions (E300: 2x at profile_standard, 3-8 % served): refuse, unless the
+        # caller only wants counts (common/counters.sh sets HSACO_RUN_ANY_LEVEL=1) or says so explicitly
+        sys.exit(f"hsaco_run: power level {'/'.join(lv)}, not auto: timings would not hold in service (set HSACO_RUN_ANY_LEVEL=1 for counts)")
     if a.loom:                                            # buffers too small for the kernel's own views refuse before any launch
         need, skipped = view_needs(open(a.loom).read(), a.kernel, {**kv(a.workload), **scalars})
         short = [f"{k}: {bufspec[k][0]} B given, {v[1]} needs {v[0]} B" for k, v in sorted(need.items()) if k in bufspec and bufspec[k][0] < v[0]]

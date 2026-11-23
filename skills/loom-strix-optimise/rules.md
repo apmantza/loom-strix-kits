@@ -158,6 +158,10 @@ more bytes than Strata's' after checking only Strata's file; our generator's doc
   result (common/checks.py, E212; from sybil-solutions/inference-optimisation-skill: a 117 tok/s 'record' there was a list stuck in a loop).
 - Decide sub-noise changes on device time per verify step, not tokens/s (sub-noise gains tie in a 5-round A/B; the per-kernel profile shows them in minutes).
 - Ablate with realistic data on a power-limited chip; constant operands raise clocks (E15 vs E24).
+- An isolated kernel A/B is a hypothesis until the harness reproduces the live kernel's served time at the served shape (same
+  kernel timed both ways). A flash2 trim measured 0.93-0.96 in isolation at every chunk and context, and 1.039 served in every
+  decile of an 81k prefill (HRX-like E313 / E316); scattered pages explained part of it. A candidate goes forward on the served
+  events A/B (device time per lane) only.
 - Time kernels at the power level the server runs at (auto), never at profile_standard (the level for counters): at
   profile_standard decode matvecs turned compute-bound and two rewrites looked 2x faster (54 -> 102 GB/s); at auto both ran
   at 196-211 GB/s and the gain was 3-8 %, which is what serving showed. Before a harness figure feeds a decision, check that it

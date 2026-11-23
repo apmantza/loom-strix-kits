@@ -26,6 +26,7 @@ declare -A PMC=(
   [lds]="LDSBankConflict SQC_LDS_BANK_CONFLICT SQC_LDS_IDX_ACTIVE SQ_INSTS_LDS ALUStalledByLDS SQ_INST_CYCLES_LDS SQ_WAVE_CYCLES"
 )
 lvl=$(cat /sys/class/drm/card*/device/power_dpm_force_performance_level 2>/dev/null | head -1)
+export HSACO_RUN_ANY_LEVEL=1   # counts, not timings: hsaco_run may run at the counter level (it refuses timing at any level but auto)
 [ "$lvl" = profile_standard ] || echo "counters: WARNING power level '$lvl' (not profile_standard): some counter clocks may be gated"
 if [ "$P" = calibrate ]; then
   B=$(bash "$H/bw_probe.sh" 0.001 1 1 > /dev/null 2>&1; echo "${STATE:-$H}/bw_probe.$GFX")    # build only, a tiny run

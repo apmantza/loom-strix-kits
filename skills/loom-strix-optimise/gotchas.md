@@ -47,3 +47,9 @@
 - **No build or second server beside a profile** (GEMMs 123 -> 131 s). common/build.sh refuses during one.
 - **loom-serve needs unlimited memlock**; elastic backing needs power-of-two pages (E73/E74).
 - **Restore the production server on every exit path** (trap; LSK_RESTORE_HOOK); a manual run once left it down ~20 min.
+
+- Timing inside a kernel on gfx11: read the shader cycle counter (`s_getreg_b32` of HW_REG_SHADER_CYCLES, id 29, 20 bits, wrap-aware
+  deltas) from a `low.func` asm helper, fenced with `scf.schedule.fence`. The realtime clock (`s_sendmsg_rtn_b64` message 131)
+  makes the compiler wait for every outstanding LDS load (lgkmcnt(0)) at each read: it slowed a GEMM 41 % and flash2 3.2x, so its
+  phase shares described another kernel; the cycle counter cost +1.7 % / +3.4 % with exact outputs (kit/stamp_loop.py; HRX-like E304 / E305).
+  `low.invoke` results need parentheses (`: () -> (i32)`).

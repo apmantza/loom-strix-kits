@@ -50,9 +50,18 @@ def check(lines, kernel, iv, nbar):
 
 
 def main():
-    lines = open(sys.argv[1]).read().splitlines()
+    prog = sys.argv[1]
+    lines = open(prog).read().splitlines()
     check(lines, "g_gemm_f16_store_m256", "step", 2)
     check(lines, "g_attention_flash2", "kt", 3)
+    # the default clock is the cycle counter (no memory wait); realtime reads perturbed the GEMM +41 % and flash2 3.2x (E304)
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        out = os.path.join(t, "s.loom")
+        sys.argv = ["stamp_loop.py", sys.argv[1], "g_gemm_f16_store_m256", "step", "1", "1", "8", out]
+        stamp_loop.main()
+        txt = open(out).read()
+    ok("s_getreg_b32" in txt and "s_sendmsg_rtn" not in txt and "scalar.andi" in txt, "the default clock is the cycle counter, with wrap-aware deltas")
     sys.exit(1 if fails else 0)
 
 

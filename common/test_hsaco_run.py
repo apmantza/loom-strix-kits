@@ -140,6 +140,20 @@ def main():
 }"""
     n3, s3 = hr.view_needs(toy, "t", {"n_arg": 3})
     ok(n3 == {"a": (48, "view<[%n]x4xf32>")} and s3 == 1, f"_arg names resolve; a non-zero offset is skipped, not sized ({n3}, {s3})")
+    # 7. timing refused at a power level other than auto (E300: kernel A/Bs at profile_standard said 2x where serving gave 3-8 %);
+    #    counts allowed with HSACO_RUN_ANY_LEVEL=1 (counters.sh); dry runs unaffected. The level comes from a fake file: no GPU is touched
+    #    (the refusal precedes device setup).
+    if gemm:
+        with tempfile.TemporaryDirectory() as t:
+            lf = os.path.join(t, "level"); open(lf, "w").write("profile_standard\n")
+            base = [sys.executable, os.path.join(H, "hsaco_run.py"), "--kernel", "g_gemm_iq4_nl_store_m256", "--loom", sys.argv[1],
+                    "--workload", "rows=1024,n=17408", "--scalar", "rows=1024,k=5120,n=17408", "--buf", "x=1:zero", "--buf", "scales=1:zero",
+                    "--buf", "w=1:zero", "--buf", "y=1:zero", f"A={gemm[0]}"]
+            env = dict(os.environ, HSACO_RUN_LEVEL_FILE=lf); env.pop("HSACO_RUN_ANY_LEVEL", None)
+            r = subprocess.run(base, capture_output=True, text=True, env=env)
+            ok(r.returncode != 0 and "not auto" in (r.stdout + r.stderr), "timing at profile_standard refused (exit nonzero, 'not auto')")
+            r = subprocess.run(base + ["--dry-run"], capture_output=True, text=True, env=env)
+            ok("not auto" not in r.stderr, "a dry run at profile_standard is not refused")
     sys.exit(1 if fails else 0)
 
 
