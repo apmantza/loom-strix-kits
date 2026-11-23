@@ -23,8 +23,6 @@
   - the 256-row GEMMs' LDS-to-WMMA serialization (E254: 48 of 64 WMMAs right after lgkmcnt(0), queue item 6 / E152) not
     reported: a loop whose WMMAs each wait lgkmcnt(0) on a fragment just loaded gets the `ldsser` note (a note until a counter
     run shows its cost), one that keeps a fragment in flight with lgkmcnt(2) does not;
-  - reductions serialised one barrier pair at a time (E272: a depth-mix draft with 40 barriers) not noted `barriers`: ten
-    straight-line barriers get the note, the same barriers inside a loop (a staged pipeline) do not;
   - the same bytes loaded twice not noted `reread` (E278: Strata's depth mix; llama.cpp's head-256 flash_attn_ext_vec repeats 24
     loads): two repeated loads with unchanged addresses get the note; a moved address, an intervening store or a pointer chase
     do not count;
@@ -167,11 +165,6 @@ def main():
     far += sum(([f"s_load_b32 s{10 + k}, s[4:5], 0x{4 * k:x}", "s_waitcnt lgkmcnt(0)", wm(k)] for k in range(8)), [])
     r = kl.lint_listing("ldsfar", *listing(loop_of(far)))
     ok("ldsser" not in r.get("notes", []), f"lgkmcnt(0) waits on scalar loads, the LDS loads long before: no note (share {r.get('ldsser')})")
-    sr = ["s_mov_b32 s0, 0"] + sum((["ds_store_b32 v1, v2", "s_barrier", "ds_load_b32 v3, v1", "v_add_f32_e32 v4, v4, v3"] for _ in range(10)), [])
-    r = kl.lint_listing("serial_reduce", *listing(sr + ["s_endpgm"]))
-    ok("barriers" in r.get("notes", []) and r["bar"] == 10, f"ten straight-line barriers get the barriers note (bar {r.get('bar')})")
-    r = kl.lint_listing("pipelined", *listing(loop_of(sum((["ds_store_b32 v1, v2", "s_barrier", "ds_load_b32 v3, v1"] for _ in range(10)), []))))
-    ok("barriers" not in r.get("notes", []), f"barriers inside a loop (a staged pipeline) do not (bar {r.get('bar')})")
     rr = ["global_load_b128 v[0:3], v4, off", "global_load_b128 v[8:11], v5, off", "v_add_f32_e32 v10, v0, v1",
           "global_load_b128 v[20:23], v4, off", "global_load_b128 v[24:27], v5, off", "s_endpgm"]
     r = kl.lint_listing("reread", *listing(rr))

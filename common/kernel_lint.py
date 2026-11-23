@@ -14,19 +14,18 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   join      a run of >= JOIN_RUN moves right after an exec-mask restore, anywhere in the kernel: a value-yielding scf.if whose
             branches leave the result in different registers, copied at the join (E242: a prefetch under scf.if; E247: the norm's
             idle-lane zero branch, 61-64 moves per pass). Fix shape: compute on a clamped index and select.
-  serial    in any loop, >= SERIAL_LINKS independent links in a run of lone loads: each issued with nothing pending on its counter
+  serial    (blind check E284: 11 of 12 hits confirmed, all material) in any loop, >= SERIAL_LINKS independent links in a run of lone loads: each issued with nothing pending on its counter
             and retired before the next load of that counter (vmcnt for vector loads, lgkmcnt for scalar ones), the
             next load's address not computed from the previous load's data. One load in flight pays the whole latency per load
             (E109: KV8 loads retired 2-26 instructions after issue; E254: g_attention_split's 7 per pass, llama.cpp NVFP4
             mul_mat_q's per-byte scales). Pointer chases and scratch reloads (the scratch flag) are not counted.
-  [ldsser]  a NOTE until a counter run shows its cost (E254, E61's hypothesis): in the hot loop (>= 8 WMMAs, >= 8 ds_loads), at
+  [ldsser]  a NOTE until a counter run shows its cost (E254, E61's hypothesis; blind check E284: 3 of 4 hits confirmed, 1 unclear): in the hot loop (>= 8 WMMAs, >= 8 ds_loads), at
             least half the WMMAs sit within 3 instructions after an lgkmcnt(0) that retires a ds_load issued at most 12
             instructions earlier: no LDS fragment kept in flight across a multiply (the 256-row GEMMs: 48 of 64; their 128-row
             siblings keep one with lgkmcnt(2)). Column ldsser = that share.
-  [barriers] a NOTE: >= BARRIERS workgroup barriers outside every loop: reductions done one at a time (each workgroup sum costs
-            a barrier pair) instead of batched through LDS behind one barrier (E272: a depth-mix draft had 40, the batched form 2;
-            llama.cpp's mul_mat_vec_f with 8 columns has 17, one block reduction per column). Column bar = that count.
-  [reread] a NOTE: >= REREAD global loads repeating an earlier load's operands while its address registers are unchanged and no store
+  (a 'barriers' note, >= 8 straight-line barriers, was removed after a blind check: 1 of 9 hits on llama.cpp were serialised
+  reductions, the rest tile staging or a peeled last iteration; E284. Barrier counts stay in the kit's own kernel tests.)
+  [reread] a NOTE (blind check E284: 2 of 5 hits confirmed): >= REREAD global loads repeating an earlier load's operands while its address registers are unchanged and no store
             intervened: the same bytes read twice (E278: Strata's Inkling depth mix reads each state twice; llama.cpp's
             flash_attn_ext_vec at head 256 with f16 KV repeats 24 loads). Column-free: r['reread'].
   [tiny]    a NOTE (with --profile): launched >= TINY_CALLS times in the profiled request with a median call under TINY_US: a
@@ -70,7 +69,6 @@ MM = ("v_wmma", "v_dot4", "v_dot2", "v_dot8")
 COPY_RUN = 16
 JOIN_RUN = 32
 SERIAL_LINKS = 4
-BARRIERS = 8
 TINY_CALLS = 1000
 REREAD = 2
 TINY_US = 10.0
@@ -374,15 +372,9 @@ def lint_listing(name, ins, addr, res=(None, None, None)):
     r["ldsser"] = lds_serialized(b) if r["where"] == "loop" else None
     if r["ldsser"] is not None and r["ldsser"] >= LDSSER:
         r.setdefault("notes", []).append("ldsser")             # a prompt to measure, not a flag (E254: cost unproven)
-    inloop = set()
-    for a, z in loops(ins, addr):
-        inloop.update(range(a, z + 1))
-    r["bar"] = sum(1 for j, x in enumerate(ins) if x.startswith("s_barrier") and j not in inloop)
     r["reread"] = rereads(ins)
     if r["reread"] >= REREAD:
         r.setdefault("notes", []).append("reread")              # E278: the same bytes loaded twice
-    if r["bar"] >= BARRIERS:
-        r.setdefault("notes", []).append("barriers")            # E272: reduce several sums behind one barrier
     r["join"] = join_runs(ins)
     if r["join"] >= JOIN_RUN:
         r["flags"].append("join")
