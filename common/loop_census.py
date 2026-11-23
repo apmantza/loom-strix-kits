@@ -62,6 +62,27 @@ def loops(ins, addr):
     return out
 
 
+def guarded(ins, addr, t, e):
+    """regions of loop [t, e] that a forward branch inside the loop can skip, as (branch index, first, last): a conditional forward
+    branch skips the instructions up to its target; an unconditional one jumps over an else block, which only another branch
+    reaches. Counts inside them are not executed every iteration: how often they run is the guard's semantics, which a listing
+    cannot tell (HRX-like E334: vsplit's 384 masked-path cndmask sat behind a branch taken only on edge blocks, and a static count
+    of them was read as every-tile cost). Branches out of the loop (early exits) are not regions."""
+    a2i = {a: i for i, a in enumerate(addr)}
+    out = []
+    for i in range(t, e + 1):
+        m = re.match(r"s_(cbranch_\w+|branch)\s+(-?\d+)", ins[i])
+        if not m:
+            continue
+        off = int(m.group(2))
+        if off > 32767:
+            off -= 65536
+        j = a2i.get(addr[i] + 4 + 4 * off)
+        if j is not None and i + 1 < j <= e:   # a target past the back-edge leaves the loop (its exit test): not a region
+            out.append((i, i + 1, j - 1))
+    return out
+
+
 def hot_loop(ins, addr):
     """the backward branch [target, branch] whose body holds the most WMMAs, as (target, branch, wmma count), or None"""
     best = None
@@ -125,6 +146,16 @@ def main():
             print(f"  loop [{t},{e}] len {c['len']} wmma {c['wmma']} moves {c['moves']} scratch {c['scratch']} vmcnt-waits {c['vmcnt_waits']}")
             for r in c["runs"]:
                 print(f"    moves at +{r['at']}..+{r['to']} of {c['len']} ({r['n']}): {r['first']} ... {r['last']}")
+            g = guarded(ins, addr, t, e)
+            inside = set(j for _, lo, hi in g for j in range(lo, hi + 1))
+            if g:
+                cnt = lambda pre, js: sum(1 for j in js if ins[j].startswith(pre))
+                print(f"    guarded (skippable by a forward branch): {len(inside)} of {c['len']} instructions in {len(g)} region(s); "
+                      f"wmma {cnt('v_wmma', inside)} of {c['wmma']}, cndmask {cnt('v_cndmask', inside)} of {cnt('v_cndmask', range(t, e + 1))}")
+                for b, lo, hi in g:
+                    if hi - lo >= 20:
+                        print(f"      [{lo - t}..{hi - t}] {hi - lo + 1} instr behind {ins[b].split()[0]} at +{b - t}: wmma {cnt('v_wmma', range(lo, hi + 1))}, "
+                              f"cndmask {cnt('v_cndmask', range(lo, hi + 1))}")
 
 
 if __name__ == "__main__":

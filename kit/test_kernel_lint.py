@@ -36,6 +36,8 @@
   - report columns read from the wrong place: LDS bank extra rounds from the summary report's gfx1151 model (E243: the 256-row
     GEMMs' activation staging store, 48 extra rounds), each kernel's served ms from a profile run, a load's distance to its wait
     and the loads still in flight at the back-edge (E109);
+  - selects behind a branch read as every-iteration cost (E334: vsplit's masked path, 384 of 496 cndmask, runs only on edge
+    blocks): loop_census.guarded reports the region a forward branch can skip, not the straight path or an early exit;
   - the outer shell of a nested loop taken as the hot loop (E237: the 16-token swiglu matvecs were flagged `select` for
     their outer loop's selects while the dot4s sat in the inner loop): the inner loop must be chosen, nothing flagged.
 usage: python3 kit/test_kernel_lint.py   (needs loom-compile: VENV from the environment or the machine env file)"""
@@ -109,6 +111,32 @@ def main():
         return f"s_branch {(target - (i + 1)) & 0xFFFF}"
     spill = ["s_mov_b32 s0, 0", "v_dot4_i32_iu8 v1, v2, v3, v1", "scratch_load_b32 v4, off, s0", "v_add_nc_u32_e32 v1, v1, v4"]
     spill.append(back(len(spill), 1))
+    # guarded regions (E334): selects behind a forward conditional branch are reported as skippable; the same selects on the
+    # straight path are not, and a branch out of the loop is not a region
+    import loop_census as lcen
+    def fwd(i, target, op="s_cbranch_scc0"):
+        return f"{op} {(target - (i + 1)) & 0xFFFF}"
+    gl = ["s_mov_b32 s0, 0"] + ["v_wmma_f32_16x16x16_f16 v[0:7], v[8:15], v[16:23], v[0:7]"] * 4 + ["s_cmp_eq_u32 s1, 0"]
+    gb = len(gl); gl.append("")                                            # the forward branch, filled in below
+    gl += ["v_cmp_eq_i32_e64 s2, v1, v2", "v_cndmask_b32_e64 v3, v4, v5, s2"] * 12
+    gl[gb] = fwd(gb, len(gl))
+    gl += ["s_add_u32 s0, s0, 1"]; gl.append(back(len(gl), 1))
+    ins_g, addr_g = listing(gl)
+    rg = lcen.guarded(ins_g, addr_g, 1, len(gl) - 1)
+    inside = {j for _, lo, hi in rg for j in range(lo, hi + 1)}
+    ok(len(rg) == 1 and sum(ins_g[j].startswith("v_cndmask") for j in inside) == 12 and not any(ins_g[j].startswith("v_wmma") for j in inside),
+       f"selects behind a forward branch are a guarded region, the WMMAs before it are not ({rg})")
+    straight = [x for k, x in enumerate(gl) if k != gb]
+    straight[-1] = back(len(straight) - 1, 1)
+    ins_s, addr_s = listing(straight)
+    ok(lcen.guarded(ins_s, addr_s, 1, len(straight) - 1) == [], "the same selects on the straight path: no guarded region")
+    ex = list(gl); ex[gb] = fwd(gb, len(gl) + 5)
+    ins_x, addr_x = listing(ex)
+    ok(lcen.guarded(ins_x, addr_x, 1, len(ex) - 1) == [], "a branch out of the loop (early exit) is not a region")
+    ex2 = list(gl); ex2[gb] = fwd(gb, len(gl))                            # to the instruction after the back-edge: the loop's exit test
+    ex2.append("s_endpgm")
+    ins_y, addr_y = listing(ex2)
+    ok(lcen.guarded(ins_y, addr_y, 1, len(gl) - 1) == [], "a branch to just past the back-edge (the loop's exit test) is not a region")
     r = kl.lint_listing("spill", *listing(spill))
     ok("scratch" in r["flags"], f"a scratch load in the hot loop flags scratch ({r['scratch']})")
     nest = ["s_mov_b32 s0, 0"] + ["v_cmp_eq_u32_e64 s1, v0, v1", "v_cndmask_b32_e64 v2, v3, v4, s1"] * 4   # outer shell: selects
