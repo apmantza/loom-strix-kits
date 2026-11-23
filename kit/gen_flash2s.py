@@ -119,7 +119,7 @@ POSHI = """  // The last live position of the block: keys past it are not writte
   %pos_hi_i32 = scalar.addi %posf_32, %hi_cnt : i32
   %pos_hi = index.cast %pos_hi_i32 : i32 to index
 """
-PARTIAL = os.environ.get("FLASH2_ROLE") == "partial"   # the tiles a run covers only in part (see gen_flash2.py)
+PARTIAL = os.environ.get("FLASH2_ROLE") == "partial"
 QTOKEN = """%q_token_value = index.add %first_token, %lane_col : index
   %q_token = index.assume %q_token_value [lt(%q_token_value, %tokens)] : index"""
 if PARTIAL:   # lane column c is the token ENTRY + c - OFF when it continues the run; other columns read the entry's Q
@@ -736,6 +736,9 @@ if SPLITK and not R4 and B_MODE != "2":
     if os.environ.get("FLASH2_VS_PF", "0") == "1":
         from flash2_prefetch import prefetch_split
         text = prefetch_split(text)
+    if os.environ.get("FLASH2_SX11", "0") == "1":   # vsplit: the same S-partial exchange as lane vectors (flash2_trim.sx11; no peel: 2 + 2)
+        from flash2_trim import sx11
+        text = sx11(text)
 if not R4 and os.environ.get("FLASH2_PF11", "0") == "1" and B_MODE != "2" and not SPLITK:
     from flash2_prefetch import prefetch, prefetch_uncond, prefetch_split
     if os.environ.get("FLASH2_KVH11", "0") == "1":   # the row's page-map pointer loaded once before the loop (flash2_trim.kvhoist): one dependent load fewer per tile
@@ -789,6 +792,9 @@ if os.environ.get("FLASH2_PEEL", "1") == "1" and not EDGE_ZERO and B_MODE != "2"
         from flash2_trim import hot11 as _trim_hot11
         _hot = lambda ls: _trim_hot11(ls, _h11 == "kvmask")
     text = peel_last_tile(text, _hot)
+    if not R4 and not PARTIAL and os.environ.get("FLASH2_SX11", "0") == "1":   # gfx11 g_attention_flash2: S partials exchanged as lane vectors (flash2_trim.sx11)
+        from flash2_trim import sx11
+        text = sx11(text)
 if os.environ.get("FLASH2_ENTRY") == "bcast" and os.environ.get("FLASH2_ROLE") != "partial":   # experiment: the listed entry broadcast from lane 0
     _old = "  %entry32 = view.load %tiles_view[%entry_slot] : view<[%tokens]xi32> -> i32\n  %entry = index.cast %entry32 : i32 to index\n"
     assert _old in text, "entry load not found"

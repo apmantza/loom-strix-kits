@@ -33,6 +33,27 @@ def sx(text):
     return text
 
 
+def sx11(text):
+    """FLASH2_SX11 (gfx11 g_attention_flash2, HRX-like E325): the S partials the two waves of a head exchange (head_dim 256 = 2 x 128 dims)
+    go through workgroup memory as each lane's own 8-vector (vector.store / vector.load of 32 bytes: two 128-bit accesses) instead of
+    fragment.store / fragment.load<result> (narrow scalar accesses and their address math: 48 narrow stores and 16 narrow loads per key
+    tile in the compiled QK phase, E325). Both waves have the same lane layout, so lane l reads exactly what its partner's lane l held:
+    the sums (%st = s + sp) see the same values; exact. The same 24,576 bytes, viewed [12 waves][2 key blocks][32 lanes][8].
+    Fails closed unless 4 stores and 4 loads (flash2: two key blocks, hot loop and peeled tile) or 2 and 2 (vsplit: no peel) are rewritten."""
+    m = re.search(r"%s_view = buffer\.view %s_tile\[%origin\] : buffer -> view<(\d+)x16xf32>", text)
+    assert m, "FLASH2_SX11: no %s_view of 16-wide rows"
+    waves = int(m.group(1)) // 32
+    vt = f"view<{waves}x2x32x8xf32>"
+    text = text.replace(m.group(0), m.group(0) + f"\n  %sx_view = buffer.view %s_tile[%origin] : buffer -> {vt}", 1)
+    blk = {"%my_s": "%c0", "%my_s1": "%c1", "%their_s": "%c0", "%their_s1": "%c1"}
+    text, ns = re.subn(r"vector\.fragment\.store<result> (%\w+), %s_view\[(%my_s1?), %c0\] shape \[%c16, %c16\] : vector<8xf32>, view<\d+x16xf32>",
+                       lambda mm: f"vector.store {mm.group(1)}, %sx_view[%wave, {blk[mm.group(2)]}, %lane, %c0] : vector<8xf32>, {vt}", text)
+    text, nl = re.subn(r"(%sp\d(?:_pt)?) = vector\.fragment\.load<result> %s_view\[(%their_s1?), %c0\] shape \[%c16, %c16\] : view<\d+x16xf32> -> vector<8xf32>",
+                       lambda mm: f"{mm.group(1)} = vector.load %sx_view[%partner_id, {blk[mm.group(2)]}, %lane, %c0] : {vt} -> vector<8xf32>", text)
+    assert ns == nl and ns in (2, 4), f"FLASH2_SX11: {ns} stores / {nl} loads rewritten (want 2 / 2 unpeeled (vsplit) or 4 / 4 peeled (flash2))"
+    return text
+
+
 def hot(lines, global_only):
     """The hot copy's lines (flash2_peel.py) with the trims; GLOBAL_ONLY: the masks go too."""
     out = []
