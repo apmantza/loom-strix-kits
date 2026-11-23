@@ -50,6 +50,15 @@ Span forms exist for the controller, sliding and global attention (K / V read on
 the span's routed experts: NOTES estimates ~40 % of each layer's experts for 8 tokens; engine-lab's MoE decode GEMV serves up to 8
 rows per launch, research/engine-lab-inkling.md).
 
+## Config (23 Nov)
+
+kits/inkling-2-mini/config.draft.json comes from kit/inspect_gguf.py: hidden 2304, 24 / 8 heads x 128, sliding window 1024 on 40 of the
+48 applications (global every 6th), attention gate, MoE 128 experts top-8, gating 2 (sigmoid + exp_probs_b selection bias),
+weights renormalised x 8, SITU caps 4 / 25 (read from the GGUF's activation.situ_beta / situ_linear_beta), fused gate_up with
+per-expert scales. Dense projections are Q8_0 and the head Q8_0 (kit formats); experts NVFP4 in layers 0-19, Q8_0 in 20-23.
+Not yet buildable: 'layers' 48 counts applications over 24 blocks, so gen_llm needs the application -> block map for weights
+and the application index for caches; the chat block is filled by hand.
+
 ## Order of work
 
 1. Generate the dense matvecs and norms at Inkling's shapes from the Qwen kit's generators, and the router / experts from gen_moe with

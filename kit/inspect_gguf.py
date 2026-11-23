@@ -288,7 +288,10 @@ MOE_DEFAULTS = {"qwen3moe": {"gating": 1, "norm_weights": True}, "qwen35moe": {"
                 "qwen3next": {"gating": 1, "norm_weights": True}, "qwen2moe": {"gating": 1, "norm_weights": False},
                 "gemma4": {"gating": 1, "norm_weights": True}, "mellum": {"gating": 1, "norm_weights": True},
                 # gpt-oss: SOFTMAX_WEIGHT (top-k of the biased logits, softmax over the k), LLM_FFN_SWIGLU_OAI_MOE
-                "gpt-oss": {"gating": 3, "norm_weights": False, "act": "swiglu_oai", "swiglu_alpha": 1.702, "swiglu_limit": 7.0}}
+                "gpt-oss": {"gating": 3, "norm_weights": False, "act": "swiglu_oai", "swiglu_alpha": 1.702, "swiglu_limit": 7.0},
+                # Inkling 2 (Unsloth fork src/models/inkling2.cpp): sigmoid scores + the selection bias (exp_probs_b), top-8, weights
+                # renormalised and scaled by expert_weights_scale 8; SITU activation with caps 4 / 25 (kits/inkling-2-mini/NOTES.md)
+                "inkling2": {"gating": 2, "norm_weights": True, "act": "situ"}}
 if A("expert_count"):
     d = MOE_DEFAULTS.get(arch, {})
     cfg["moe"] = {"experts": A("expert_count"), "used": A("expert_used_count"), "ffn": A("expert_feed_forward_length"),
@@ -297,6 +300,9 @@ if A("expert_count"):
                   "scale": A("expert_weights_scale", 1.0) or 1.0,
                   "probs_bias": any(k.endswith("exp_probs_b.bias") for k in tensors)}
     cfg["moe"].update({k: v for k, v in d.items() if k in ("act", "swiglu_alpha", "swiglu_limit")})
+    if cfg["moe"].get("act") == "situ":   # Inkling 2: the caps live in the GGUF (activation.situ_beta / situ_linear_beta); refuse if absent
+        cfg["moe"]["situ_beta"], cfg["moe"]["situ_linear_beta"] = A("activation.situ_beta"), A("activation.situ_linear_beta")
+        assert cfg["moe"]["situ_beta"] and cfg["moe"]["situ_linear_beta"] is not None, "SITU activation without its caps in the GGUF"
     _ld = cfg["moe"]["leading_dense"]
     if f"blk.{_ld}.ffn_gate_inp.bias" in tensors:   # the router's own bias, added to its logits (gen_moe gating 3)
         cfg["moe"]["router_bias"] = True
