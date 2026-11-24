@@ -2,7 +2,8 @@
 # Served per-dispatch profiles of packages in the order given (A B B A for an ABBA) at one prompt size, then events_summary.py
 # (each lane against its hardware floor, kits/<kit>/lanes.json). Per run: stop other servers (and a managed one, LSK_STOP_HOOK),
 # wait for a quiet machine, serve with the kit's flags plus device profiling into a bundle, send profile_req.py's long request,
-# check the served context against the label, stop, export the dispatch events with iree-profile. The managed server comes back
+# check the served context against the label (a > 5 % mismatch stops the script: a profile labelled 81k that served 66k is not
+# the cell it claims, HRX-like E421), stop, export the dispatch events with iree-profile. The managed server comes back
 # on every exit (LSK_RESTORE_HOOK).
 # Environment (strix-llama.cpp #241: a Mesa update turned a measured speedup into a loss): env_block.py records the stack before
 # each run (<run>/env.txt); summary.md ends with an `environment:` section (the first run's block) and each run whose block
@@ -27,7 +28,9 @@ for p in "$@"; do
   lsk_serve_bg prof "$p" --device_profiling_mode=dispatch-events,executable-metadata --device_profiling_flush_interval_ms=5 \
     --device_profiling_output="$d/run.ireeprof"
   "$PYTHON" "$H/profile_req.py" "http://127.0.0.1:$PORT" "$KIT_MODEL_ID" "$L" > "$d/run.req.json" 2> "$d/run.req.err" || die "events_ab STOP: request $p"
-  echo "### $n $p $(python3 -I "$H/context_label_check.py" "$d/run.req.json" "$L")"
+  lab=$(python3 -I "$H/context_label_check.py" "$d/run.req.json" "$L"); lc=$?   # not inside the echo: its status was discarded there
+  echo "### $n $p $lab"
+  [ $lc -eq 0 ] || die "events_ab STOP: run $n served another context than LENGTH $L (the request's size label: read the served count)"
   lsk_stop || exit 1
   "$IREE_PROFILE" dispatch --dispatch_events --format=jsonl "$d/run.ireeprof" > "$d/events.jsonl" 2> "$d/events.err" || die "events_ab STOP: iree-profile export $p"
 done

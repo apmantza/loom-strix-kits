@@ -86,7 +86,11 @@ for a fraction of the next one's cost.
   and title a row "root cause" only after the direct test (E139 called the page map host-private from its allocation
   site; serving uploads it into a device buffer, E140).
 - **Cite the served context, not the profile's label** (E128/E133: "dec100k" served 81,432 tokens and reversed a
-  framing). common/events_ab.sh prints it on a `###` line (common/context_label_check.py, exit 1 on a >5 % mismatch).
+  framing). common/events_ab.sh prints it on a `###` line and stops on a >5 % mismatch (common/context_label_check.py); a check's
+  status read inside an `echo "$(...)"` is discarded: run it on its own line (HRX-like E421: the size label 81430 served 66,304).
+- **A ratio compares equal work** (HRX-like E449: two concurrent agents' '1.7x' wall throughput was mostly 31 % less output, since
+  own-mode replies differ; work-adjusted ~1.15-1.2x): before quoting a speedup between arms, check that they generated the same
+  tokens, or price each arm's work per unit (common/concurrency_audit.py throughput()).
 - **Measure on a quiet machine**: no build, compile or second server beside a profile (a CPU build during a profile moved GEMM
   time 123 -> 131 s). common/wait_quiet.sh waits builds out; common/build.sh refuses during a measurement.
 
