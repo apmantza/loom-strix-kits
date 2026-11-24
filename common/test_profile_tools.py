@@ -193,6 +193,25 @@ class LaneGate(unittest.TestCase):
         r = self.gate(self.abba((1000.0, 1001.0), (900.0, 1010.0)))
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
 
+    def test_no_slower_tie_passes(self):
+        # HRX-like E466: q179's NaN fix tied (+0.20 %, noise 0.38 %) and the drop-only gate stopped it; a fix's question is 'not slower'
+        runs = self.abba((1000.0, 1004.0), (1003.0, 1005.0))
+        r = self.gate(runs, "--no-slower", "0.5", "--guard-others", "2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("not slower beyond noise", r.stdout)
+        self.assertEqual(self.gate(runs).returncode, 1)   # the speed gate still stops it
+
+    def test_no_slower_rise_stops(self):
+        # a fix that costs 5 % on its lane (noise 0.4 %) stops before the bench
+        r = self.gate(self.abba((1000.0, 1004.0), (1050.0, 1052.0)), "--no-slower", "0.5")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("targeted lane got slower beyond noise", r.stdout)
+
+    def test_no_slower_keeps_other_guards(self):
+        r = self.gate(self.abba((1000.0, 1004.0), (1003.0, 1005.0), cgemm=(1100.0, 1100.0)), "--no-slower", "0.5", "--guard-others", "2")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("another lane got slower", r.stdout)
+
     def test_min_drop_pct(self):
         r = self.gate(self.abba((1000.0, 1010.0), (935.0, 940.0)), "--min-drop-pct", "10")
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)

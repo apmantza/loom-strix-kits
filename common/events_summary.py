@@ -19,6 +19,9 @@ usage: events_summary.py MODEL.json RUN [RUN ...] [--top 12] [--split KERNEL[:CU
   other lane's candidate mean is above its reference by more than max(its noise, PCT); a lane that cannot be measured stops.
   Prints the (kernel, workgroups) present only in the candidate runs or only in the reference runs; --expect-kernel REGEX
   stops when no candidate-only kernel name matches (the switch did not reach serving). Exit 1 = STOP.
+  --no-slower PCT: for a change whose goal is 'not slower' (a correctness fix, an exact layout change; HRX-like E466: q179's NaN fix
+  tied +0.20 % inside 0.38 % noise and the speed gate stopped it): the targeted lane passes unless it rose by more than
+  max(noise, PCT). The guards on the other lanes and --expect-kernel apply as before.
 """
 import argparse
 import glob
@@ -166,6 +169,10 @@ def lane_gate(a, d, res):
             bar = max(noise, a.min_drop_pct) if ok else float("nan")
             if not ok:
                 stops.append(f"targeted lane {name} cannot be measured in these runs")
+            elif a.no_slower is not None:
+                tie = max(noise, a.no_slower)
+                if chg > tie:
+                    stops.append(f"targeted lane got slower beyond noise: {chg:+.2f} % (bar +{tie:.2f} %)")
             elif not -chg > bar:
                 stops.append(f"targeted lane did not move beyond noise: skip the bench ({chg:+.2f} %, bar -{bar:.2f} %)")
         elif a.guard_others is not None:
@@ -187,7 +194,8 @@ def lane_gate(a, d, res):
         if not any(rx.search(k) for k, _ in ck - rk):
             stops.append(f"no candidate-only kernel matches {a.expect_kernel!r}: the switch did not reach serving")
     print("\nLANE GATE: " + (f"STOP ({'; '.join(stops)})" if stops else
-                              f"PASS-TO-BENCH ({names[gi]} dropped beyond noise; the agent bench decides)"))
+                              (f"PASS-TO-BENCH ({names[gi]} not slower beyond noise; the agent bench decides)" if a.no_slower is not None
+                               else f"PASS-TO-BENCH ({names[gi]} dropped beyond noise; the agent bench decides)")))
     return 1 if stops else 0
 
 
@@ -214,6 +222,7 @@ def main():
     ap.add_argument("--cand", help="--gate: candidate run positions, 1-based, e.g. 2,3")
     ap.add_argument("--min-drop-pct", type=float, default=0.0, help="--gate: the drop must also exceed this (%%)")
     ap.add_argument("--guard-others", type=float, help="--gate: stop when another lane rises by more than max(noise, this %%)")
+    ap.add_argument("--no-slower", type=float, help="--gate: pass unless the targeted lane rose by more than max(noise, this %%) (a fix)")
     ap.add_argument("--expect-kernel", help="--gate: stop unless a candidate-only kernel name matches this regex")
     a = ap.parse_args()
     d = json.load(open(a.model))
