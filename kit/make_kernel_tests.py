@@ -2209,6 +2209,108 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and _F16O_K:
 {_tail}  check.return
 }}
 """)
+# 3a''-o. F16O_O (HRX-like E375, kit f16o_o.py): the attention / GDN output producers' f16 copies must equal the live chain bit for bit:
+# the f32 producer then g_row_scale_f16_live_lv (f16 rows at the padded stride + row scales). Exact while every live row's max|o| <
+# 2^14 (row scale 1); E375: every served row < 2^11. @f16oo_eq_gdn_norm_gate: 64 rows of max ~10, 5 dead (info word 2 = 0: no f16
+# row, scales (0, 0)); o16 and scales equal. @f16oo_big_gdn_norm_gate: one row near 1.5 x 2^15 (z constant), where the live chain's
+# scale is 2^-2 and F16O's stays 1. The combine pair (kto_: the f32 reference copy, kt_: the f16o copy; ktest_variants.listed_copy,
+# the count a scalar, the list every token): the f16 rows equal (it writes no scales: the GDN layer before it leaves (1, 1) / (0, 0)
+# in %s_o, f16o_o.py); @f16oo_big_combine_listed: the live chain's scales on one row near 1.5 x 2^15 are 2^-2, and (the negative
+# control) its f16 rows differ from F16O's, which are not rescaled.
+_OO = _pkg_llm_text() or ""
+if not KS and 'export("g_gdn_norm_gate_lv_f16o")' in _OO and cfg.get("recurrent_layers"):
+    from gen_gdn import gdn_geometry as _oo_geo
+    _og = _oo_geo(cfg); _VD, _DV = _og["VD"], _og["DV"]
+    _orng = np.random.default_rng(375)   # own stream: the other cases' inputs do not move with this block
+    _t = 64; _VP = _VD + _PFPAD
+    _raw = _orng.standard_normal((_t, _VD)).astype(np.float32); _z = _orng.standard_normal((_t, _VD)).astype(np.float32)
+    _nw = (1 + 0.1 * _orng.standard_normal(_DV)).astype(np.float32)
+    _dead = _orng.choice(_t, 5, replace=False)
+    _info = np.zeros((_t, 4), np.int32); _info[:, 2] = 1; _info[_dead, 2] = 0
+    _r3 = _raw.reshape(_t, -1, _DV).astype(np.float64)
+    _nr = _r3 / np.sqrt((_r3 ** 2).mean(-1, keepdims=True) + eps) * _nw
+    _oeq = np.abs(_nr * (_z.reshape(_nr.shape) / (1 + np.exp(-_z.reshape(_nr.shape))))).max()
+    assert _oeq < 2.0 ** 13, f"f16oo eq rows: max {_oeq:.1f} not below the exact condition with margin"
+    _br = int(np.setdiff1d(np.arange(_t), _dead)[7]); _zb = _z.copy()
+    _zb[_br] = 1.5 * 2 ** 15 / np.abs(_nr[_br]).max()   # silu(z) = z for z > 30 in f32: the row's max |o| ~ 1.5 x 2^15 (e = 2)
+    assert _zb[_br, 0] > 30, "f16oo big row: z too small for silu(z) = z"
+    _sbig = np.ones((_t, 2), np.float32); _sbig[_dead] = 0; _sbig[_br] = (2.0 ** -2, 2.0 ** 2)
+    _s1 = np.ones((_t, 2), np.float32); _s1[_dead] = 0
+    for _n, _a in (("oo_raw", _raw), ("oo_z", _z), ("oo_zb", _zb), ("oo_nw", _nw), ("oo_info", _info), ("oo_sbig", _sbig), ("oo_s1", _s1)):
+        save(_n, _a)
+    _RT, _HT, _ST = f"tensor<{_t}x{_VD}xf32>", f"tensor<{_t}x{_VP}xf16>", f"tensor<{_t}x2xf32>"
+    for _case, _zn in (("eq", "oo_z"), ("big", "oo_zb")):
+        _tail = (f"  check.expect.equal actual(%hb) expected(%ha) : {_HT}\n  check.expect.equal actual(%sb) expected(%sa) : {_ST}\n"
+                 if _case == "eq" else f"""  %esa = check.file.read.npy path("oo_sbig.npy") : {_ST}
+  %esb = check.file.read.npy path("oo_s1.npy") : {_ST}
+  check.expect.equal actual(%sa) expected(%esa) : {_ST}
+  check.expect.equal actual(%sb) expected(%esb) : {_ST}
+""")
+        cases.append(f"""check.case public @f16oo_{_case}_gdn_norm_gate {{
+  %t = check.literal value({_t}) : index
+  %n = check.literal value({_VD}) : index
+  %info = check.file.read.npy path("oo_info.npy") : tensor<{_t}x4xi32>
+  %raw = check.file.read.npy path("oo_raw.npy") : {_RT}
+  %z = check.file.read.npy path("{_zn}.npy") : {_RT}
+  %nw = check.file.read.npy path("oo_nw.npy") : tensor<{_DV}xf32>
+  %o = check.generate.fill value(0.0) : {_RT}
+  %ha = check.generate.fill value(0.0) : {_HT}
+  %hb = check.generate.fill value(0.0) : {_HT}
+  %sa = check.generate.fill value(7.0) : {_ST}
+  %sb = check.generate.fill value(7.0) : {_ST}
+  kernel.launch @g_gdn_norm_gate_lv[%t](%t, %info, %raw, %nw, %z, %o) : [index](index, tensor<{_t}x4xi32>, {_RT}, tensor<{_DV}xf32>, {_RT}, {_RT})
+  kernel.launch @g_row_scale_f16_live_lv[%t](%t, %info, %n, %o, %sa, %ha) : [index](index, tensor<{_t}x4xi32>, index, {_RT}, {_ST}, {_HT})
+  kernel.launch @g_gdn_norm_gate_lv_f16o[%t](%t, %info, %raw, %nw, %z, %hb, %sb) : [index](index, tensor<{_t}x4xi32>, {_RT}, tensor<{_DV}xf32>, {_RT}, {_HT}, {_ST})
+{_tail}  check.return
+}}
+""")
+if not KS and 'export("g16_attention_combine_listed_f16o")' in _OO:
+    import ktest_variants as _oo_kv
+    _ref = _oo_kv.listed_copy(_OO, "g16_attention_combine_listed"); _cp = _oo_kv.listed_copy(_OO, "g16_attention_combine_listed_f16o")
+    assert _ref and _cp, "f16oo: no listed copy of the combine kernels"
+    cases.append(_ref.replace("kt_g16_attention_combine_listed", "kto_g16_attention_combine_listed"))   # kto_: not counted as K's test
+    cases.append(_cp)
+    _orng = np.random.default_rng(376)
+    _t, _QD = 64, QH * D; _QP = _QD + _PFPAD
+    assert D == 256, "f16oo combine: 32 lanes x 8 values per head"
+    _info = np.zeros((_t, 4), np.int32); _info[:, 1] = _orng.integers(0, 6000, _t); _info[:, 2] = 1
+    _dead = _orng.choice(_t, 5, replace=False); _info[_dead, 2] = 0
+    _ml = np.stack([_orng.standard_normal((_t, QH, 16)), _orng.uniform(0.5, 2.0, (_t, QH, 16))], -1).astype(np.float32)
+    _acc = _orng.standard_normal((_t, QH, 16, 32, 8)).astype(np.float32)
+    _gt = _orng.standard_normal((_t, _QD)).astype(np.float32)
+    # a convex combination of acc_s / l_s, times sigmoid(gate) < 1: |o| <= max|acc| / min l
+    assert np.abs(_acc).max() / 0.5 < 2.0 ** 13, "f16oo combine eq rows: not below the exact condition with margin"
+    _br = int(np.setdiff1d(np.arange(_t), _dead)[7]); _accb = _acc.copy(); _gb = _gt.copy()
+    _cb = 1.5 * 2 ** 15 * (1 + 0.01 * _orng.standard_normal((QH, 32, 8)))   # acc_s = C l_s on the big row: o = C sigmoid(30) = C
+    _accb[_br] = (_cb[:, None] * _ml[_br, :, :, 1][:, :, None, None]).astype(np.float32); _gb[_br] = 30.0
+    _sbig = np.ones((_t, 2), np.float32); _sbig[_dead] = 0; _sbig[_br] = (2.0 ** -2, 2.0 ** 2)
+    for _n, _a in (("ooc_info", _info), ("ooc_ml", _ml.reshape(-1)), ("ooc_acc", _acc.reshape(-1)), ("ooc_accb", _accb.reshape(-1)),
+                   ("ooc_g", _gt), ("ooc_gb", _gb), ("ooc_list", np.arange(_t, dtype=np.int32)), ("ooc_sbig", _sbig)):
+        save(_n, _a)
+    _OT, _HT, _PT, _MT = f"tensor<{_t}x{_QD}xf32>", f"tensor<{_t}x{_QP}xf16>", f"tensor<{_acc.size}xf32>", f"tensor<{_ml.size}xf32>"
+    _sig = lambda out: f"[index](index, tensor<{_t}xi32>, i32, tensor<{_t}x4xi32>, {_PT}, {_MT}, {_OT}, {out})"
+    for _case, _an, _gn in (("eq", "ooc_acc", "ooc_g"), ("big", "ooc_accb", "ooc_gb"), ("big_negcontrol", "ooc_accb", "ooc_gb")):
+        _tail = (f'  %esa = check.file.read.npy path("ooc_sbig.npy") : tensor<{_t}x2xf32>\n  check.expect.equal actual(%sa) expected(%esa) : tensor<{_t}x2xf32>\n'
+                 if _case == "big" else f"  check.expect.equal actual(%hb) expected(%ha) : {_HT}\n")
+        cases.append(f"""check.case public @f16oo_{_case}_combine_listed {{
+  %t = check.literal value({_t}) : index
+  %n = check.literal value({_QD}) : index
+  %sliding = check.literal value(0) : i32
+  %list = check.file.read.npy path("ooc_list.npy") : tensor<{_t}xi32>
+  %info = check.file.read.npy path("ooc_info.npy") : tensor<{_t}x4xi32>
+  %pacc = check.file.read.npy path("{_an}.npy") : {_PT}
+  %pml = check.file.read.npy path("ooc_ml.npy") : {_MT}
+  %g = check.file.read.npy path("{_gn}.npy") : {_OT}
+  %o = check.generate.fill value(0.0) : {_OT}
+  %ha = check.generate.fill value(0.0) : {_HT}
+  %hb = check.generate.fill value(0.0) : {_HT}
+  %sa = check.generate.fill value(7.0) : tensor<{_t}x2xf32>
+  kernel.launch @kto_g16_attention_combine_listed[%t](%t, %list, %sliding, %info, %pacc, %pml, %g, %o) : {_sig(_OT)}
+  kernel.launch @g_row_scale_f16_live_lv[%t](%t, %info, %n, %o, %sa, %ha) : [index](index, tensor<{_t}x4xi32>, index, {_OT}, tensor<{_t}x2xf32>, {_HT})
+  kernel.launch @kt_g16_attention_combine_listed_f16o[%t](%t, %list, %sliding, %info, %pacc, %pml, %g, %hb) : {_sig(_HT)}
+{_tail}  check.return
+}}
+""")
 # 3a'''. EPI_FUSE (HRX-like E200, kit epi_fuse.py): two chains on the same inputs must agree bit for bit (check.expect.equal).
 # resid: f16 store m256 GEMM -> y, then g_post_add_norm_rs_live[_noh]_lv (x += y; norm)  vs  f16 acc m256 GEMM (x += acc * inv),
 # then g_add_norm_rs_live[_noh]_lv (reads x only; its y operand is a 7.0-filled decoy). x, h16, scales (and h, unless _noh) equal;
@@ -3705,6 +3807,50 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
                             ("g_attention_flash2", "g_attention_flash2_partial")).replace("f_arena_a.npy", "f_arena_nan.npy"))
     cases += [invariance_case(s, st) for s in ((0, 1) if WIN else (0,)) for st in (5, 0, 'zero')]
     cases += [order_case(s) for s in ((0, 1) if WIN else (0,))]
+    # F16O_O (HRX-like E375, kit f16o_o.py): the f16-output flash kernels (whole and partial tiles) against the live chain, the f32
+    # kernels then g_row_scale_f16_live_lv over every row, bit for bit. One epoch whose live tokens are all the flash kernels'
+    # (a 100-token run with partial head and tail blocks, a 9-token run, three aligned whole tiles) plus padding: the dead rows
+    # are no kernel's (f16 rows untouched, 0); the scales are the GDN producer's (f16oo_*_gdn_norm_gate). @flash_prefill_f16oo_eq:
+    # |o| <= max|V| < 2^13. @flash_prefill_f16oo_big: V ~ 1.5 x 2^15 and gate 30, every live row's max in [2^15, 2^16): the live
+    # chain's scales are 2^-2 there; @flash_prefill_f16oo_big_negcontrol: its f16 rows differ from F16O's (not rescaled).
+    if not KS and 'export("g_attention_flash2_f16o")' in (_pkg_llm_text() or ""):
+        _oi3 = epoch_info([(1, 301, 100), (0, 1013, 9), (2, 64, 48), (None, 0, 11)]); _ot = len(_oi3); _oqd = QH * D
+        _oinfo = np.zeros((_ot, 4), np.int32); _oinfo[:, :3] = _oi3
+        assert (flash_covered(_oinfo) == (_oinfo[:, 2] != 0)).all(), "f16oo flash: a live token outside the flash kernels"
+        _orng = np.random.default_rng(377)
+        _oq = (_orng.standard_normal((_ot, _oqd)) * 2.5).astype(np.float32); _og = _orng.standard_normal((_ot, _oqd)).astype(np.float32)
+        assert np.abs(arena_a_raw[1].astype(np.float32)).max() < 2.0 ** 13, "f16oo flash eq: V not below the exact condition"
+        _ab = arena_a_raw.copy(); _ab[1] = (1.5 * 2 ** 15 * (1 + 0.01 * _orng.standard_normal(_ab[1].shape))).astype(np.float16)
+        save("foo_arena_big", kv_arena(_ab)[0] if KV8_LIVE else _ab.reshape(-1))
+        _osb = np.zeros((_ot, 2), np.float32); _osb[_oinfo[:, 2] != 0] = (2.0 ** -2, 2.0 ** 2)
+        for _n, _a in (("foo_info", _oinfo), ("foo_q", _oq), ("foo_g", _og), ("foo_gb", np.full_like(_og, 30.0)), ("foo_sbig", _osb)):
+            save(_n, _a)
+        _OT, _HT, _IT = f"tensor<{_ot}x{_oqd}xf32>", f"tensor<{_ot}x{_oqd + _PFPAD}xf16>", f"tensor<{_ot}x4xi32>"
+        for _case, _arn, _gn in (("eq", "f_arena_a", "foo_g"), ("big", "foo_arena_big", "foo_gb"), ("big_negcontrol", "foo_arena_big", "foo_gb")):
+            _fl = lambda k, sfx, out, oty: (f"  kernel.launch @{k}[%t](%t, %layer, %sliding, %ctx, %pool, %q, %g, %info, %tiles{sfx}, %orig, %arena, {out}) : "
+                                            f"[index](index, index, i32, index, index, {_OT}, {_OT}, {_IT}, tensor<{_ot}xi32>, {OA}, {AA}, {oty})\n")
+            _tail = (f'  %esa = check.file.read.npy path("foo_sbig.npy") : tensor<{_ot}x2xf32>\n  check.expect.equal actual(%sa) expected(%esa) : tensor<{_ot}x2xf32>\n'
+                     if _case == "big" else f"  check.expect.equal actual(%hb) expected(%ha) : {_HT}\n")
+            cases.append(f"""check.case public @flash_prefill_f16oo_{_case} {{
+  %t = check.literal value({_ot}) : index
+  %n = check.literal value({_oqd}) : index
+  %layer = check.literal value(0) : index
+  %sliding = check.literal value(0) : i32
+  %ctx = check.literal value({ctx_a}) : index
+  %pool = check.literal value({pool_a}) : index
+  %q = check.file.read.npy path("foo_q.npy") : {_OT}
+  %g = check.file.read.npy path("{_gn}.npy") : {_OT}
+  %info = check.file.read.npy path("foo_info.npy") : {_IT}
+  %orig = check.file.read.npy path("f_orig_a.npy") : {OA}
+  %arena = check.file.read.npy path("{_arn}.npy") : {AA}
+  %o = check.generate.fill value(0.0) : {_OT}
+  %ha = check.generate.fill value(0.0) : {_HT}
+  %hb = check.generate.fill value(0.0) : {_HT}
+  %sa = check.generate.fill value(7.0) : tensor<{_ot}x2xf32>
+{list_launch("%t", _ot, "%info", "a")}{_fl("g_attention_flash2", "a", "%o", _OT)}{_fl("g_attention_flash2_partial", "a", "%o", _OT)}  kernel.launch @g_row_scale_f16_live_lv[%t](%t, %info, %n, %o, %sa, %ha) : [index](index, {_IT}, index, {_OT}, tensor<{_ot}x2xf32>, {_HT})
+{list_launch("%t", _ot, "%info", "b")}{_fl("g_attention_flash2_f16o", "b", "%hb", _HT)}{_fl("g_attention_flash2_partial_f16o", "b", "%hb", _HT)}{_tail}  check.return
+}}
+""")
 
 # 6. MoE (gen_moe.py) on real tensors, one layer per expert-down format: the decode chain (router -> top-k ->
 # gate/up -> down -> combine, plus the prefill router with padding tokens) and the prefill chain (prefill router ->

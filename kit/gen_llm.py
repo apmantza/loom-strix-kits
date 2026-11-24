@@ -6571,6 +6571,8 @@ if __name__ == "__main__":
         text = kv8_late.apply(text)
     import f16o11   # F16O11=1 (HRX-like E180): the f16 swiglu GEMM writes the row-scaled f16 copy itself; unset: unchanged
     text = f16o11.apply(text, L)
+    import f16o_o   # F16O_O=1 (HRX-like E375): the attention / GDN output producers write %o16 (and %s_o) themselves; unset: unchanged
+    text = f16o_o.apply(text, L)
     if os.environ.get("GEMM256_FLATADDR", "0") not in ("", "0", "false", "no", "off"):   # kit/gemm_flataddr.py (HRX-like E345): on the final text
         from gemm_flataddr import flataddr
         _ks = list(re.finditer(r'^kernel\.def (?:target\(@rdna3\) )?export\("(g_gemm_f16_\w*_m256)"\).*?\n\} launch\(.*?\n\}\n', text, re.S | re.M))
