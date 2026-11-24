@@ -26,6 +26,8 @@
 - **A data-dependency pin must hold for every value, NaN included**: dead padding columns read stale workspace (E123).
 - **A loop-carried converted value drags its loads' wait into the issuing iteration** (E109): carry raw codes.
 - **Spills and global loads share vmcnt**: any spill drains the prefetch (gfx11).
+- **f16 accumulation is not free speed on gfx1151**: strix-llama.cpp measured it 6.9 % slower than f32 (their #193); weigh that before
+  an inexact f16 accumulator (HRX-like E394).
 - **I2: a token's result must not depend on its span** (alone == in span, atol 0). Partitions (split-K boundaries) must
   depend on the token's position only (E144: absolute key splits sized by a 4096-position bucket).
 - **LLVM 21's llvm-objdump mis-decodes gfx1151** (E230): it cannot decode `v_cmp_*_e64` with an SGPR result, prints `.long` plus a

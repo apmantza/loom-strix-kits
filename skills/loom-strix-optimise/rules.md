@@ -156,6 +156,10 @@ more bytes than Strata's' after checking only Strata's file; our generator's doc
   client's injected text is not the live input (E104).
 - **Quality-affecting formats need a quality gate on long context** (agreement and needles at 26k-200k, E75), not only
   short prompts. Precision changes go live only by the owner's decision.
+- **Judge a non-exact change by its divergence against the reference's own noise, never an absolute bar** (strix-llama.cpp review
+  practice): the candidate's mean KL against the reference counts only beyond the reference's KL against itself under a change that
+  should be harmless (the same weights at another verify width or batch: t1 vs t8). GGUF-level changes: common/quant_eval.sh (llama.cpp
+  --kl-divergence); a kernel change needs the serving engine's logits. A pass still needs the long-context gate and the owner.
 
 ## 5. Measurement hygiene
 
@@ -164,6 +168,13 @@ more bytes than Strata's' after checking only Strata's file; our generator's doc
   reference in both ABBA halves; prefill and TTFT no more than 3 % worse); a looping output (8-gram repeat share >= 0.5) is not a speed
   result (common/checks.py, E212; from sybil-solutions/inference-optimisation-skill: a 117 tok/s 'record' there was a list stuck in a loop).
 - Decide sub-noise changes on device time per verify step, not tokens/s (sub-noise gains tie in a 5-round A/B; the per-kernel profile shows them in minutes).
+- **An A/A floor counts server starts, not turns.** A floor from one start per arm (prefill 0.2 %) called an identical copy's
+  prefill 6.1 % slower on another night (1.061 [1.031, 1.089]; the swapped-label rerun read 1.004), and the same package's late long
+  turns moved +6.9 % decode / -18 % prefill between two starts of different memory state (HRX-like E473 / E475). Measure the floor over
+  >= 4 starts per arm; until then agent_ab's prefill floor is 7 % and prefill kernels are judged on served device time (events_ab).
+- **A shape-dependent switch owns a shape region only where it wins on every measured shape in it, with >= 3 shapes per region**
+  (strix-llama.cpp's dispatch tables): a threshold set from one shape hands the shapes beside it to a variant that loses there
+  (HRX-like E11 / E12: a row threshold extended to every format was rejected).
 - Ablate with realistic data on a power-limited chip; constant operands raise clocks (E15 vs E24).
 - An isolated kernel A/B is a hypothesis until the harness reproduces the live kernel's served time at the served shape (same
   kernel timed both ways). A flash2 trim measured 0.93-0.96 in isolation at every chunk and context, and 1.039 served in every
