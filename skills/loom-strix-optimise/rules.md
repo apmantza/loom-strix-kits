@@ -176,6 +176,12 @@ more bytes than Strata's' after checking only Strata's file; our generator's doc
   (strix-llama.cpp's dispatch tables): a threshold set from one shape hands the shapes beside it to a variant that loses there
   (HRX-like E11 / E12: a row threshold extended to every format was rejected).
 - Ablate with realistic data on a power-limited chip; constant operands raise clocks (E15 vs E24).
+- **At a power cap the clock follows temperature, and a compute-bound kernel's time follows the clock.** At 85 W the prefill clock
+  read 2.22 / 2.20 / 2.17 / 2.11 GHz at 74 / 78 / 83 / 89 C across four server starts, while the GEMM lane's cycles stayed at
+  239-241 G (+-0.5 %): its seconds moved 5 % with nothing changed. A latency-bound kernel (flash2, 126-136 G cycles) does not scale
+  this way. Compare a compute-bound lane across starts in cycles (device time x the run's busy clock), record temperature beside every
+  run, and check a 'memory state' explanation against temperature before believing it (HRX-like E482: the 'fragmented' run was also
+  the hottest). The 0.1 s telemetry cannot attribute clock to lanes that interleave faster than that.
 - An isolated kernel A/B is a hypothesis until the harness reproduces the live kernel's served time at the served shape (same
   kernel timed both ways). A flash2 trim measured 0.93-0.96 in isolation at every chunk and context, and 1.039 served in every
   decile of an 81k prefill (HRX-like E313 / E316); scattered pages explained part of it. A candidate goes forward on the served
