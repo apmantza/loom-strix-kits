@@ -25,7 +25,8 @@
 #   AB_SERVE   command prefix: AB_SERVE PKG serves PKG, AB_SERVE --restore hands the port back (default: bash common/serve_as.sh KIT)
 #   AB_STOP    command that stops the bench server before each cooling wait (default: lsk_stop, which also runs LSK_STOP_HOOK)
 #   AB_REPLAY  the replay script (default common/agent_bench/replay.py)
-#   AB_CPU_MAX other CPU in cores above which a sample counts toward CONTAMINATED (default 2)
+#   AB_CPU_MAX other CPU in cores above which a sample counts toward CONTAMINATED (default 3: this box idles at other-CPU median 1.4, p90 2.4
+#              cores (q166, 11-24); E415's real contamination was ~7 cores)
 # usage: agent_ab.sh KIT PKG_A PKG_B OUT_DIR SESSION.json
 set -u -o pipefail
 . "$(dirname "$0")/env.sh"; lsk_load "${1:?usage: agent_ab.sh KIT PKG_A PKG_B OUT_DIR SESSION}"
@@ -54,7 +55,7 @@ run() {   # half, package, first turn
   python3 "$H/gpu_telemetry.py" record "$OUT/$tag.tel.tsv" --pid "${spid:-none}" & TEL=$!
   "$T" "$REPLAY" "$SESSION" http://127.0.0.1:$PORT "$KIT_MODEL_ID" --kind loom --mode fixed \
     --turns "$3:" --every 4 --sampling card --seed 1 --label "$(basename "$2")" --log "$OUT/$tag.jsonl" > "$OUT/$tag.out" 2>&1; rc=$?
-  kill $TEL 2>/dev/null; python3 "$H/gpu_telemetry.py" summary "$OUT/$tag.tel.tsv" "$tag" --cpu-max "${AB_CPU_MAX:-2}" | tee "$OUT/$tag.tel.txt"
+  kill $TEL 2>/dev/null; python3 "$H/gpu_telemetry.py" summary "$OUT/$tag.tel.tsv" "$tag" --cpu-max "${AB_CPU_MAX:-3}" | tee "$OUT/$tag.tel.txt"
   [ $rc = 0 ] || { echo "agent_ab STOP: replay $2 ($OUT/$tag.out)"; tail -5 "$OUT/$tag.out"; exit 2; }
   grep -q '"errors": 0' "$OUT/$tag.out" || { echo "agent_ab STOP: replay errors on $2 ($OUT/$tag.out)"; exit 2; }
   echo "$tag done $(date +%T)"
@@ -157,6 +158,9 @@ for tag in tags:
     print(f"environment changed before {tag}:" if d[-1] == "exit 1" else f"environment not comparable before {tag}:")
     print("\n".join("  " + l for l in d[:-1]) or "  (no output)")
     keys = [l.split(": ", 1)[0] for l in d[:-1]] if d[-1] == "exit 1" else (d[:-1] or [d[-1]])
+    # kit_commit alone is reported, not distrusted (E438): the packages' model.json hashes are the bench's identity, and a commit to the kit
+    # during a bench (q166, 11-24) changes no package being benched
+    if d[-1] == 'exit 1' and set(keys) <= {'kit_commit'}: continue
     untrusted.append(f"environment {'changed' if d[-1] == 'exit 1' else 'not comparable'} before {tag}: {', '.join(keys)}")
 # the verdict (E374): CI excludes 1.0 AND the ratio is beyond the A/A floor
 def judge(key):

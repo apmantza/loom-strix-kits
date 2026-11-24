@@ -5,7 +5,10 @@ Reports, per stream: decode tok/s split by what the OTHER streams were doing at 
 share of decode time in each phase, TTFT p50 / p95, and re-prefill events (a turn whose prefill covers ~its whole history:
 eviction, or a continuation miss when the previous reply hit its cap and the client's history changed). Per cell: aggregate
 decode tok/s over the cell's wall time; with --solo (the same streams run one at a time), one stream alone against the N-stream
-total and exactness (each stream's replies == its solo replies, by reply hash; a planted difference must be caught first);
+total, exactness (each stream's replies == its solo replies, by reply hash; a planted difference must be caught first) and
+work-normalised throughput (throughput(): tokens per wall second per arm, prefill / decode seconds per token, the aggregate
+while every stream decodes, and the cell's wall for the solo arm's token counts, priced per turn at the solo costs, with a
+bootstrap CI; E449: an own-mode cell does other work than its solo arm, so the raw wall ratio is not a throughput figure);
 with --ref (another package's cell, same streams) the paired per-turn decode / prefill ratio against --floor (the kit's A/A noise
 floor: an argument, measured per kit).
 
@@ -28,6 +31,7 @@ import copy
 import json
 import math
 import os
+import random
 import statistics
 import sys
 
@@ -125,8 +129,10 @@ def pct(xs, q):
     return s[min(len(s) - 1, max(0, math.ceil(q / 100 * len(s)) - 1))]
 
 
-def reprefills(rows):
-    """turns after a contiguous predecessor whose new tokens are >= 90 % of the prompt: the retained history was not used"""
+def reprefills(rows, fixed=False):
+    """turns after a contiguous predecessor whose new tokens are >= 90 % of the prompt: the retained history was not used.
+    fixed: a fixed-mode replay (replay.py --mode fixed) re-sends the RECORDED reply, never the engine's, so every turn misses
+    its retained tip and falls back to whatever prefix the cache captured (E105): a whole re-prefill is not attributable"""
     ev, prev = [], None
     for r in rows:
         if r.get("error"):
@@ -135,7 +141,8 @@ def reprefills(rows):
         if prev is not None and prev["turn"] == r["turn"] - 1 and r["prompt"] > 0 and r["new"] >= 0.9 * r["prompt"]:
             miss = prev.get("cap") is not None and prev["out"] >= prev["cap"]
             ev.append({"turn": r["turn"], "prompt": r["prompt"], "new": r["new"], "ttft": r["ttft"],
-                       "kind": "continuation miss (previous reply hit its cap)" if miss else "eviction"})
+                       "kind": "fixed-mode miss (eviction not attributable)" if fixed else
+                       "continuation miss (previous reply hit its cap)" if miss else "eviction"})
         prev = r
     return ev
 
@@ -179,7 +186,7 @@ def cell(records):
         st["by_phase"] = {p: {"tok_s": round(tok[p] / sec[p], 2) if sec[p] else None, "time_share": round(sec[p] / total, 3) if total else None}
                           for p in PHASES}
         st["sliced_prefill_overlap"] = round(overlap / total, 3) if total else None
-        st["reprefills"] = reprefills(d["rows"])
+        st["reprefills"] = reprefills(d["rows"], fixed=d["summary"].get("mode") == "fixed")
         st["span"] = (min(s for _, s, _, _ in tl[lab]), max(e for _, _, _, e in tl[lab])) if tl[lab] else None
         res["streams"][lab] = st
     spans = [st["span"] for st in res["streams"].values() if st["span"]]
@@ -242,6 +249,101 @@ def ref_compare(cand, ref, floor):
     return out
 
 
+def apportion(intervals):
+    """[(lo, hi, key)] -> {key: seconds}: every instant of the arm's wall split evenly among the turns in flight then (time with
+    none in flight is left out); a turn's share of a wall the streams shared, so per-turn units can be resampled"""
+    cuts = sorted({x for lo, hi, _ in intervals for x in (lo, hi)})
+    share = {k: 0.0 for _, _, k in intervals}
+    for lo, hi in zip(cuts, cuts[1:]):
+        live = [k for a, b, k in intervals if a < hi and b > lo]
+        for k in live:
+            share[k] += (hi - lo) / len(live)
+    return share
+
+
+def all_decoding(tl):
+    """(seconds, tokens) while EVERY stream of the cell decodes: each turn's tokens spread evenly over its decode interval"""
+    iv = [(f, e, (r["out"] - 1) / (e - f), lab) for lab, rows in tl.items() for r, _, f, e in rows if e > f and r["out"] > 1]
+    cuts = sorted({x for lo, hi, _, _ in iv for x in (lo, hi)})
+    sec = tok = 0.0
+    for lo, hi in zip(cuts, cuts[1:]):
+        live = [(rate, lab) for a, b, rate, lab in iv if a < hi and b > lo]
+        if {lab for _, lab in live} == set(tl):
+            sec += hi - lo
+            tok += sum(rate for rate, _ in live) * (hi - lo)
+    return sec, tok
+
+
+def throughput(conc, solo, iters=2000, seed=1, min_new=64, min_dec=8):
+    """Work-normalised throughput of the concurrent cell against the same streams run one after another (E449: the arms of an
+    own-mode cell did different work, so the raw wall ratio was mostly less output). Paired units = (stream, turn) present in
+    both. A unit's work is in solo-seconds: its tokens priced at what that turn cost alone (prefill s per new token, decode s
+    per output token after the first; a turn with < min_new new / < min_dec decode tokens alone uses its fixed TTFT / the solo
+    arm's pooled decode cost). A unit's wall is its share of its arm's wall (apportion; idle gaps spread pro rata). Speedup =
+    (work / wall of the cell) / (work / wall of the solo arm), with a bootstrap 95 % interval over the units."""
+    ctl = {lab: timeline(d["rows"])[0] for lab, d in conc.items()}
+    stl = {lab: timeline(d["rows"])[0] for lab, d in solo.items()}
+    c_span = [x for rows in ctl.values() for x in rows]
+    c_wall = max(e for _, _, _, e in c_span) - min(s for _, s, _, _ in c_span)
+    s_wall = sum(max(e for _, _, _, e in rows) - min(s for _, s, _, _ in rows) for rows in stl.values() if rows)
+    csh = apportion([(s, e, (lab, r["turn"])) for lab, rows in ctl.items() for r, s, _, e in rows])
+    ssh = {}
+    for lab, rows in stl.items():   # one stream at a time: each turn owns its own wall
+        ssh.update(apportion([(s, e, (lab, r["turn"])) for r, s, _, e in rows]))
+    cf, sf = c_wall / sum(csh.values()), s_wall / sum(ssh.values())
+    s_ok = [r for d in solo.values() for r in d["rows"] if not r.get("error")]
+    pooled_dec = sum(r["gen_s"] for r in s_ok) / max(1, sum(max(0, r["out"] - 1) for r in s_ok))
+    units, unpaired = [], 0
+    for lab, rows in ctl.items():
+        alone = {r["turn"]: r for r, _, _, _ in stl.get(lab, [])}
+        for r, _, _, _ in rows:
+            x = alone.get(r["turn"])
+            if x is None:
+                unpaired += 1
+                continue
+
+            def work(y, x=x):
+                pre = x["ttft"] * y["new"] / x["new"] if x["new"] >= min_new else x["ttft"]
+                dx, dy = max(0, x["out"] - 1), max(0, y["out"] - 1)
+                return pre + (x["gen_s"] * dy / dx if dx >= min_dec else pooled_dec * dy)
+            units.append({"label": lab, "turn": r["turn"], "c_work": work(r), "s_work": work(x),
+                          "c_wall": csh[(lab, r["turn"])] * cf, "s_wall": ssh[(lab, x["turn"])] * sf,
+                          "c": r, "s": x})
+    if not units:
+        return None
+
+    def stat(ix):
+        cw, cl = sum(units[i]["c_work"] for i in ix), sum(units[i]["c_wall"] for i in ix)
+        sw, sl = sum(units[i]["s_work"] for i in ix), sum(units[i]["s_wall"] for i in ix)
+        return (cw / cl) / (sw / sl)
+    idx = list(range(len(units)))
+    rng = random.Random(seed)
+    boots = sorted(stat([rng.choice(idx) for _ in idx]) for _ in range(iters))
+
+    def arm(side, wall):
+        rows = [u[side] for u in units]
+        pre_n, out_n = sum(r["new"] for r in rows), sum(r["out"] for r in rows)
+        dec_n = sum(max(0, r["out"] - 1) for r in rows)
+        ttft = [r["ttft"] for r in rows]
+        return {"wall_s": round(wall, 1), "prefill_tokens": pre_n, "output_tokens": out_n,
+                "prefill_tok_per_wall_s": round(pre_n / wall, 1), "output_tok_per_wall_s": round(out_n / wall, 2),
+                "prefill_ms_per_tok": round(1000 * sum(r["ttft"] for r in rows) / pre_n, 3) if pre_n else None,
+                "decode_ms_per_tok": round(1000 * sum(r["gen_s"] for r in rows) / dec_n, 2) if dec_n else None,
+                "ttft_p50": pct(ttft, 50), "ttft_p95": pct(ttft, 95),
+                "work_solo_s": round(sum(u[side[0] + "_work"] for u in units), 1)}
+    c_l, s_l = sum(u["c_wall"] for u in units), sum(u["s_wall"] for u in units)
+    res = {"paired_turns": len(units), "unpaired_turns": unpaired, "concurrent": arm("c", c_l), "solo": arm("s", s_l)}
+    both_s, both_t = all_decoding(ctl)
+    res["all_decoding"] = {"seconds": round(both_s, 1), "wall_share": round(both_s / c_wall, 3) if c_wall else None,
+                           "aggregate_tok_s": round(both_t / both_s, 2) if both_s else None}
+    cw, sw = res["concurrent"]["work_solo_s"], res["solo"]["work_solo_s"]
+    res["same_work_concurrent_wall_s"] = round(c_l * sw / cw, 1) if cw else None
+    res["raw_wall_ratio"] = round(s_l / c_l, 4)
+    res["speedup"] = round(stat(idx), 4)
+    res["speedup_ci"] = [round(boots[int(0.025 * iters)], 4), round(boots[int(0.975 * iters) - 1], 4)]
+    return res
+
+
 def fmt(x, nd=1):
     return "-" if x is None else f"{x:.{nd}f}"
 
@@ -288,6 +390,8 @@ def main(argv=None):
             print(f"  re-prefill turn {ev['turn']}: {ev['new']} of {ev['prompt']} tokens new, TTFT {ev['ttft']} s: {ev['kind']}")
             if ev["kind"] == "eviction":
                 fail.append(f"{lab} turn {ev['turn']} re-prefilled its history (eviction)")
+            elif ev["kind"].startswith("fixed-mode"):
+                unknown.append(f"{lab} turn {ev['turn']} re-prefilled its history in fixed mode (eviction not attributable)")
         if st["errors"]:
             fail.append(f"{lab}: {st['errors']} failed turns")
     if not res["overlap"]:
@@ -322,6 +426,29 @@ def main(argv=None):
                     fail.append(f"{lab}: {e['mismatch']} turns differ from solo (first {e['first']})")
                 if e["missing"]:
                     unknown.append(f"exactness of {e['missing']} {lab} turns (no solo row)")
+        tp = throughput(conc, solo)
+        if tp is None:
+            unknown.append("work-normalised throughput (no (stream, turn) in both the cell and --solo)")
+        else:
+            res["throughput"] = tp
+            c, s = tp["concurrent"], tp["solo"]
+            print(f"work ({tp['paired_turns']} paired turns, {tp['unpaired_turns']} unpaired): prefill tokens {c['prefill_tokens']} concurrent vs "
+                  f"{s['prefill_tokens']} solo ({c['prefill_tokens'] / max(1, s['prefill_tokens']):.3f}), output {c['output_tokens']} vs "
+                  f"{s['output_tokens']} ({c['output_tokens'] / max(1, s['output_tokens']):.3f})")
+            print(f"  {'arm':<14}{'wall s':>8}{'prefill tok/wall-s':>20}{'out tok/wall-s':>16}{'prefill ms/tok':>16}{'decode ms/tok':>15}"
+                  f"{'ttft p50':>10}{'p95':>7}{'work solo-s':>13}")
+            for name, x in (("concurrent", c), ("one by one", s)):
+                print(f"  {name:<14}{x['wall_s']:>8.1f}{x['prefill_tok_per_wall_s']:>20.1f}{x['output_tok_per_wall_s']:>16.2f}"
+                      f"{fmt(x['prefill_ms_per_tok'], 2):>16}{fmt(x['decode_ms_per_tok'], 1):>15}{fmt(x['ttft_p50']):>10}{fmt(x['ttft_p95']):>7}"
+                      f"{x['work_solo_s']:>13.1f}")
+            ad = tp["all_decoding"]
+            print(f"  all streams decoding: {fmt(ad['aggregate_tok_s'], 2)} tok/s aggregate over {ad['seconds']} s "
+                  f"({fmt(ad['wall_share'], 3)} of the cell wall)")
+            print(f"  same work: the cell would need {tp['same_work_concurrent_wall_s']} s for the solo arm's tokens vs {s['wall_s']} s one by one: "
+                  f"work-normalised speedup {tp['speedup']} (95 % CI {tp['speedup_ci'][0]}-{tp['speedup_ci'][1]}, bootstrap over "
+                  f"{tp['paired_turns']} turns); raw wall ratio {tp['raw_wall_ratio']}")
+            if tp["unpaired_turns"]:
+                unknown.append(f"throughput: {tp['unpaired_turns']} cell turns without a solo row")
     else:
         unknown.append("exactness and share (no --solo)")
     if ref:

@@ -19,7 +19,7 @@ own mode with THAT log's replies as the history (none of this run's), so a turn 
 prompt the resumed run sent.
 
 usage: replay.py SESSION URL MODEL [--kind loom|llama|generic] [--mode fixed|own] [--turns A:B] [--every N]
-                 [--exact-length] [--effort LEVEL] [--label X] [--log FILE] [--keep-replies] [--history-from LOG]
+                 [--exact-length] [--max-out N] [--effort LEVEL] [--label X] [--log FILE] [--keep-replies] [--history-from LOG]
 """
 import argparse
 import json
@@ -52,6 +52,8 @@ ap.add_argument("--log", default=None)
 ap.add_argument("--sampling", default=None, help="'card' = the Qwen3.8-27B card's set (thinking: T 1.0, top_p 0.95, top_k 20; "
                 "effort none: T 0.7, top_p 0.8, top_k 20; E113), or a JSON object of body fields; default greedy (temperature 0)")
 ap.add_argument("--seed", type=int, default=None, help="with --sampling: per-turn seed SEED*100000+turn (same seed, same build: same text)")
+ap.add_argument("--max-out", type=int, default=0, help="fixed mode: cap each turn's output at N tokens (0 = the recorded length); "
+                "bounds a runaway reply (the next fixed-mode turn re-sends the recording anyway)")
 ap.add_argument("--salt", default="", help="prepended to the system prompt: a second concurrent stream of the same session shares no cached prefix")
 ap.add_argument("--keep-replies", action="store_true", help="store each turn's reply (reasoning, text, tool calls) in its row")
 ap.add_argument("--history-from", default=None, help="own mode: the history is the replies of this --keep-replies log (one record), "
@@ -59,6 +61,8 @@ ap.add_argument("--history-from", default=None, help="own mode: the history is t
 a = ap.parse_args()
 if a.mode == "own" and a.every != 1:
     sys.exit("--mode own replays a contiguous range of turns (the history is the engine's own output): drop --every")
+if a.max_out and a.mode != "fixed":
+    sys.exit("--max-out caps fixed-mode turns only: an own-mode reply cut short changes the next turn's history")
 if a.history_from and a.mode != "own":
     sys.exit("--history-from replaces the engine's own replies: it needs --mode own")
 
@@ -135,6 +139,8 @@ def run(k, own):
     # own mode: headroom over the recorded length, so a turn is not cut inside a tool call (a dropped call changes the
     # history the next turn re-sends and breaks continuation); fixed mode keeps the recorded length
     cap = max(1, t["rec_out"]) if own is None else max(2048, 2 * t["rec_out"])
+    if a.max_out and own is None:
+        cap = min(cap, a.max_out)
     body.update(engines.request_params(a.kind, a.effort or t["effort"], cap, a.exact_length and own is None))
     if a.sampling:
         body.update(sampling_for(body.get("reasoning_effort")))
@@ -236,7 +242,7 @@ wall = time.perf_counter() - t_all
 pre, gen = sum(r["ttft"] for r in res_ok), sum(r["gen_s"] for r in res_ok)
 newt, outt = sum(r["new"] for r in res_ok), sum(r["out"] for r in res_ok)
 summary = {"label": a.label, "model": a.model, "kind": a.kind, "mode": a.mode, "sampling": a.sampling, "seed": a.seed, "session": S["name"],
-           "effort": a.effort, "history_from": a.history_from, "turns": len(res_ok), "errors": len(errors),
+           "effort": a.effort, "history_from": a.history_from, "max_out": a.max_out or None, "turns": len(res_ok), "errors": len(errors),
            "session_wall_s": round(wall, 1), "prefill_s": round(pre, 1), "decode_s": round(gen, 1), "new_tokens": newt,
            "out_tokens": outt, "prefill_tps": round(newt / pre, 1) if pre else None, "decode_tps": round(outt / gen, 1) if gen else None,
            "cache_hit": round(sum(r["cached"] for r in res_ok) / max(1, sum(r["prompt"] for r in res_ok)), 3),

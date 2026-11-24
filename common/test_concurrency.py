@@ -219,6 +219,26 @@ case("audit: a single stream is not a cell (exit 2)", rc == 2)
 rc, _ = quiet(ca.main, [write("dup.jsonl", [rec("A", A), rec("A", B)])])
 case("audit: a label twice is invalid input (exit 2)", rc == 2)
 
+# E449: q165's cell finished in 669 s vs 1,143 s one by one (1.7x) while generating 31 % fewer tokens; the raw wall ratio was read
+# as throughput. Here the solo arm does 4 turns of 4 s prefill (1000 new) + 4 s decode (101 out) = 32 s; the cell runs both
+# streams side by side in 12 s but decodes half the tokens (51 out in 2 s): work 4 + 2 = 6 solo-s per turn, 24 in all, so the
+# work-normalised speedup is (24 / 12) / (32 / 32) = 2.0, not the raw 32 / 12 = 2.67, and the cell needs 16 s for the solo work.
+tsolo = {lab: rec(lab, [row(0, 0, 4, 4, 101, 1000, cached=0), row(1, 8, 4, 4, 101, 2000)]) for lab in ("A", "B")}
+tsolo["B"]["rows"] = [dict(r, t_send=r["t_send"] + 100, t_first=r["t_first"] + 100, t_end=r["t_end"] + 100) for r in tsolo["B"]["rows"]]
+tcell = {lab: rec(lab, [row(0, 0, 4, 2, 51, 1000, cached=0), row(1, 6, 4, 2, 51, 2000)]) for lab in ("A", "B")}
+tp = ca.throughput(tcell, tsolo)
+case("throughput: the cell doing half the decode work -> speedup 2.0 (raw wall ratio 2.67), same work in 16 s, CI [2, 2]",
+     tp["speedup"] == 2.0 and abs(tp["raw_wall_ratio"] - 32 / 12) < 1e-3 and tp["same_work_concurrent_wall_s"] == 16.0
+     and tp["speedup_ci"] == [2.0, 2.0] and tp["solo"]["wall_s"] == 32.0)
+case("throughput: per-arm tokens per wall second and the aggregate while both decode (2 x 25 tok/s)",
+     tp["concurrent"]["output_tok_per_wall_s"] == round(204 / 12, 2) and tp["solo"]["output_tok_per_wall_s"] == round(404 / 32, 2)
+     and tp["all_decoding"]["aggregate_tok_s"] == 50.0 and tp["concurrent"]["prefill_ms_per_tok"] == 4.0)
+# a fixed-mode replay re-sends the recorded reply, so every turn misses its tip (E105 capture policy): a whole re-prefill there
+# must not be called eviction (recurrence: q182's fixed-mode cell FAILed on an artifact of its replay mode)
+fx = [dict(r) for r in B]
+fx[2] = row(2, 20, 30, 4, 41, 1400, cached=0, sha="b2")
+case("audit: a fixed-mode whole re-prefill is not attributable to eviction", ca.reprefills(fx, fixed=True)[0]["kind"].startswith("fixed-mode"))
+
 # gap_stats is decode_while_prefill.py's phase classifier: E59's saved trace must come out as recorded
 seg = [(float("-inf"), 0, "before"), (0, 5, "during"), (5, float("inf"), "after")]
 g = ca.gap_stats([-2, -1, 0.5, 4.5, 6, 6.5], seg)
@@ -286,6 +306,15 @@ if machine_env("LOOM_SKILLS"):
             case("replay: rows carry t_send <= t_first <= t_end on the epoch clock",
                  all(k in r for k in ("t_send", "t_first", "t_end")) and r["t_send"] <= r["t_first"] <= r["t_end"] and r["t_send"] > 1.7e9)
     case("replay: the reply hash ignores the server's call id", shas[0] is not None and shas[0] == shas[1])
+    # q164 ran the private replay because the kit's had no output cap (a runaway fixed-mode reply then dominates a cell's wall)
+    srv = fake_server("a b c", "id1")
+    log = os.path.join(tmp, "rcap.jsonl")
+    subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_bench", "replay.py"), sess,
+                    f"http://127.0.0.1:{srv.server_address[1]}", "m", "--mode", "fixed", "--max-out", "3", "--log", log],
+                   capture_output=True, text=True, env=env)
+    srv.shutdown()
+    r = json.load(open(log))["rows"][0] if os.path.isfile(log) else {}
+    case("replay: --max-out 3 caps a fixed-mode turn recorded at 7 tokens", r.get("cap") == 3)
     case("replay: the reply hash sees a one-word difference", shas[0] != shas[2])
 
 print(f"{len(ran) - len(fails)}/{len(ran)} passed")
