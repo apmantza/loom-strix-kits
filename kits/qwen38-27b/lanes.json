@@ -1,5 +1,5 @@
 {
- "_doc": "Hardware and model constants for ceiling.py / events_summary.py. Every number names its source. Update the source when you change a number; recompute the byte counts from the served GGUFs when a quant changes (gguf.GGUFReader).",
+ "_doc": "Hardware and model constants for ceiling.py / events_summary.py. Every number names its source. Update the source when you change a number; recompute the byte counts from the served GGUFs when a quant changes (gguf.GGUFReader). A lane's optional 'chain' lists its dispatches per step with dependent memory round trips and serial issue cycles per dispatch (ceiling.py's latency-chain term; per-value sources in each item).",
  "hardware": {
   "name": "Strix Halo, Radeon 8060S, gfx1151 (40 CUs, LPDDR5X unified)",
   "bw_copy_gbs": 216,
@@ -41,7 +41,28 @@
    "lane": "decode: verify attention",
    "phase": "decode",
    "regex": "^g_attention_(vsplit|split|combine)$",
-   "floor": "decode_kv"
+   "floor": "decode_kv",
+   "chain": [
+    {
+     "what": "g_attention_vsplit",
+     "dispatches": 16,
+     "trips": 3,
+     "serial_cycles": "unknown",
+     "_src": "16 per verify step (1,536 at [8,4,64] + 16 at [1,4,64] over 97 steps, W/static-1123/abba-e343 (summary.md, 3-e343/events.jsonl: pkg-e343 = HEADPACK, the limits table's verify attention, E350; 97 verify steps at 81,432)); trips: the page walk record -> per-row page map -> slot, then K/V, one dependent chain per key tile (E139); tiles are independent of each other (a kernel can prefetch the next tile's walk), so one walk per dispatch is what the design forces. serial_cycles unknown: the online-softmax carry across a split's ~40 key tiles is a true serial chain, but its per-tile instruction count was read before HEADPACK (E168: ~1,250 per tile, live pkg-u60kv2) and not since"
+    },
+    {
+     "what": "g_attention_split",
+     "dispatches": 16,
+     "trips": 1,
+     "_src": "16 per step (W/static-1123/abba-e343 (summary.md, 3-e343/events.jsonl: pkg-e343 = HEADPACK, the limits table's verify attention, E350; 97 verify steps at 81,432)); trips 1: any dispatch that reads its input pays one round trip (lower bound)"
+    },
+    {
+     "what": "g_attention_combine",
+     "dispatches": 16,
+     "trips": 1,
+     "_src": "16 per step (W/static-1123/abba-e343 (summary.md, 3-e343/events.jsonl: pkg-e343 = HEADPACK, the limits table's verify attention, E350; 97 verify steps at 81,432)); reads the splits' partials: one round trip"
+    }
+   ]
   },
   {
    "lane": "decode: drafter",
@@ -50,13 +71,36 @@
    "floor": "decode_drafter",
    "_src": "g_head_mv_*_p40 = @llm_dflash_propose on the q4_0 proposal-head copy (pkg-u60kv2 llm.loom:146291); decode-phase GEMMs are the drafter's (per-step warm pass: g_gemm_q4_k_store/q6_k_store; the target decodes with matvecs)",
    "submission_regex": "^g_dfl_(prepare|kv_store)$",
-   "_src_submission": "E163: the drafter's propose pass (opens with g_dfl_prepare, 131 dispatches) and its per-step warm pass (g_dfl_kv_store + the fc / K/V GEMMs, 21 dispatches) are submissions of their own; neither marker ever shares a submission with target attention (abba-u60x run 2: 95 + 117 submissions, none with vsplit or flash2). By name the lanes swapped call sites: the propose pass's g_mv_q4_k_* went to the target matvecs and the target's Q8_0 matvecs (ssm_alpha/beta, attn_k/v, attn_output, ssm_out) to the drafter"
+   "_src_submission": "E163: the drafter's propose pass (opens with g_dfl_prepare, 131 dispatches) and its per-step warm pass (g_dfl_kv_store + the fc / K/V GEMMs, 21 dispatches) are submissions of their own; neither marker ever shares a submission with target attention (abba-u60x run 2: 95 + 117 submissions, none with vsplit or flash2). By name the lanes swapped call sites: the propose pass's g_mv_q4_k_* went to the target matvecs and the target's Q8_0 matvecs (ssm_alpha/beta, attn_k/v, attn_output, ssm_out) to the drafter",
+   "chain": [
+    {
+     "what": "every drafter dispatch",
+     "dispatches": 155.9,
+     "trips": 1,
+     "_src": "15,119 dispatches over 97 verify steps (W/static-1123/abba-e343 (summary.md, 3-e343/events.jsonl: pkg-e343 = HEADPACK, the limits table's verify attention, E350; 97 verify steps at 81,432)); trips 1 each (lower bound; matvec weight loads do not depend on each other). E367's laggards (q4_k K25600 at 147 GB/s, small grids at 64-256 workgroups 164-200 GB/s) are fill shortfalls (too few bytes in flight: Little's law, bandwidth x latency), not a dependent chain: they need the trip latency too and are not modelled here"
+    }
+   ]
   },
   {
    "lane": "decode: GDN",
    "phase": "decode",
    "regex": "^g_gdn_",
-   "floor": "decode_gdn_state"
+   "floor": "decode_gdn_state",
+   "chain": [
+    {
+     "what": "g_gdn_recurrence_rec",
+     "dispatches": 47.5,
+     "trips": 1,
+     "serial_cycles": 2680,
+     "_src": "4,608 over 97 steps (W/static-1123/abba-e343 (summary.md, 3-e343/events.jsonl: pkg-e343 = HEADPACK, the limits table's verify attention, E350; 97 verify steps at 81,432)); trips 1: the state is loaded once, the per-token q / k / v loads do not depend on it; serial_cycles: the recurrence carries the state from token to token, 8 verified tokens x the 335-instruction step loop (E185, E363), at most one instruction issued per wave per cycle (E344's issue rate): 2,680 cycles. This loop's count, not the algorithm's: E363 finds about a quarter of it is the state update, so a lever that shortens the loop lowers this term"
+    },
+    {
+     "what": "other GDN kernels (conv_commit, conv_bank, qk_norm, norm_gate, fold, fold_hist)",
+     "dispatches": 194.5,
+     "trips": 1,
+     "_src": "the lane's 23,472 dispatches / 97 steps = 242.0 per step (W/static-1123/abba-e343 (summary.md, 3-e343/events.jsonl: pkg-e343 = HEADPACK, the limits table's verify attention, E350; 97 verify steps at 81,432)), minus the recurrence's 47.5; trips 1 each (lower bound)"
+    }
+   ]
   },
   {
    "lane": "decode: other (producers, rope, spec misc)",

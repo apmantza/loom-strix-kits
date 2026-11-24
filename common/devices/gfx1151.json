@@ -12,6 +12,9 @@
    "clock_ghz": 2.14,
    "clock_ghz_served": [2.13, 2.19],
    "bw_practical_gbs": 240,
+   "launch_gap_us": 0.72,
+   "global_load_latency_ns": "unknown",
+   "_src_chain": "ceiling.py's latency-chain term. launch_gap_us: start of a served dispatch minus the end of the one before it, median of 95 decode submissions (~1,196 dispatches each; p10 0.72, p90 0.76, none negative: the queue serialises them), static-1123/abba-e310/1-u60q (E328). global_load_latency_ns: unknown. No HRX-like LEDGER row gives a DRAM load round trip in ns: rocprof's VmemLoadLatency read 0 on every global-load kernel until E411 fixed its definition, and it has not been re-measured since; E83 / E139 / E168 ablations time whole kernels (no-load, cache-resident, no-page-map variants), not one trip. Measure it (counters.sh latency preset, or a pointer-chase probe) before filling it in",
    "_src": "the default 85 W PPT cap: served prefill and decode both run pinned at 84-85 W, clock median 2.12-2.19 GHz (E356, E358, E373); 2.14 GHz -> 43.8 TFLOP/s (E369); pure reads 239.8 GB/s cool and 239.6 hot after a 10-minute 85 W soak (E380: bandwidth does not drop with heat)"
   },
   "nominal": {

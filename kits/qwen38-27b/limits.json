@@ -1,6 +1,12 @@
 {
  "_doc": "Worked example for common/amdahl.py: the HRX-like limits table (LEDGER 'Standing goal', refreshed 11-23, 'Now (e249)' column) with the switches live since (FLASH2_HEADPACK: verify attention 19.6, E350, live in pkg-e379, E390), one lever per part taking it to its floor at the 85 W cap (common/ceiling.py kits/qwen38-27b/lanes.json --context 81430 --prompt 81430 --device common/devices/gfx1151.json: 240 GB/s, 43.8 TFLOP/s, E369, E380). Parts without a ceiling.py floor are taken to the table's floor (prefill GDN ~3.8 s exact form, E186) or to 0 (fixed costs). Each part is its own overlap group: the parts are disjoint dispatch sets (events_summary lanes), so their savings add. 81,430-token prompt; decode per verify step at ~3.25 tokens per step (agent bench).",
  "_discrepancy": "E369 states the capped decode limit as ~92-95 ms/step: it re-floored only the matvecs (69-73 ms) and kept 228 GB/s for attention, drafter and GDN; at E380's 240 GB/s on every DRAM-bound lane the sum is 90.1. Prefill reproduces E369 (~197 -> ~128-132 s).",
+ "floors": {
+  "lanes": "lanes.json",
+  "context": 81430,
+  "prompt": 81430,
+  "_src": "levers 'to floor' take ceiling.py's lane floor at --device's profile: max(bandwidth or compute, latency chain); at cap85w no chain term binds (global_load_latency_ns unknown; the known launch + serial-issue parts are 0.03-0.23 ms/step)"
+ },
  "phases": [
   {
    "phase": "decode",
@@ -13,28 +19,28 @@
     {
      "name": "target weight matvecs to floor",
      "target": 79.4,
-     "to": 69.08,
+     "to_floor": "decode: target weight matvecs",
      "overlap_group": "matvecs",
      "src": "E301 (79.4); floor 16.58 GB at 240 GB/s (E217, E380)"
     },
     {
      "name": "verify attention to floor",
      "target": 19.6,
-     "to": 11.47,
+     "to_floor": "decode: verify attention",
      "overlap_group": "verify attention",
      "src": "E350 (HEADPACK 19.54-19.72); KV8 bytes at 240 GB/s"
     },
     {
      "name": "drafter to floor",
      "target": 10.5,
-     "to": 8.23,
+     "to_floor": "decode: drafter",
      "overlap_group": "drafter",
      "src": "E367 (10.49); weights + head + warm at 240 GB/s"
     },
     {
      "name": "GDN to floor",
      "target": 3.6,
-     "to": 1.31,
+     "to_floor": "decode: GDN",
      "overlap_group": "gdn",
      "src": "E185 (3.58); state read + write at 240 GB/s"
     },
@@ -64,21 +70,21 @@
     {
      "name": "GEMMs to floor",
      "target": 111.8,
-     "to": 90.49,
+     "to_floor": "prefill: GEMMs (f16 WMMA)",
      "overlap_group": "gemm",
      "src": "E301 (111.77); 2 x 24.35e9 params x 81,430 at 43.8 TFLOP/s (E369)"
     },
     {
      "name": "flash2 attention to floor",
      "target": 60.2,
-     "to": 29.74,
+     "to_floor": "prefill: attention (flash2)",
      "overlap_group": "attention",
      "src": "E301 (60.2); causal QK + PV FLOPs at 43.8 TFLOP/s"
     },
     {
      "name": "dequant to floor",
      "target": 5.8,
-     "to": 5.35,
+     "to_floor": "prefill: weight dequant to f16 scratch",
      "overlap_group": "dequant",
      "src": "E301 (5.82); 20 chunks x (15.54 GB + 2 B x params) at 240 GB/s"
     },

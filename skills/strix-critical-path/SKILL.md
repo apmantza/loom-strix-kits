@@ -25,6 +25,13 @@ loom-strix-optimise (rules.md sections 1, 2 and 5 first). Nothing here is model-
    (`--profile nominal` for the uncapped figures, `--clock-ghz X` to ask what a clock would give). The device file derives the
    WMMA peak from the clock (SIMDs x FLOP per WMMA / cycles x clock). Record the power, clock and temperature beside every
    served figure (the A/B's telemetry): a floor at a clock the chip cannot hold under its power cap ranks levers wrongly.
+   **Latency chain.** A lane whose work is a chain of dependent steps cannot beat that chain: floor = max(bandwidth or
+   compute, chain). Declare it in lanes.json as `chain` items `{what, dispatches (per step / prompt), trips (dependent memory
+   round trips per dispatch), serial_cycles (carried issue cycles per wave), _src}`; the device profile gives
+   `launch_gap_us` and `global_load_latency_ns`. Count what the design forces (a page walk, a loop-carried state), not what
+   the code could prefetch. An unknown count or constant is left out and named, so the chain stays a lower bound and the old
+   floor stands; ceiling.py prints which term binds (`--trip-ns X` asks what a latency would give). In an amdahl input,
+   `to_floor: LANE` (with a top-level `floors: {lanes, context, prompt}`) takes a lever to that floor instead of a typed number.
 3. **Amdahl screen.** Write each lever as `{name, target, to | reduction | reduction_pct, overlap_group, enabler, src}` in
    a phase `{phase, unit, wall, screen_pct, candidates}` and run `common/amdahl.py FILE`. It prints each lever's share of the
    whole step, which clear the screen, and the combined gain counting the largest saving per overlap group (two rewrites of one
@@ -64,6 +71,11 @@ loom-strix-optimise (rules.md sections 1, 2 and 5 first). Nothing here is model-
 - Headroom: decode bandwidth x1.32 on the seeded agent bench (E381; its turns span 34-108k context, so the 81k bytes approximate),
   tokens per step x1.26 against DFlash2's published low end (E181, other content: E188), dispatch x1.003 (busy 99.7 %, E354);
   prefill compute x1.63.
+- Latency chain: verify attention (48 dispatches/step, vsplit's 3-trip page walk, E139), drafter (156 dispatches, E367's
+  laggards are fill shortfalls, not chains) and GDN (242 dispatches; the recurrence's 8 tokens x 335-instruction carried loop,
+  E185 / E363) carry `chain` items from the HEADPACK events (abba-e343). Known parts at cap85w: 0.035 / 0.112 / 0.234 ms/step
+  (launch gaps 0.72 us, E328, plus GDN's serial issue); the trip latency is unknown (VmemLoadLatency not re-measured since
+  E411's fix), so no chain binds. With every trip at 1 us none would either (GDN needs > 4.4 us per trip to bind).
 - Screens: ~1 % decode, ~0.2 % prefill, the seeded agent bench's A/A floor (E374).
 
 ## What this does not cover

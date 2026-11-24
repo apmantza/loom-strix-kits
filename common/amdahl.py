@@ -14,6 +14,10 @@ Input (JSON): one phase object, or {"phases": [phase, ...]}. A phase:
 - enabler: a lever with no saving of its own that others need; it is listed and kept, never screened out.
 - screen_pct: a lever passes when it cuts at least this share of the wall (default --screen, 1 %): set it to the A/B's
   noise floor (on the HRX-like agent bench ~1 % decode, ~0.2 % prefill: LEDGER E374), or a real gain cannot be told apart.
+- to_floor (instead of to / reduction / reduction_pct): a lane name of the kit's lanes.json; the lever takes the part to
+  that lane's floor as ceiling.py computes it (max of bandwidth, compute and the latency chain, at --device's profile, or the
+  lanes.json hardware without one). Needs a top-level "floors": {"lanes": PATH (relative to this file), "context": N,
+  "prompt": N}; the lane's phase must be the phase's. The run prints each floor and the term that binds.
 - expect (optional): totals the input should reproduce (a limits table's 'now' and 'limit' sums); a miss beyond
   tolerance_pct (default 2) is a discrepancy and fails the run. "after" is checked against every lever (a table takes each
   part to its floor).
@@ -48,7 +52,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ceiling import hardware  # noqa: E402
+from ceiling import hardware, lane_floor  # noqa: E402
 
 
 class Invalid(Exception):
@@ -188,6 +192,31 @@ def stack_cell(c, ceil):
     return out
 
 
+def resolve_floors(doc, path, phases, device, profile):
+    """Replace each candidate's to_floor with to = that lane's ceiling.py floor; [(candidate, lane, floor dict)]."""
+    out, spec = [], doc.get("floors") if isinstance(doc, dict) else None
+    for ph in phases:
+        for c in ph.get("candidates") or []:
+            if "to_floor" not in c:
+                continue
+            name = c.get("name")
+            if any(k in c for k in ("to", "reduction", "reduction_pct")):
+                raise Invalid(f"{name}: to_floor replaces to / reduction / reduction_pct, give one")
+            if not isinstance(spec, dict) or "lanes" not in spec:
+                raise Invalid(f"{name}: to_floor needs a top-level floors.lanes (the kit's lanes.json)")
+            lanes = json.load(open(os.path.join(os.path.dirname(os.path.abspath(path)), spec["lanes"])))
+            hits = [ln for ln in lanes["lanes"] if ln["lane"] == c["to_floor"]]
+            if len(hits) != 1 or hits[0]["phase"] != ph.get("phase"):
+                raise Invalid(f"{name}: no {ph.get('phase')} lane named {c['to_floor']!r} in {spec['lanes']}")
+            hw = hardware(lanes, device, profile)
+            f = lane_floor(hits[0], lanes["model"], hw, int(spec.get("context", 0)), int(spec.get("prompt", 0)))
+            if f is None:
+                raise Invalid(f"{name}: lane {c['to_floor']!r} has no floor (judge it against 0: to 0)")
+            c["to"] = f["floor"]
+            out.append((name, c["to_floor"], f))
+    return out
+
+
 def check_expect(ph, res):
     exp, out = ph.get("expect") or {}, []
     tol = float(exp.get("tolerance_pct", 2))
@@ -214,6 +243,7 @@ def main():
     try:
         doc = json.load(open(a.candidates))
         phases = doc.get("phases", []) if isinstance(doc, dict) and ("phases" in doc or "cells" in doc) else [doc]
+        floors = resolve_floors(doc, a.candidates, phases, a.device, a.profile)
         results = [(ph, screen_phase(ph, a.screen)) for ph in phases]
         cells = doc.get("cells", []) if isinstance(doc, dict) else []
         if cells and not a.device:
@@ -226,6 +256,12 @@ def main():
         print("amdahl: INVALID")
         sys.exit(2)
     ok, dump = True, []
+    for name, lane, f in floors:
+        terms = ", ".join(f"{k} {v:.3f}" for k, v in f["terms"].items())
+        print(f"floor for {name}: {lane} = {f['floor']:.3f} (binds: {f['binds']}; {terms})"
+              + (f"; chain is a lower bound, unknown: {', '.join(f['unknown'])}" if f["unknown"] else ""))
+    if floors:
+        print()
     for ph, r in results:
         u = r["unit"]
         print(f"## {r['phase']}: wall {r['wall']:.2f} {u}, screen {r['screen_pct']:g} % of the wall")

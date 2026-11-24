@@ -81,6 +81,9 @@ class Amdahl(unittest.TestCase):
         self.assertIn("115.10 -> 90.09 ms/step", r.stdout)
         self.assertIn("196.75 -> 129.38 s/prompt", r.stdout)
         self.assertIn("| compute | x1.631 |", r.stdout)
+        # the levers take ceiling.py's lane floors (to_floor): at cap85w no chain term binds, the trip latency is unknown
+        self.assertIn("decode: GDN = 1.307 (binds: bandwidth; bandwidth 1.307, chain 0.234); chain is a lower bound, "
+                      "unknown: global_load_latency_ns (device)", r.stdout)
 
     def cell(self, **kw):
         return dict({"cell": "d", "kind": "decode", "tokens_per_s": 30.0, "tokens_per_step": 3.0,
@@ -136,6 +139,72 @@ class CeilingDevice(unittest.TestCase):
 
     def test_profile_without_device_refused(self):
         self.assertNotEqual(run("ceiling.py", self.LANES, "--clock-ghz", "2.0").returncode, 0)
+
+
+class CeilingChain(unittest.TestCase):
+    """The latency-chain floor term (E409 survey item 7): a lane whose work is a chain of dependent round trips cannot reach
+    its bytes / bandwidth floor (verify attention's page walk, the GDN recurrence's token-to-token carry)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        with open(DEV) as f:
+            dev = json.load(f)
+        self.assertEqual(dev["profiles"]["cap85w"]["global_load_latency_ns"], "unknown")   # E411: not re-measured
+        dev["profiles"]["cap85w"]["global_load_latency_ns"] = 1000
+        self.dev_known = self.write("dev.json", dev)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name, d):
+        p = os.path.join(self.tmp.name, name)
+        with open(p, "w") as f:
+            json.dump(d, f)
+        return p
+
+    def lanes(self, chain):
+        # 2 x 120 MB of state at 240 GB/s = 1.00 ms/step: the bandwidth floor the chain competes with
+        return self.write("lanes.json", {"hardware": {"name": "h", "bw_practical_gbs": 240, "wmma_f16_tflops": 45},
+                                         "model": {"name": "m", "gdn_state_bytes": 120e6},
+                                         "lanes": [{"lane": "decode: chained", "phase": "decode", "regex": ".",
+                                                    "floor": "decode_gdn_state", "chain": chain}]})
+
+    def test_chain_bound_lane_reports_chain(self):
+        # recurrence: a floor of bytes / bandwidth alone called a latency-bound lane 'at 10 % of its floor', a gap no
+        # bandwidth lever can close. 10 x (0.72 us launch + 1000 trips x 1 us) + 2 x (0.72 us + 2.14e6 cycles at 2.14 GHz)
+        lanes = self.lanes([{"what": "walk", "dispatches": 10, "trips": 1000},
+                            {"what": "carry", "dispatches": 2, "serial_cycles": 2.14e6}])
+        r = run("ceiling.py", lanes, "--device", self.dev_known)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("decode: chained                               floor     12.01 ms/step  binds: chain; chain 12.009",
+                      r.stdout)
+        # amdahl's to_floor takes that floor, not the bandwidth term: 20 -> 12.01, not 20 -> 1.00
+        doc = self.write("c.json", {"floors": {"lanes": "lanes.json", "context": 0, "prompt": 0},
+                                    "phases": [{"phase": "decode", "unit": "ms/step", "wall": 20.0,
+                                                "candidates": [{"name": "x", "target": 20.0, "to_floor": "decode: chained"}]}]})
+        r = run("amdahl.py", doc, "--device", self.dev_known)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("20.00 -> 12.01 ms/step", r.stdout)
+        self.assertIn("(binds: chain; bandwidth 1.000, chain 12.009)", r.stdout)
+
+    def test_unknown_latency_keeps_the_old_floor_and_says_so(self):
+        # recurrence: an unknown trip latency filled with a guess would move a floor on a number nobody measured (E411:
+        # VmemLoadLatency read 0 until fixed); the known part (launch gaps) stays a lower bound
+        lanes = self.lanes([{"what": "walk", "dispatches": 10, "trips": 1000, "serial_cycles": "unknown"}])
+        r = run("ceiling.py", lanes, "--device", DEV)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("floor      1.00 ms/step  binds: bandwidth; chain 0.007 (lower bound; unknown: "
+                      "global_load_latency_ns (device), walk: serial_cycles)", r.stdout)
+        # without a device file nothing of the chain is known: the old floor, named unknown
+        r = run("ceiling.py", lanes)
+        self.assertIn("floor      1.00 ms/step  binds: bandwidth; chain unknown (unknown: launch_gap_us (device), "
+                      "global_load_latency_ns (device), walk: serial_cycles)", r.stdout)
+
+    def test_bad_chain_count_refused(self):
+        # a typo (negative or text count) must not pass as zero
+        for bad in (-1, "many"):
+            r = run("ceiling.py", self.lanes([{"what": "walk", "dispatches": 10, "trips": bad}]), "--device", self.dev_known)
+            self.assertNotEqual(r.returncode, 0, bad)
 
 
 if __name__ == "__main__":
