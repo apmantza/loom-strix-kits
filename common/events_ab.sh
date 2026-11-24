@@ -9,6 +9,8 @@
 # each run (<run>/env.txt); summary.md ends with an `environment:` section (the first run's block) and each run whose block
 # differs from it, and then the script exits 2 (EVENTS: UNTRUSTED): profiles from two environments are not an A/B.
 # usage: events_ab.sh KIT OUTDIR LENGTH PKG [PKG ...]
+#   env EXPECT_TOKENS: the prompt tokens LENGTH is expected to serve (default LENGTH); a run more than 5 % off stops the script.
+#     LENGTH is a size label, not a token count (HRX-like E421: a label of 100000 served 81,432; a step stopped on LENGTH as the expectation)
 #   machine env: IREE_PROFILE = an iree-profile binary built from the installed hrx-system tag (tools/iree-profile; not in the
 #   wheel); SPLIT = a kernel whose dispatch-time clusters to print (default g_attention_vsplit)
 set -u -o pipefail
@@ -28,9 +30,9 @@ for p in "$@"; do
   lsk_serve_bg prof "$p" --device_profiling_mode=dispatch-events,executable-metadata --device_profiling_flush_interval_ms=5 \
     --device_profiling_output="$d/run.ireeprof"
   "$PYTHON" "$H/profile_req.py" "http://127.0.0.1:$PORT" "$KIT_MODEL_ID" "$L" > "$d/run.req.json" 2> "$d/run.req.err" || die "events_ab STOP: request $p"
-  lab=$(python3 -I "$H/context_label_check.py" "$d/run.req.json" "$L"); lc=$?   # not inside the echo: its status was discarded there
+  lab=$(python3 -I "$H/context_label_check.py" "$d/run.req.json" "${EXPECT_TOKENS:-$L}"); lc=$?   # not inside the echo: its status was discarded there
   echo "### $n $p $lab"
-  [ $lc -eq 0 ] || die "events_ab STOP: run $n served another context than LENGTH $L (the request's size label: read the served count)"
+  [ $lc -eq 0 ] || die "events_ab STOP: run $n served another context than ${EXPECT_TOKENS:-$L} tokens (LENGTH $L is the request's size label: set EXPECT_TOKENS to what it serves)"
   lsk_stop || exit 1
   "$IREE_PROFILE" dispatch --dispatch_events --format=jsonl "$d/run.ireeprof" > "$d/events.jsonl" 2> "$d/events.err" || die "events_ab STOP: iree-profile export $p"
 done
