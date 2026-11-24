@@ -6,9 +6,13 @@ loop_share(text)          share of word 8-grams that repeat an earlier 8-gram; i
 paired_ratio_ci(a, b)     bootstrap 95 % interval of median(b) / median(a) over paired samples (turns), resampled together
 neighbour_verdict(...)    ABBA rule: the candidate must beat the reference in EVERY half on the primary metric (each half's
                           reference run is a neighbouring control), and no secondary metric may be worse by more than 3 %
+reply_sha(reply)          16-hex hash of a chat reply (reasoning, text, tool-call names and arguments; call ids left out: server-made):
+                          the one spelling agent_bench/replay.py writes as out_sha and resume_audit.py recomputes
 drm_memory(pid)           GPU memory a process holds, from /proc/PID/fdinfo (drm-memory-* / drm-resident-* per region, one count per
                           drm-client-id): on unified memory the GPU's share is invisible to MemAvailable
 usage: checks.py drm PID | checks.py loop FILE"""
+import hashlib
+import json
 import os
 import random
 import re
@@ -30,6 +34,12 @@ def loop_share(text, n=8):
 
 def is_loop(text, share=0.5, min_words=64):
     return len(text.split()) >= min_words and loop_share(text) >= share
+
+
+def reply_sha(reply):
+    """hash of an assistant message {reasoning_content?, content, tool_calls?}: what the model produced, not who numbered it"""
+    calls = [(tc["function"]["name"], tc["function"]["arguments"]) for tc in reply.get("tool_calls") or []]
+    return hashlib.sha256(json.dumps([reply.get("reasoning_content"), reply.get("content"), calls]).encode()).hexdigest()[:16]
 
 
 def paired_ratio_ci(a, b, iters=2000, seed=1, level=0.95):

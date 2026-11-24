@@ -14,11 +14,14 @@ Modes
 Per turn: context, new vs cached prompt tokens (engine-reported) next to the recording, time to first token
 (client-side), prefill rate, output tokens, decode rate, wall time. Summary: session wall time, prefill/decode split.
 
+Resume audit (common/resume_audit.py): --keep-replies stores each turn's reply in its row; --history-from LOG then replays
+own mode with THAT log's replies as the history (none of this run's), so a turn sent to a fresh server carries exactly the
+prompt the resumed run sent.
+
 usage: replay.py SESSION URL MODEL [--kind loom|llama|generic] [--mode fixed|own] [--turns A:B] [--every N]
-                 [--exact-length] [--effort LEVEL] [--label X] [--log FILE]
+                 [--exact-length] [--effort LEVEL] [--label X] [--log FILE] [--keep-replies] [--history-from LOG]
 """
 import argparse
-import hashlib
 import json
 import os
 import statistics
@@ -50,9 +53,14 @@ ap.add_argument("--sampling", default=None, help="'card' = the Qwen3.8-27B card'
                 "effort none: T 0.7, top_p 0.8, top_k 20; E113), or a JSON object of body fields; default greedy (temperature 0)")
 ap.add_argument("--seed", type=int, default=None, help="with --sampling: per-turn seed SEED*100000+turn (same seed, same build: same text)")
 ap.add_argument("--salt", default="", help="prepended to the system prompt: a second concurrent stream of the same session shares no cached prefix")
+ap.add_argument("--keep-replies", action="store_true", help="store each turn's reply (reasoning, text, tool calls) in its row")
+ap.add_argument("--history-from", default=None, help="own mode: the history is the replies of this --keep-replies log (one record), "
+                "not this run's; a turn whose earlier turns are missing from it fails")
 a = ap.parse_args()
 if a.mode == "own" and a.every != 1:
     sys.exit("--mode own replays a contiguous range of turns (the history is the engine's own output): drop --every")
+if a.history_from and a.mode != "own":
+    sys.exit("--history-from replaces the engine's own replies: it needs --mode own")
 
 S = json.load(open(a.session))
 msgs, turns, tools = S["messages"], S["turns"], S["tools"]
@@ -106,8 +114,23 @@ def sampling_for(effort):
     return json.loads(a.sampling)
 
 
+def frozen_history(path):
+    """({message index: reply}, first turn) from a --keep-replies log of one record: the history a fresh arm must re-send"""
+    recs = [json.loads(x) for x in open(path) if x.strip()]
+    if len(recs) != 1:
+        sys.exit(f"--history-from {path}: {len(recs)} records; give the log of the one run whose history to re-send")
+    rows = [r for r in recs[0]["rows"] if not r.get("error")]
+    if any("reply" not in r for r in rows):
+        sys.exit(f"--history-from {path}: rows without 'reply' (that run lacked --keep-replies)")
+    return {turns[r["turn"]]["upto"]: r["reply"] for r in rows}, min((r["turn"] for r in recs[0]["rows"]), default=0)
+
+
 def run(k, own):
     t = turns[k]
+    if frozen is not None:   # every earlier turn of the frozen run must be in it, or the prompt is not the one it sent
+        gap = [j for j in range(frozen_lo, k) if turns[j]["upto"] not in own]
+        if gap:
+            raise RuntimeError(f"--history-from lacks the replies of turns {gap[:5]}: this prompt would not be the one it sent")
     body = {"model": a.model, "messages": history(k, own), "tools": tools, "stream": True, "stream_options": {"include_usage": True}}
     # own mode: headroom over the recorded length, so a turn is not cut inside a tool call (a dropped call changes the
     # history the next turn re-sends and breaks continuation); fixed mode keeps the recorded length
@@ -167,8 +190,9 @@ def run(k, own):
            # send / first token / end on the epoch clock, and a hash of the reply (reasoning, text, calls): the phase split and
            # the solo-vs-concurrent exactness check of common/concurrency_audit.py (call ids left out: server-made)
            "t_send": round(t0_epoch, 3), "t_first": round(t0_epoch + ((first or end) - t0), 3), "t_end": round(t0_epoch + (end - t0), 3),
-           "out_sha": hashlib.sha256(json.dumps([reply.get("reasoning_content"), reply["content"],
-                                            [(tc["function"]["name"], tc["function"]["arguments"]) for tc in reply.get("tool_calls") or []]]).encode()).hexdigest()[:16]}
+           "out_sha": checks.reply_sha(reply)}
+    if a.keep_replies:
+        row["reply"] = reply
     if dc0:
         dc1 = server_draft_counters(a.url)
         row["draft_acc"] = acceptance_between(dc0, dc1)
@@ -177,6 +201,10 @@ def run(k, own):
 
 
 own = {} if a.mode == "own" else None
+frozen, frozen_lo = None, 0
+if a.history_from:
+    frozen, frozen_lo = frozen_history(a.history_from)
+    own = dict(frozen)
 res, t_all = [], time.perf_counter()
 prev = None
 for k in sel:
@@ -192,7 +220,7 @@ for k in sel:
     # reuses all of it but one token (run1: 49/49 turns). lost > 64 means the history did not extend it exactly.
     row["lost"] = (prev["prompt"] + prev["out"] - row["cached"]) if prev and sel[sel.index(k) - 1] == k - 1 else None
     prev = row
-    if own is not None:
+    if own is not None and frozen is None:
         own[turns[k]["upto"]] = reply      # the assistant message at that index becomes the engine's reply
     res.append(row)
     print(f"turn {k:3d} ctx {row['prompt']:6d} new {row['new']:6d} (rec {row['rec_new']:6d}) ttft {row['ttft']:6.1f}s "
@@ -207,7 +235,8 @@ if not res_ok:
 wall = time.perf_counter() - t_all
 pre, gen = sum(r["ttft"] for r in res_ok), sum(r["gen_s"] for r in res_ok)
 newt, outt = sum(r["new"] for r in res_ok), sum(r["out"] for r in res_ok)
-summary = {"label": a.label, "model": a.model, "kind": a.kind, "mode": a.mode, "sampling": a.sampling, "seed": a.seed, "session": S["name"], "turns": len(res_ok), "errors": len(errors),
+summary = {"label": a.label, "model": a.model, "kind": a.kind, "mode": a.mode, "sampling": a.sampling, "seed": a.seed, "session": S["name"],
+           "effort": a.effort, "history_from": a.history_from, "turns": len(res_ok), "errors": len(errors),
            "session_wall_s": round(wall, 1), "prefill_s": round(pre, 1), "decode_s": round(gen, 1), "new_tokens": newt,
            "out_tokens": outt, "prefill_tps": round(newt / pre, 1) if pre else None, "decode_tps": round(outt / gen, 1) if gen else None,
            "cache_hit": round(sum(r["cached"] for r in res_ok) / max(1, sum(r["prompt"] for r in res_ok)), 3),

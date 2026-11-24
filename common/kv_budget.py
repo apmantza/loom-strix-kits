@@ -17,6 +17,12 @@ Idle retained histories and prefix endpoints are evictable: they are what gets e
 streams fit. A continuation miss (the next request does not extend the retained history exactly) can hold the old history and
 the new request at once until the old one is evicted: --miss-tolerant budgets one such fork (the largest stream twice); the
 exact model is the default.
+Recurrent state (hybrid models: one fixed-size slot per row, the storage program's %recurrent_bytes) is bytes outside the
+position pool, so it is reported beside the verdict, not in it. loom serve/service/text/source.c sizes the slots: rows when the
+deployment has no cache endpoints, else 2 x rows (a fork slot per row) + endpoints, where endpoints = checkpoint_capacity +
+prefix_cache_capacity + (session_cache_capacity + 1 when nonzero) (cache_policy.c); each endpoint is a recurrent-state checkpoint
+a resumed turn restores. An automatic prefix or session count is chosen by cache_target_bytes (model-documents.md: default
+2 GiB): its bytes are then bounded by that target, printed as 'at most'.
 
 usage: kv_budget.py PKG --streams CTX[,CTX...] [--kit KIT | --backing fixed|elastic] [--pool N] [--completion N]
                     [--retained N] [--preset NAME] [--miss-tolerant]
@@ -39,7 +45,8 @@ def storage_geometry(text):
         m = re.search(r"%" + name + r" = scalar\.constant (\d+) : i64", text)
         return int(m.group(1)) if m else None
     g = {"kv_position_bytes": const("kv_position_bytes"), "planes": const("plane_count"),
-         "draft_planes": const("draft_planes"), "draft_position_bytes": const("draft_pos_bytes"), "page_positions": None}
+         "draft_planes": const("draft_planes"), "draft_position_bytes": const("draft_pos_bytes"), "page_positions": None,
+         "recurrent_bytes": const("recurrent_bytes"), "slot_stride": const("slot_stride")}
     # the page size the source declares: geometry record field 0 (block positions); cross-checked against block bytes
     m = re.search(r"view\.store %(\w+), %geometry_view\[0\]", text)
     page = const(m.group(1)) if m else None
@@ -103,6 +110,24 @@ def round_up(n, page):
     return -(-n // page) * page
 
 
+def recurrent(ex, geo):
+    """recurrent-state bytes: per slot, per stream (its row slot + its fork slot when endpoints exist), checkpoint endpoints,
+    and the whole bank (source.c: slots = endpoints ? 2 x rows + endpoints : rows); None when the program spells no slot size"""
+    per = geo.get("recurrent_bytes")
+    if not per:
+        return None
+    if geo.get("slot_stride"):
+        per = round_up(per, geo["slot_stride"])
+    rows = ex.get("rows", 4)   # model-documents.md default
+    prefix, session, explicit = ex.get("prefix_cache_capacity"), ex.get("session_cache_capacity"), ex.get("checkpoint_capacity", 0)
+    endpoints = explicit + (prefix or 0) + (session + 1 if session else 0)
+    target = ex.get("cache_target_bytes", 2 << 30) if prefix is None or session is None else 0   # automatic counts' bound
+    slots = 2 * rows + endpoints if endpoints else rows
+    return {"slot_bytes": per, "rows": rows, "endpoints": endpoints, "automatic_bound_bytes": target,
+            "per_stream_bytes": per * (2 if endpoints or target else 1), "endpoint_bytes": endpoints * per,
+            "bank_bytes": slots * per, "bank_max_bytes": slots * per + target, "slots": slots}
+
+
 def budget(pkg_info, streams, backing=None, pool=None, completion=None, retained=0, miss_tolerant=False):
     """dict with every input, its source, the demand, and verdict FIT / NO_FIT / UNKNOWN"""
     ex, geo = pkg_info["execution"], pkg_info["geometry"]
@@ -133,6 +158,7 @@ def budget(pkg_info, streams, backing=None, pool=None, completion=None, retained
            "completion_source": src.get("completion"), "draft_depth": depth, "page_positions": page, "backing": backing,
            "streams": streams, "retained": retained, "miss_tolerant": miss_tolerant, "unknown": unknown,
            "kv_format": kv_format(geo, pkg_info["llm_config"])}
+    res["recurrent"] = recurrent(ex, geo)
     if geo.get("kv_position_bytes") and geo.get("planes"):
         per = geo["kv_position_bytes"] * geo["planes"] + ((geo.get("draft_planes") or 0) * (geo.get("draft_position_bytes") or 0) if depth else 0)
         res["kv_bytes_per_position"] = per
@@ -159,6 +185,16 @@ def report(r, out=print):
     out(f"page {r['page_positions'] or 'unknown'} positions, KV format {r['kv_format']}, draft depth {r['draft_depth']}, "
         f"completion credit {r['completion'] if r['completion'] is not None else 'unknown'} ({r['completion_source'] or 'unknown'}), "
         f"context_capacity {r['context_capacity']}, backing {r['backing'] or 'unknown'}")
+    rc = r.get("recurrent")
+    if rc:
+        mib = lambda b: f"{b / 2**20:,.0f} MiB"   # noqa: E731
+        out(f"recurrent state {mib(rc['slot_bytes'])} per slot: {mib(rc['per_stream_bytes'])} per stream (its row"
+            + (" + fork slot" if rc["per_stream_bytes"] > rc["slot_bytes"] else "") + f"), {rc['endpoints']} configured checkpoint endpoints (pinned + prefix + session) "
+            f"{mib(rc['endpoint_bytes'])}, bank {rc['slots']} slots {mib(rc['bank_bytes'])}"
+            + (f", at most {mib(rc['bank_max_bytes'])} with the automatic cache counts" if rc["automatic_bound_bytes"] else "")
+            + " (bytes outside the position pool)")
+    else:
+        out("recurrent state: the storage program spells no %recurrent_bytes (attention-only, or another spelling): unknown")
     if r["verdict"] == "UNKNOWN":
         for u in r["unknown"]:
             out(f"unknown: {u}")

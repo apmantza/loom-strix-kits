@@ -103,6 +103,24 @@ rc, _ = quiet(kb.main, [new, "--streams", "140439,122812"])
 case("kv_budget: CLI exit 2 on UNKNOWN", rc == 2)
 rc, _ = quiet(kb.main, [new, "--streams", "x"])
 case("kv_budget: CLI exit 2 on invalid streams", rc == 2)
+# Recurrent-state checkpoints (E409 survey: kv_budget counted KV positions only; E105: each prefix endpoint holds a 157 MB GDN
+# snapshot). Slots per loom source.c: 2 x rows + endpoints when any endpoint exists; bytes outside the position pool.
+REC = "  %slot_stride = scalar.constant 256 : i64\n  %recurrent_bytes = scalar.constant 156893184 : i64\n"
+hyb = package(os.path.join(tmp, "hyb"), {"rows": 4, "context_capacity": 262144, "max_tokens": 4096, "draft_depth": 7, "prefix_cache_capacity": 8,
+                                         "session_cache_capacity": 0})
+open(os.path.join(hyb, "program", "storage.loom"), "a").write(REC)
+rh = kb.budget(kb.load_package(hyb), E47, backing="fixed")
+rr = rh["recurrent"] or {}
+case("kv_budget: recurrent bank = (2 x 4 rows + 8 prefix endpoints) slots, 2 slots per stream, verdict unchanged",
+     rr.get("slots") == 16 and rr.get("bank_bytes") == 16 * 156893184 and rr.get("per_stream_bytes") == 2 * 156893184
+     and rr.get("endpoint_bytes") == 8 * 156893184 and rr.get("automatic_bound_bytes") == 0 and rh["headroom"] == -9328)
+auto = package(os.path.join(tmp, "auto"), {"rows": 4, "context_capacity": 262144, "max_tokens": 4096})
+open(os.path.join(auto, "program", "storage.loom"), "a").write(REC)
+ra = kb.budget(kb.load_package(auto), E47, backing="fixed")["recurrent"] or {}
+case("kv_budget: automatic cache counts -> bank bounded by cache_target_bytes (2 GiB), printed as 'at most'",
+     ra.get("automatic_bound_bytes") == 2 << 30 and ra.get("bank_max_bytes") == 4 * 156893184 + (2 << 30))
+rc, out = quiet(kb.main, [new, "--streams", "1000", "--backing", "fixed"])
+case("kv_budget: no %recurrent_bytes in the program -> recurrent state unknown, said", "recurrent state: " in out and "unknown" in out)
 if os.path.isfile(f"{W}/pkg-pf16-live/model.json"):
     r = kb.budget(kb.load_package(f"{W}/pkg-pf16-live"), E47)
     case("kv_budget: the real E47 package (pkg-pf16-live) parses to pool 327,680, page 16, KV 26.2 GiB (E51's figure)",

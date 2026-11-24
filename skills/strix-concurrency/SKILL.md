@@ -1,6 +1,6 @@
 ---
 name: strix-concurrency
-description: Serve a Loom package to several concurrent clients on AMD Strix Halo and judge it. Load it when two or more agents (or users) share one server, when time-to-first-token spikes or a turn re-prefills its whole history (eviction), when sizing the KV pool or context per session, or when a candidate package needs its concurrent cell checked beside the single-stream bench.
+description: Serve a Loom package to several concurrent clients on AMD Strix Halo and judge it, and check that a turn resumed from the server cache equals the same turn prefilled fresh. Load it when two or more agents (or users) share one server, when time-to-first-token spikes or a turn re-prefills its whole history (eviction), when sizing the KV pool or context per session, or when a candidate package needs its concurrent cell checked beside the single-stream bench.
 ---
 
 # Concurrent serving on Strix Halo
@@ -21,6 +21,8 @@ ledger rows (Exx). They show the method and are not defaults.
    - **Elastic backing:** the pool comes from physical memory. Pass `--pool` from the server's
      `text_memory.pool.capacity_tokens`.
 
+   It also prints the recurrent-state bytes of a hybrid model (one slot per row, a fork slot per row and one per cache
+   endpoint once any endpoint is configured; loom source.c), which sit outside the position pool.
    Each active request holds its history, plus a page-rounded completion credit (the request's max_tokens), plus draft
    depth + 1 positions. A drafter's K/V uses the target's page ids, so it costs bytes but not positions.
    `--miss-tolerant` adds one continuation miss: a history held twice until the old copy is evicted.
@@ -48,6 +50,30 @@ ledger rows (Exx). They show the method and are not defaults.
    planted difference (CONTROL FAILED, exit 2, otherwise). In own mode, one divergent turn changes every later history, so
    the first divergent turn is the finding.
 
+5. **Resumed equals fresh.** A turn that resumes from the server's cache must give the reply the same turn gives prefilled
+   from zero. Step 4 compares concurrent with solo, common/eq.sh compares packages; neither restores a cached prefix on one
+   side only. On a hybrid model a resume below the row's tip needs a recurrent-state checkpoint, so this is the check that
+   exercises it. Three arms on one package, same sampling and seed (seeded card sampling or greedy):
+   - **resumed**: `replay.py --mode own --keep-replies --turns A:B` on one fresh server. Its first turn is cold on purpose
+     (paired with the fresh arm it is an A/A control of the fresh path); every later turn continues the retained row.
+   - **fork**: on that same server afterwards, re-send an earlier turn (`--history-from RESUMED.jsonl --turns k:k+1`). The row
+     has moved past it, so it can only restore from an intermediate prefix endpoint.
+   - **fresh**: each turn on a just-started server, with `--history-from RESUMED.jsonl`, so its prompt is the resumed run's
+     prompt token for token. Loom 0.2 has no request-level cache switch: untagged requests reuse an idle row automatically and
+     `prefix_cache_capacity: 0` is a different package, so a restart per fresh turn is the supported way.
+
+   Then `common/resume_audit.py --fresh F.jsonl --resumed R.jsonl [--fork K.jsonl]`. The evidence that the restore path ran is
+   the server's `usage.prompt_tokens_details.cached_tokens` per turn (replay.py's `cached`). A resumed or fork turn with no
+   cached tokens is NOT-EXERCISED, never a pass. So is a fresh turn that reused tokens, or a pair whose prompt token counts
+   differ. A mismatch names the first differing part and character. The audit first checks that it reports a planted
+   one-character difference at its position.
+
+   Two conditions must hold for a zero (SGLang's kl-consistency skill): every kernel on the path gives a token the same result
+   whatever chunk it is prefilled in, and the restored state is the state a fresh prefill computes. A cold A/A pair that
+   differs points at the first. A resume-only difference with clean A/A pairs points at the second. With seeded sampling and a
+   drafter, compare the per-turn draft acceptance (`draft_acc`) between arms too: a drafter whose state is not restored can
+   change sampled text while greedy output stays exact.
+
 ## Verdict lines (exit 0 pass, 1 fail, 2 usage / invalid / unknown)
 
 - `KV_BUDGET: FIT | NO_FIT | UNKNOWN` (common/kv_budget.py)
@@ -60,6 +86,9 @@ ledger rows (Exx). They show the method and are not defaults.
   - a paired per-turn decode or prefill ratio against `--ref` whose 95 % CI is below 1 and beyond `--floor`.
 
   The verdict is UNKNOWN without `--solo` or reply hashes.
+- `RESUME: EXACT | MISMATCH | NOT-EXERCISED | UNKNOWN` (common/resume_audit.py). EXACT needs at least one exercised
+  (non-cold) exact pair and no NOT-EXERCISED pair. MISMATCH includes a cold A/A pair that differs. UNKNOWN covers arms run with
+  different model, session, mode, sampling, seed or effort, invalid logs, and a failed control.
 - `common/decode_while_prefill.py` prints its phase table (exit 0 measured, 1 a stream failed, 2 usage).
 
 ## What counts as a regression
