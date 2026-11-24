@@ -10,6 +10,20 @@ devices/gfx1151.md, the traps in gotchas.md, what the Loom SDK offers our kernel
 knowledge in kits/<kit>/NOTES.md. Commands below run from the repository root; `KIT` is a directory under kits/.
 Keep a log: one entry per try (what ran, where the data is, the result, the decision), refuted tries included.
 
+## Which skill for what
+
+This file is the entry point and the loop; the companion skills hold one procedure each and end in one verdict line per tool
+(`TOOL: VERDICT`, exit 0 pass / 1 fail / 2 usage or unknown input). Load the one that matches what you measured or need:
+
+| You have / need | Load | Main tools |
+|---|---|---|
+| where served time goes, a part's floor at the machine's power setting, which lever next, the limits table | [strix-critical-path](../strix-critical-path/SKILL.md) | common/events_summary.py --device, ceiling.py, amdahl.py |
+| tokens per verify step, draft depth, drafter cost, greedy vs sampled drafts | [strix-drafter](../strix-drafter/SKILL.md) | common/draft_depth.py |
+| several clients on one server, TTFT spikes, a turn re-prefilling its whole history, KV pool sizing | [strix-concurrency](../strix-concurrency/SKILL.md) | common/kv_budget.py, concurrency_audit.py, decode_while_prefill.py |
+| a kernel's compiled loop: waits, copies, spills, loads in flight | this file, step 6 | common/kernel_lint.py, loop_census.py, load_cover.py |
+| a switch that should change only some kernels | this file, step 8 | common/binary_gate.py |
+| is the candidate exact, is it faster | this file, step 8 | common/eq.sh (planted-difference control), common/agent_ab.sh |
+
 ## The loop
 
 0. **Weights and floors first.** `common/kit_check.sh KIT`: local files match pins.json, upstream freshness, and lanes.json
@@ -36,6 +50,8 @@ Keep a log: one entry per try (what ran, where the data is, the result, the deci
 7. **Change test-first.** Kernel cases that straddle every new boundary (`kit/make_kernel_tests.py`), then deliberate
    breaks of each new guard in the built program: a break that survives is a missing case.
 8. **Candidate check.** `common/build.sh KIT PKG` (EXTRA="SWITCH=1" for the candidate; the exact command lands in PKG.cmd),
+   `common/binary_gate.py REF PKG --allow 'KERNEL_REGEX'` (only the kernels the switch names may compile differently; an --allow that
+   matches nothing means the switch did not apply),
    `common/ktest.sh KIT PKG DIR` (kernel tests stop the chain), `common/eq.sh KIT PKG REF OUT` when the change is meant to
    be exact (texts and draft counters), `common/gates.sh KIT PKG OUT`, then the served ABBA
    (`common/events_ab.sh KIT OUT LENGTH REF CAND CAND REF`) and the agent bench
