@@ -44,6 +44,9 @@ lsk_measuring() {   # a measurement server of ours is alive (its pid file in $ST
 
 lsk_stop() {   # stop our servers (pid files), then any managed server (LSK_STOP_HOOK), and wait for the port
   local f i
+  # LSK_GUARD (machine env, optional): a command that must succeed before anything is stopped. The stop hook alone fenced only the
+  # managed server: a refused hook still came after the pid-file kills, and a dry run killed another run's profiling servers (E438).
+  if [ -n "${LSK_GUARD:-}" ] && ! eval "$LSK_GUARD" >/dev/null; then echo "lsk_stop: LSK_GUARD refused; nothing stopped" >&2; return 1; fi
   for f in "$STATE"/*.pid; do [ -f "$f" ] || continue; kill "$(cat "$f")" 2>/dev/null; rm -f "$f"; done
   [ -n "${LSK_STOP_HOOK:-}" ] && eval "$LSK_STOP_HOOK" >/dev/null 2>&1
   for i in $(seq 1 60); do ss -ltn | grep -q ":$PORT " || return 0; sleep 1; done
