@@ -1,13 +1,17 @@
 #!/bin/bash
 # Hardware counters on a HIP process (ROCm 10.2 rocprofv3 + common/counters/<gfx>.yaml derived metrics), one pass per preset.
 # Loom drives /dev/kfd itself, so profile served code objects through a HIP harness (devices/<gfx>.md), never loom-serve.
-# Presets (each one hardware pass on gfx1151, checked with rocprofv3-avail pmc-check):
-#   waits    what waves wait on: WaitVmemPct WaitDelayAluPct WaitAnyPct + raw SQ_WAIT_* and wave cycles
-#   bytes    MemReadBytes (size-weighted L2 -> memory read requests) and GPU busy cycles
-#   l2       GL2C hits, misses, DRAM and memory-controller read requests
-#   latency  VmemLoadLatency, VmemLoadsInFlight, LdsLatency
-#   lds      LDSBankConflict (% of cycles), SQC_LDS_BANK_CONFLICT, LDS activity and instructions, ALUStalledByLDS: is a modelled
-#            bank conflict (Loom's compile report, common/kernel_lint.py) a measured cost? (E245)
+# Presets (each one hardware pass on gfx1151, checked with rocprofv3-avail pmc-check; definitions follow AMD's, see the yaml):
+#   waits    what waves wait on: WaitVmemPct WaitLgkmPct WaitDelayAluPct WaitAnyPct + raw SQ_WAIT_* and wave cycles
+#   sync     AMD's wait-state table (rocprof-compute 7.9): WaitCntAnyPct WaitBarrierPct WaitIfetchPct WaitAnyPct
+#   issue    is the loop issue-bound? WaitInstAnyPct (AMD 2.1 Wave Issue Wait), WaitInstValuPct, IPC (AMD 2.1), VALU and VOPD counts
+#   bytes    MemReadBytes (size-weighted L2 -> fabric read requests = AMD GL2-Fabric Read BW x time) and GPU busy cycles
+#   l2       L2CacheHit (AMD 13.1), GL2C hits, misses, DRAM and memory-controller read requests
+#   cache    GL0HitPct GL1HitPct (AMD 9.3, 11.3), MemWriteBytes, DramReadBytes / DramWriteBytes (GCEA, AMD 3.9)
+#   latency  VmemLoadLatency, VmemLoadsInFlight, LdsLatency (+ the TEX / FLAT load counts VmemLoadLatency divides by)
+#   lds      LDSBankConflict (% of LDS-active cycles stalled by conflicts, = AMD 3.4 LDS Bank Conflict Rate), SQC_LDS_BANK_CONFLICT,
+#            LDS activity and instructions, ALUStalledByLDS: is a modelled bank conflict (Loom's compile report,
+#            common/kernel_lint.py) a measured cost? (E245)
 # usage: counters.sh OUT_DIR PRESET[,PRESET...] [--kernel REGEX] -- COMMAND ...
 #        counters.sh OUT_DIR calibrate        (bw_probe under bytes, waits, latency; MemReadBytes against the bytes it reads)
 # Trusted counts need power_dpm_force_performance_level=profile_standard (root; restore auto); run on a quiet machine.
@@ -19,10 +23,13 @@ PROF=$(ls "$R/../../../../bin/rocprofv3" "$R/bin/rocprofv3" 2>/dev/null | head -
 Y=$H/counters/$GFX.yaml; [ -f "$Y" ] || { echo "counters: no derived counters for $GFX ($Y)"; exit 1; }
 OUT=${1:?OUT_DIR}; P=${2:?PRESET}; shift 2
 declare -A PMC=(
-  [waits]="WaitVmemPct WaitDelayAluPct WaitAnyPct SQ_WAIT_CNT_VMVS SQ_WAIT_DELAY_ALU SQ_WAIT_ANY SQ_WAIT_CNT_LGKM SQ_WAIT_INST_LDS SQ_WAVE_CYCLES SQ_BUSY_CYCLES"
+  [waits]="WaitVmemPct WaitLgkmPct WaitDelayAluPct WaitAnyPct SQ_WAIT_CNT_VMVS SQ_WAIT_DELAY_ALU SQ_WAIT_ANY SQ_WAIT_CNT_LGKM SQ_WAIT_INST_LDS SQ_WAVE_CYCLES SQ_BUSY_CYCLES"
+  [sync]="WaitCntAnyPct WaitBarrierPct WaitIfetchPct WaitAnyPct SQ_WAVES"
+  [issue]="WaitInstAnyPct WaitInstValuPct IPC SQ_INSTS_VALU SQ_INSTS_DUAL_VALU_WAVE32"
   [bytes]="MemReadBytes GRBM_GUI_ACTIVE"
-  [l2]="GL2C_HIT GL2C_MISS GL2C_EA_RDREQ_DRAM GL2C_MC_RDREQ GRBM_GUI_ACTIVE"
-  [latency]="VmemLoadLatency VmemLoadsInFlight LdsLatency"
+  [l2]="L2CacheHit GL2C_HIT GL2C_MISS GL2C_EA_RDREQ_DRAM GL2C_MC_RDREQ GRBM_GUI_ACTIVE"
+  [cache]="GL0HitPct GL1HitPct MemWriteBytes DramReadBytes DramWriteBytes GRBM_GUI_ACTIVE"
+  [latency]="VmemLoadLatency VmemLoadsInFlight LdsLatency SQ_INSTS_TEX_LOAD SQ_INSTS_FLAT_LOAD"
   [lds]="LDSBankConflict SQC_LDS_BANK_CONFLICT SQC_LDS_IDX_ACTIVE SQ_INSTS_LDS ALUStalledByLDS SQ_INST_CYCLES_LDS SQ_WAVE_CYCLES"
 )
 lvl=$(cat /sys/class/drm/card*/device/power_dpm_force_performance_level 2>/dev/null | head -1)

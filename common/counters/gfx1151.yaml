@@ -1,43 +1,119 @@
-# Derived counters for gfx1151 (rocprofv3 -E this file; ROCm 10.2). Raw counters and units from rocprofv3-avail info --pmc:
-# SQ_WAVE_CYCLES, SQ_WAIT_ANY, SQ_WAIT_INST_ANY are in quad-cycles (4 cycles); SQ_WAIT_CNT_VMVS, SQ_WAIT_DELAY_ALU say "cycles".
-# Until common/counters.sh calibrate has run (bw_probe: known bytes, known waits), the *Pct metrics are unit-uncalibrated and
-# MemReadBytes is checked against bw_probe's 4 GiB. 10.2's own FETCH_SIZE has no gfx1151 expression; MemReadBytes stands in.
+# Derived counters for gfx1151 (rocprofv3 -E this file; ROCm 10.2), checked against AMD's own definitions: rocprofv3's
+# share/rocprofiler-sdk/config.yaml and rocprof-compute 3.10's analysis_configs/gfx115x (panel.table ids cited per metric).
+# Units: every SQ_WAIT_* counter is in the unit of SQ_WAVE_CYCLES, whatever its rocprofv3-avail text says ("cycles" for
+# CNT_VMVS / CNT_LGKM / INST_VALU, "quad-cycles" for ANY / INST_ANY): AMD's panels divide each by SQ_WAVE_CYCLES with no factor,
+# and bw_probe's k_read (q98, a pure streaming read) gives SQ_WAIT_CNT_VMVS / SQ_WAVE_CYCLES = 0.965 with SQ_WAIT_ANY 0.993; a
+# x4 for VMVS would put it at 24 % for a kernel that waits on nothing else. The first version divided VMVS and DELAY_ALU by 4.
+# Bytes: MemReadBytes = 10.2's FETCH_SIZE (gfx1151 expression, KiB) x 1024 = rocprof-compute's GL2-Fabric Read BW (2.1, 3.8.2)
+# x kernel time; calibrated 1.000 on bw_probe (q98).
 rocprofiler-sdk:
   counters-schema-version: 1
   counters:
     - name: MemReadBytes
-      description: 'Bytes the L2 requested from memory (EA read requests weighted by size). Unit: bytes'
+      description: 'Bytes the L2 requested from the fabric (EA read requests weighted by size; AMD GL2-Fabric Read BW x time). Unit: bytes'
       properties: []
       definitions:
         - architectures: [gfx1151]
           expression: reduce(GL2C_EA_RDREQ_32B,sum)*32+reduce(GL2C_EA_RDREQ_64B,sum)*64+reduce(GL2C_EA_RDREQ_96B,sum)*96+reduce(GL2C_EA_RDREQ_128B,sum)*128
-    - name: VmemLoadLatency
-      description: 'Mean cycles a vector-memory load is in flight (as LdsLatency, for TEX_LOAD; includes FLAT/global). Unit: cycles'
+    - name: MemWriteBytes
+      description: 'Bytes the L2 wrote to the fabric (AMD GL2-Fabric Write BW x time, 10.2 WRITE_SIZE x 1024). Unit: bytes'
       properties: []
       definitions:
         - architectures: [gfx1151]
-          expression: reduce(accumulate(SQ_INST_LEVEL_TEX_LOAD,HIGH_RES),sum)/reduce(SQ_INSTS_TEX_LOAD,sum)
+          expression: reduce(GL2C_EA_WRREQ_64B,sum)*64+(reduce(GL2C_MC_WRREQ,sum)-reduce(GL2C_EA_WRREQ_64B,sum))*32
+    - name: DramReadBytes
+      description: 'Bytes read at the DRAM interface (AMD 3.9 DRAM Read Bandwidth x time: GCEA_RDRAM_SIZE_REQ in 32 B). Unit: bytes'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: reduce(GCEA_RDRAM_SIZE_REQ,sum)*32
+    - name: DramWriteBytes
+      description: 'Bytes written at the DRAM interface (AMD 3.9 DRAM Write Bandwidth x time). Unit: bytes'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: reduce(GCEA_WDRAM_SIZE_REQ,sum)*32
+    - name: GL0HitPct
+      description: 'GL0 (TCP) vector cache hit rate (AMD 9.3 / 3.3). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*(reduce(TCP_REQ,sum)-reduce(TCP_REQ_MISS,sum))/reduce(TCP_REQ,sum)
+    - name: GL1HitPct
+      description: 'GL1 cache hit rate (AMD 11.3 / 3.6). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*(reduce(GL1C_REQ,sum)-reduce(GL1C_REQ_MISS,sum))/reduce(GL1C_REQ,sum)
+    - name: VmemLoadLatency
+      description: 'Mean cycles a vector-memory load is in flight. SQ_INST_LEVEL_TEX_LOAD includes FLAT/global loads, SQ_INSTS_TEX_LOAD does not (q98: 0 on global loads), so the count adds SQ_INSTS_FLAT_LOAD. No AMD equivalent. Unit: cycles'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: reduce(accumulate(SQ_INST_LEVEL_TEX_LOAD,HIGH_RES),sum)/(reduce(SQ_INSTS_TEX_LOAD,sum)+reduce(SQ_INSTS_FLAT_LOAD,sum))
     - name: VmemLoadsInFlight
-      description: 'Mean vector-memory loads in flight per busy cycle (Little: latency x issue rate). Unit: loads'
+      description: 'Mean vector-memory loads in flight per busy cycle, whole GPU (Little: latency x issue rate). No AMD equivalent. Unit: loads'
       properties: []
       definitions:
         - architectures: [gfx1151]
           expression: reduce(accumulate(SQ_INST_LEVEL_TEX_LOAD,HIGH_RES),sum)/reduce(GRBM_GUI_ACTIVE,max)
     - name: WaitVmemPct
-      description: 'Waiting on vmcnt/vscnt per wave time (uncalibrated units until calibrate). Unit: percent'
+      description: 'Wave time waiting on vmcnt/vscnt (convention of AMD 7.9 Wait for Counter, restricted to VM/VS). Unit: percent'
       properties: []
       definitions:
         - architectures: [gfx1151]
-          expression: 100*reduce(SQ_WAIT_CNT_VMVS,sum)/(4*reduce(SQ_WAVE_CYCLES,sum))
+          expression: 100*reduce(SQ_WAIT_CNT_VMVS,sum)/reduce(SQ_WAVE_CYCLES,sum)
+    - name: WaitLgkmPct
+      description: 'Wave time waiting on lgkmcnt (LDS, scalar memory, messages; convention of AMD 7.9). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*reduce(SQ_WAIT_CNT_LGKM,sum)/reduce(SQ_WAVE_CYCLES,sum)
     - name: WaitDelayAluPct
-      description: 'Waiting on s_delay_alu per wave time (uncalibrated units until calibrate). Unit: percent'
+      description: 'Wave time waiting on s_delay_alu (convention of AMD 7.9; unit by analogy with VMVS, not separately calibrated). Unit: percent'
       properties: []
       definitions:
         - architectures: [gfx1151]
-          expression: 100*reduce(SQ_WAIT_DELAY_ALU,sum)/(4*reduce(SQ_WAVE_CYCLES,sum))
+          expression: 100*reduce(SQ_WAIT_DELAY_ALU,sum)/reduce(SQ_WAVE_CYCLES,sum)
     - name: WaitAnyPct
-      description: 'Waiting on anything per wave time (both in quad-cycles). Unit: percent'
+      description: 'Wave time waiting on anything (AMD 2.1 Wave Dependency Wait = 7.9 Wait for Any). Unit: percent'
       properties: []
       definitions:
         - architectures: [gfx1151]
           expression: 100*reduce(SQ_WAIT_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+    - name: WaitCntAnyPct
+      description: 'Wave time waiting on any s_waitcnt counter (AMD 7.9 Wait for Counter). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*reduce(SQ_WAIT_CNT_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+    - name: WaitBarrierPct
+      description: 'Wave time waiting at s_barrier (AMD 7.9 Wait for Barrier). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*reduce(SQ_WAIT_BARRIER,sum)/reduce(SQ_WAVE_CYCLES,sum)
+    - name: WaitIfetchPct
+      description: 'Wave time waiting on instruction fetch (AMD 7.9 Wait for Instruction Fetch). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*reduce(SQ_WAIT_IFETCH,sum)/reduce(SQ_WAVE_CYCLES,sum)
+    - name: WaitInstAnyPct
+      description: 'Wave time ready but waiting to issue (AMD 2.1 Wave Issue Wait). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*reduce(SQ_WAIT_INST_ANY,sum)/reduce(SQ_WAVE_CYCLES,sum)
+    - name: WaitInstValuPct
+      description: 'Wave time waiting to issue a VALU (incl. WMMA) instruction: the VALU port is the bottleneck (convention of AMD 7.9; unit by analogy, not calibrated). Unit: percent'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: 100*reduce(SQ_WAIT_INST_VALU,sum)/reduce(SQ_WAVE_CYCLES,sum)
+    - name: IPC
+      description: 'Instructions issued per busy cycle, internal ones excluded (AMD 2.1 IPC). Unit: instructions/cycle'
+      properties: []
+      definitions:
+        - architectures: [gfx1151]
+          expression: (reduce(SQ_INSTS_ALL,sum)-reduce(SQ_INSTS_INTERNAL,sum))/reduce(SQ_BUSY_CYCLES,sum)
