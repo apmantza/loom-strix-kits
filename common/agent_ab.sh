@@ -71,7 +71,7 @@ run() {   # half, package, first turn
 }
 run h1 "$A" 0; run h1 "$B" 0; run h2 "$B" 2; run h2 "$A" 2
 "$T" - "$OUT" "$(basename "$A")" "$(basename "$B")" "$H" "${AB_FLOOR_DECODE:-0.01}" "${AB_FLOOR_PREFILL:-0.07}" <<'PY' | tee "$OUT/summary.txt"
-import glob, json, os, random, sys
+import glob, json, os, random, re, sys
 out, a, b = sys.argv[1:4]
 floor = {"gen_s": float(sys.argv[5]), "ttft": float(sys.argv[6])}
 def rows(pkg):
@@ -161,6 +161,20 @@ for tag in tags:
     tel = open(f"{out}/{tag}.tel.txt").read() if os.path.exists(f"{out}/{tag}.tel.txt") else ""
     if "CONTAMINATED" in tel: untrusted.append(f"{tag} CONTAMINATED by CPU work")
     elif ": clean:" not in tel: untrusted.append(f"{tag} CPU unknown")
+# clock and power per arm and half, side by side (R5, HRX-like E450 / E475): at a power cap a candidate that holds a lower clock at the
+# same power spends more energy per cycle, so its served loss may be a power cost rather than a slower kernel. Informational, never a
+# verdict: A/As of one package read 2.19 vs 2.30 GHz between server starts (E475), so a delta inside ~5 % says nothing alone.
+def telm(tag):
+    p = f"{out}/{tag}.tel.txt"
+    m = re.search(r"while busy: power ([0-9.]+) .*?clock ([0-9.]+) ", open(p).read()) if os.path.exists(p) else None
+    return (float(m.group(1)), float(m.group(2))) if m else None
+for h in ("h1", "h2"):
+    ta, tb = telm(f"{h}-{a}"), telm(f"{h}-{b}")
+    if ta and tb:
+        print(f"clock / power {h}: {a} {ta[1]:.2f} GHz {ta[0]:.1f} W, {b} {tb[1]:.2f} GHz {tb[0]:.1f} W "
+              f"(clock {b}/{a} {tb[1] / ta[1]:.3f}; informational, A/A spread up to ~5 %, E475)")
+    else:
+        print(f"clock / power {h}: no telemetry median for {'both arms' if not (ta or tb) else (a if not ta else b)}")
 # the environment (common/env_block.py, strix-llama.cpp #241): printed once; a half whose block differs from the first half's,
 # or could not be compared (no block, an empty one), makes the bench UNTRUSTED with the differing keys
 print("environment:")
