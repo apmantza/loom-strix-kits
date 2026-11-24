@@ -79,6 +79,15 @@ def main():
         case("a switch the live build carries is not re-litigated", not pr)
         hid = w("q304.sh", '#!/bin/bash\n# prior: none (searched: zzz)\nEXTRA="$SW" bash build.sh\n')
         case("switches hidden in a variable are refused (fail closed)", any("not readable" in x for x in lt.preflight(hid, log)[0]))
+        # Recurrence (11-25, T6 builder): '(searched: ...)' on a continuation line, or a dangling comma, read as no terms and passed
+        cont = w("q305.sh", "#!/bin/bash\n# prior: E11,\n#   (searched: tile order)\necho\n")
+        case("'(searched:' on a continuation line is refused (fail closed)", any("must be on the '# prior:' line" in x for x in lt.preflight(cont, log)[0]))
+        dangle = w("q306.sh", "#!/bin/bash\n# prior: E11,\necho\n")
+        case("a dangling comma after the rows is refused", any("not a parenthetical" in x for x in lt.preflight(dangle, log)[0]))
+        note = w("q307.sh", "#!/bin/bash\n# prior: E10 (a note on why) (searched: tile order)\necho\n")
+        case("a parenthetical note after the rows is admitted and its terms searched", not lt.preflight(note, log)[0])
+        note2 = w("q308.sh", "#!/bin/bash\n# prior: E11 (a note on why) (searched: tile order)\necho\n")
+        case("... and the terms in it still find E10", any("E10" in x for x in lt.preflight(note2, log)[0]))
         case("a grandfathered step passes with a note", lt.preflight(reopen, log, grandfather=300)[1][0].endswith("written before this check)"))
 
         # probe card. Recurrence: results believed with no prediction made before the run (a harness 2x where serving gave 3-8 %).

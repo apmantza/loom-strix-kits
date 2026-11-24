@@ -160,9 +160,20 @@ def preflight(step, log, exclude=frozenset(), exclude_note=None, grandfather=Non
     me = re.match(r"^#\s*prior:\s*((?:" + idr + r")(?:\s*,\s*(?:" + idr + r"))*)(.*)$", pl[0])
     mn = re.match(r"^#\s*prior:\s*none\s*\(searched:\s*([^)]*\S[^)]*)\)\s*$", pl[0])
     cited, terms = set(), []
+    # fail closed on what the parser cannot read (T6 builder, 11-25): '(searched: ...)' on a continuation line, or a prior line
+    # ending in a dangling comma, passed with no terms searched while the same terms on one line gave 17 refusals
+    stray = [l for l in hd if "(searched:" in l and l is not pl[0]]
+    if stray:
+        return [f"{name}: '(searched: ...)' must be on the '# prior:' line itself, found on {stray[0]!r}"], notes
     if me:
         cited = set(re.findall(idr, me.group(1)))
-        s = re.search(r"\(searched:\s*([^)]*)\)", me.group(2))
+        rest = me.group(2).strip()
+        # known-good tails: nothing, or parentheticals ('(searched: a, b)', a note); a dangling comma or bare words are not
+        if rest and not rest.startswith("("):
+            return [f"{name}: '# prior:' line has text after its rows that is not a parenthetical: {rest!r}"], notes
+        s = re.search(r"\(searched:\s*([^)]*\S[^)]*)\)", rest)
+        if "searched:" in rest and not s:
+            return [f"{name}: '# prior:' line has a 'searched:' clause the parser cannot read: {rest!r}"], notes
         terms = [t.strip() for t in s.group(1).split(",") if t.strip()] if s else []
     elif mn:
         terms = [t.strip() for t in mn.group(1).split(",") if t.strip()]
