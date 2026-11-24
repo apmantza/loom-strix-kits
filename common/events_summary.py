@@ -7,9 +7,18 @@ size). Dispatches go to the first lane whose regex matches the kernel name (MODE
 distinct submissions that ran the verify-attention lane. Several RUNs print side by side (an ABBA's four runs).
 
 usage: events_summary.py MODEL.json RUN [RUN ...] [--top 12] [--split KERNEL[:CUT_MS]] [--device DEV.json [--profile P]]
+         [--gate LANE --ref I,J --cand K,L [--min-drop-pct P] [--guard-others PCT] [--expect-kernel REGEX]]
   --device: floors at a device file's power profile (common/devices/<gfx>.json; ceiling.py), not MODEL.json's hardware.
   --split prints a kernel's dispatch-time clusters (E143: vsplit's aligned 1.62 ms vs straddling 3.01 ms) per run: below
   and above CUT_MS (default: midway between the run's 10th and 90th percentile), count and median each.
+  --gate: a one-sided lane gate over an ABBA (E351, E356, E374): a profile can only STOP a candidate, never pass it to go-live
+  (under the 85 W cap device time can drop without a wall-clock gain; the seeded agent bench decides). LANE is a substring of
+  exactly one lane name (else exit 2); --ref / --cand are 1-based RUN positions (two or more each). Noise per lane = the larger
+  of the reference runs' and the candidate runs' spread, (max - min) / mean in %. PASS-TO-BENCH (exit 0) only when the
+  candidate mean is below the reference mean by more than max(noise, --min-drop-pct); --guard-others PCT also stops when any
+  other lane's candidate mean is above its reference by more than max(its noise, PCT); a lane that cannot be measured stops.
+  Prints the (kernel, workgroups) present only in the candidate runs or only in the reference runs; --expect-kernel REGEX
+  stops when no candidate-only kernel name matches (the switch did not reach serving). Exit 1 = STOP.
 """
 import argparse
 import glob
@@ -112,6 +121,86 @@ def clusters(ev, kernel, cut):
     return f"{kernel} (cut {c:.2f} ms): below {f(lo)}, above {f(hi)}, mean {st.mean(xs):.3f} ms"
 
 
+def spread(xs):
+    m = st.mean(xs)
+    return (max(xs) - min(xs)) / m * 100 if m > 0 else float("nan")
+
+
+def lane_gate(a, d, res):
+    """One-sided lane gate (see the module doc): returns the exit code, 0 = PASS-TO-BENCH, 1 = STOP."""
+    names = [ln["lane"] for ln in d["lanes"]]
+    hits = [i for i, n in enumerate(names) if a.gate in n]
+    if len(hits) != 1:
+        print(f"events_summary: --gate {a.gate!r} matches {len(hits)} lanes ({[names[i] for i in hits]}), want exactly one",
+              file=sys.stderr)
+        return 2
+    try:
+        ref = [int(x) - 1 for x in a.ref.split(",")]
+        cand = [int(x) - 1 for x in a.cand.split(",")]
+    except (AttributeError, ValueError):
+        print("events_summary: --gate needs --ref and --cand as comma-separated run positions (1-based)", file=sys.stderr)
+        return 2
+    if (len(ref) < 2 or len(cand) < 2 or set(ref) & set(cand)
+            or not all(0 <= i < len(res) for i in ref + cand)):
+        print(f"events_summary: --ref/--cand need two or more distinct run positions each, disjoint, within 1..{len(res)}",
+              file=sys.stderr)
+        return 2
+    gi = hits[0]
+    stops = []
+    print(f"\nlane gate: reference {', '.join(res[i][0] for i in ref)}; candidate {', '.join(res[i][0] for i in cand)}")
+    print("| lane | reference mean | candidate mean | change | noise |")
+    print("|---|---|---|---|---|")
+    for i, name in enumerate(names):
+        rv = [res[r][5][i][2] for r in ref]
+        cv = [res[c][5][i][2] for c in cand]
+        unit = res[0][5][i][3]
+        rm, cm = st.mean(rv), st.mean(cv)
+        noise = max(spread(rv), spread(cv))
+        # refused, not passed: an unmeasured lane (nan != nan), or a lane missing from a run (a renamed kernel fell into
+        # another lane: its 'drop' would be 100 %)
+        ok = rm > 0 and noise == noise and cm == cm and all(res[j][5][i][1] for j in ref + cand)
+        chg = (cm - rm) / rm * 100 if ok else float("nan")
+        mark = " (gated)" if i == gi else ""
+        print(f"| {name}{mark} | {rm:.3f} {unit} | {cm:.3f} {unit} | {chg:+.2f} % | {noise:.2f} % |")
+        if i == gi:
+            bar = max(noise, a.min_drop_pct) if ok else float("nan")
+            if not ok:
+                stops.append(f"targeted lane {name} cannot be measured in these runs")
+            elif not -chg > bar:
+                stops.append(f"targeted lane did not move beyond noise: skip the bench ({chg:+.2f} %, bar -{bar:.2f} %)")
+        elif a.guard_others is not None:
+            if not ok:
+                if rm != 0 or cm != 0:   # a lane absent from both sides has nothing to guard
+                    stops.append(f"another lane cannot be measured: {name}")
+            elif chg > max(noise, a.guard_others):
+                stops.append(f"another lane got slower: {name} {chg:+.1f} %")
+    kset = lambda idx: {k for j in idx for k in res[j][6]}
+    rk, ck = kset(ref), kset(cand)
+    for label, only, idx in (("candidate-only", ck - rk, cand), ("reference-only", rk - ck, ref)):
+        print(f"\n{label} (kernel, workgroups): {len(only)}")
+        for k, wg in sorted(only, key=lambda kw: -sum(res[j][6].get(kw, (0, 0.0))[1] for j in idx)):
+            n = sum(res[j][6].get((k, wg), (0, 0.0))[0] for j in idx)
+            ms = sum(res[j][6].get((k, wg), (0, 0.0))[1] for j in idx)
+            print(f"  {k:36s} {str(list(wg)):18s} n {n:6d}  {ms / 1e3:8.2f} s (summed over {len(idx)} runs)")
+    if a.expect_kernel is not None:
+        rx = re.compile(a.expect_kernel)
+        if not any(rx.search(k) for k, _ in ck - rk):
+            stops.append(f"no candidate-only kernel matches {a.expect_kernel!r}: the switch did not reach serving")
+    print("\nLANE GATE: " + (f"STOP ({'; '.join(stops)})" if stops else
+                              f"PASS-TO-BENCH ({names[gi]} dropped beyond noise; the agent bench decides)"))
+    return 1 if stops else 0
+
+
+def kernels(ev):
+    """(kernel, workgroups) -> [dispatches, total ms]: the top-kernels table's data and the gate's dispatch evidence."""
+    agg = {}
+    for e in ev:
+        v = agg.setdefault((e["key"], tuple(e.get("workgroup_count", []))), [0, 0.0])
+        v[0] += 1
+        v[1] += e["duration_ns"] / 1e6
+    return agg
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
@@ -120,13 +209,19 @@ def main():
     ap.add_argument("--split", action="append", default=[])
     ap.add_argument("--device", help="device file (common/devices/<gfx>.json): floors at its profile, not MODEL.json's hardware")
     ap.add_argument("--profile", help="the device file's profile (default: its default_profile)")
+    ap.add_argument("--gate", help="one-sided lane gate on the lane whose name contains this (see the module doc)")
+    ap.add_argument("--ref", help="--gate: reference run positions, 1-based, e.g. 1,4")
+    ap.add_argument("--cand", help="--gate: candidate run positions, 1-based, e.g. 2,3")
+    ap.add_argument("--min-drop-pct", type=float, default=0.0, help="--gate: the drop must also exceed this (%%)")
+    ap.add_argument("--guard-others", type=float, help="--gate: stop when another lane rises by more than max(noise, this %%)")
+    ap.add_argument("--expect-kernel", help="--gate: stop unless a candidate-only kernel name matches this regex")
     a = ap.parse_args()
     d = json.load(open(a.model))
     d["hardware"] = hardware(d, a.device, a.profile)   # MODEL.json's block unless --device
     res = []
     for run in a.runs:
         ev, prompt = load(run)
-        res.append((os.path.basename(os.path.normpath(run)), ev, prompt) + summarize(ev, prompt, d))
+        res.append((os.path.basename(os.path.normpath(run)), ev, prompt) + summarize(ev, prompt, d) + (kernels(ev),))
     print("| lane | floor | " + " | ".join(f"{r[0]}: measured (% of floor)" for r in res) + " |")
     print("|---|---|" + "---|" * len(res))
     for i, ln in enumerate(d["lanes"]):
@@ -151,6 +246,8 @@ def main():
         print(f"\ntop {a.top} (kernel, workgroups) in {res[0][0]}:")
         for (k, wg), v in sorted(agg.items(), key=lambda x: -sum(x[1]))[:a.top]:
             print(f"  {k:36s} {str(list(wg)):18s} n {len(v):6d}  {sum(v) / 1e3:8.2f} s  median {st.median(v):9.3f} ms  {sum(v) / tot * 100:5.1f} %")
+    if a.gate is not None:
+        sys.exit(lane_gate(a, d, res))
 
 
 if __name__ == "__main__":

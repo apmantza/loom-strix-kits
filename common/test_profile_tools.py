@@ -148,6 +148,104 @@ class EventsSummary(unittest.TestCase):
         self.assertAlmostEqual(2 * float(fa.split()[0]), float(fb.split()[0]), places=1)
 
 
+def abba_run(root, name, flash2, gemm=1000.0, extra=()):
+    """One served run: a verify step (decode lanes measurable) and a prefill epoch with flash2 + GEMM (abba-e325's shape)."""
+    es = [ev("g_attention_vsplit", 1, 1.0), ev("g_mv_q5_k_k5120_t8_q8", 1, 2.0), ev("g_dfl_attention", 1, 0.5),
+          ev("g_gdn_recurrence_rec", 1, 0.3), ev("g_rope", 1, 0.1)]
+    es += [ev("g_attention_flash2", 9, flash2, (256, 4, 1)), ev("g_gemm_f16_store_m256", 9, gemm, (40, 16, 1)),
+           ev("g_token_info", 9, 0.01, (4096, 1, 1)), ev("g_deq16_q5_k", 9, 50.0), ev("g_gdn_recurrence_pf", 9, 80.0), ev("g_row_scale_f16_live_lv", 9, 90.0)]
+    es += [ev("g_token_info", 10, 0.01, (4096, 1, 1)), ev("g_dfl_kv_store", 10, 10.0)]
+    es += [ev(k, 9, ms, wg) for k, ms, wg in extra]
+    return run_dir(root, name, es)
+
+
+class LaneGate(unittest.TestCase):
+    """--gate (E351/E356/E374): a served profile may STOP a candidate before the 2-hour agent bench, never pass it to go-live."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def abba(self, ref, cand, cgemm=(1000.0, 1000.0), cextra=()):
+        return [abba_run(self.root, "1-ref", ref[0]), abba_run(self.root, "2-cand", cand[0], cgemm[0], cextra),
+                abba_run(self.root, "3-cand", cand[1], cgemm[1], cextra), abba_run(self.root, "4-ref", ref[1])]
+
+    def gate(self, runs, *extra):
+        return summary(*runs, "--top", "0", "--gate", "prefill: attention", "--ref", "1,4", "--cand", "2,3", *extra)
+
+    def test_real_drop_passes(self):
+        # a 7 % flash2 drop with a 1 % reference spread is the one shape that may go on to the agent bench
+        r = self.gate(self.abba((1000.0, 1010.0), (935.0, 940.0)), "--guard-others", "2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("LANE GATE: PASS-TO-BENCH", r.stdout)
+
+    def test_drop_inside_reference_spread_stops(self):
+        # E374: a 3 % drop inside a 6 % A/A spread is noise; benching it costs two hours for a coin flip
+        r = self.gate(self.abba((1000.0, 1060.0), (995.0, 1000.0)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("LANE GATE: STOP (targeted lane did not move beyond noise: skip the bench", r.stdout)
+
+    def test_drop_inside_candidate_spread_stops(self):
+        # the candidate pair's own spread counts too: a tight reference does not make a scattered candidate a win
+        r = self.gate(self.abba((1000.0, 1001.0), (900.0, 1010.0)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+
+    def test_min_drop_pct(self):
+        r = self.gate(self.abba((1000.0, 1010.0), (935.0, 940.0)), "--min-drop-pct", "10")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("did not move beyond noise", r.stdout)
+
+    def test_other_lane_slower_stops(self):
+        # E351: a lane gain paid for by another lane (here the GEMMs +5 %) is no gain: guard-others stops it
+        runs = self.abba((1000.0, 1010.0), (935.0, 940.0), cgemm=(1050.0, 1050.0))
+        r = self.gate(runs, "--guard-others", "2")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("another lane got slower: prefill: GEMMs (f16 WMMA) +5.0 %", r.stdout)
+        self.assertEqual(self.gate(runs).returncode, 0)   # without the guard the target lane alone decides
+
+    def test_missing_expected_kernel_stops(self):
+        # a switch that never reached serving (stale package, env not passed) shows no new kernel: stop, whatever the lanes say
+        r = self.gate(self.abba((1000.0, 1010.0), (935.0, 940.0)), "--expect-kernel", "^g_attention_flash2_smx$")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no candidate-only kernel matches", r.stdout)
+        os.makedirs(os.path.join(self.root, "smx"))
+        root = os.path.join(self.root, "smx")
+        smx = lambda ms: [("g_attention_flash2_smx", ms, (256, 4, 1))]
+        runs = [abba_run(root, "1-ref", 1000.0), abba_run(root, "2-cand", 5.0, extra=smx(930.0)),
+                abba_run(root, "3-cand", 5.0, extra=smx(935.0)), abba_run(root, "4-ref", 1010.0)]
+        r = self.gate(runs, "--expect-kernel", "^g_attention_flash2_smx$")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cand_only = r.stdout.split("candidate-only (kernel, workgroups): 1")[1].split("reference-only")[0]
+        self.assertIn("g_attention_flash2_smx", cand_only)
+        self.assertIn("[256, 4, 1]", cand_only)
+
+    def test_lane_missing_from_candidate_stops(self):
+        # a candidate kernel renamed out of the lane's regex lands in a catch-all: the gated lane reads 0 s, a '100 % drop'
+        os.makedirs(os.path.join(self.root, "gone"))
+        root = os.path.join(self.root, "gone")
+        moved = [("g_attn_new", 930.0, (256, 4, 1))]
+        runs = [abba_run(root, "1-ref", 1000.0), abba_run(root, "2-cand", 0.0, extra=moved),
+                abba_run(root, "3-cand", 0.0, extra=moved), abba_run(root, "4-ref", 1010.0)]
+        for r in runs[1:3]:   # drop the flash2 dispatch itself from the candidate runs
+            p = os.path.join(r, "events.jsonl")
+            keep = [x for x in open(p).readlines() if "g_attention_flash2" not in x]
+            open(p, "w").writelines(keep)
+        r = self.gate(runs)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("cannot be measured", r.stdout)
+
+    def test_lane_must_match_once(self):
+        runs = self.abba((1000.0, 1010.0), (935.0, 940.0))
+        for lane in ("GDN", "no such lane"):   # GDN names a decode and a prefill lane
+            r = summary(*runs, "--top", "0", "--gate", lane, "--ref", "1,4", "--cand", "2,3")
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        r = summary(*runs, "--top", "0", "--gate", "prefill: attention", "--ref", "1", "--cand", "2,3")
+        self.assertEqual(r.returncode, 2)   # one reference run has no spread: no noise estimate, no verdict
+
+
 class LaneBreakdown(unittest.TestCase):
     def test_matvec_gbs_uses_row_groups_on_y(self):
         # matvec launches are workgroups(token_groups, row_groups, 1): rows = y x %rows_per (11-21: reading x gave 0-1 GB/s)
