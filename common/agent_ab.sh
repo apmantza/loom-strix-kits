@@ -17,7 +17,10 @@
 # per-turn time ratios B/A with bootstrap 95 % CIs (all / h1 / h2; E371), the start temperatures and telemetry per half, and last:
 #   BENCH: FASTER | TIE | SLOWER | UNTRUSTED | INVALID      exit 0 | 0 | 1 | 2 | 2  (a failed run: exit 2, no BENCH line)
 #   Rule (E374): a metric (decode time, prefill time) differs when its paired 95 % CI excludes 1.0 AND the ratio is beyond the
-#   A/A floor (AB_FLOOR_DECODE 0.01, AB_FLOOR_PREFILL 0.002: measured on one machine; measure your own with A vs a copy of A).
+#   A/A floor (AB_FLOOR_DECODE 0.01, AB_FLOOR_PREFILL 0.07: measured on one machine; measure your own with A vs a copy of A, over
+#   several server starts). The prefill floor was 0.002 (one start per arm, HRX-like q158); A/As across server starts read the identical
+#   copy's prefill 1.061 [1.031, 1.089] and 1.004 (HRX-like E473 / E475: up to +-18 % on long late turns between starts), so a bench
+#   prefill verdict within 7 % (above the largest A/A, 6.1 %) is per-start noise; judge prefill kernels on served device time (events_ab) until a multi-start floor exists.
 #   SLOWER if any metric is slower; FASTER if one is faster and none slower; TIE otherwise. UNTRUSTED: a half CONTAMINATED by
 #   CPU work, or recorded without CPU columns, or the environment changed between halves (or could not be compared).
 #   INVALID: fewer than 3 turns with equal output lengths, or a half missing.
@@ -67,7 +70,7 @@ run() {   # half, package, first turn
   echo "$tag done $(date +%T)"
 }
 run h1 "$A" 0; run h1 "$B" 0; run h2 "$B" 2; run h2 "$A" 2
-"$T" - "$OUT" "$(basename "$A")" "$(basename "$B")" "$H" "${AB_FLOOR_DECODE:-0.01}" "${AB_FLOOR_PREFILL:-0.002}" <<'PY' | tee "$OUT/summary.txt"
+"$T" - "$OUT" "$(basename "$A")" "$(basename "$B")" "$H" "${AB_FLOOR_DECODE:-0.01}" "${AB_FLOOR_PREFILL:-0.07}" <<'PY' | tee "$OUT/summary.txt"
 import glob, json, os, random, sys
 out, a, b = sys.argv[1:4]
 floor = {"gen_s": float(sys.argv[5]), "ttft": float(sys.argv[6])}
