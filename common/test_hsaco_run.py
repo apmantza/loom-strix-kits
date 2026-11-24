@@ -51,7 +51,124 @@ def readelf_args(path):
     return out
 
 
+class FakeDev:
+    """hsaco_run.Hip's boundary in host memory (the device is the one process boundary; no GPU here): a bump allocator over a byte
+    array, kernels as Python callables over (memory, kernarg packet), timings from a list. Records each timed launch's packet."""
+    def __init__(self, times=()):
+        import numpy as np
+        self.mem, self.top, self.times, self.timed_packets = np.zeros(1 << 20, np.uint8), 4096, list(times), []
+
+    def alloc(self, n):
+        a = self.top; self.top += -(-n // 4096) * 4096
+        assert self.top <= len(self.mem), "fake device out of memory"
+        return a
+
+    def write(self, addr, data):
+        self.mem[addr:addr + len(data)] = data
+
+    def read(self, addr, n):
+        return self.mem[addr:addr + n].copy()
+
+    def prepare(self, kargs):
+        return kargs
+
+    def launch(self, fn, prep, what):
+        fn(self.mem, prep)
+
+    def timed(self, fn, prep):
+        fn(self.mem, prep); self.timed_packets.append(prep)
+        return self.times.pop(0) if self.times else 1.0
+
+
+def cold_cache_checks():
+    """--rotate / --anchor (measure, rotation_plan, memory_guard, anchor_drift, llc_bytes) on the fake device. Recurrences: the
+    harness re-reading one cached copy while claiming cold timing (copies not cycled, or cycled per round so arm B reads what arm A
+    just pulled in); copies filled differently (a copy's output then differs for a reason that is not the kernel); a rotation
+    that fills the box's memory while live serves ~53 GB; anchor drift computed against the wrong window or rounds silently dropped;
+    --rotate auto sized from a figure nobody measured (TensorFold states 64 MiB; this chip's KFD topology says L2 2 + L3 32 MiB)."""
+    import numpy as np, struct, tempfile
+    meta = {".args": [{".name": "x", ".offset": 0, ".size": 8, ".value_kind": "global_buffer"},
+                      {".name": "w", ".offset": 8, ".size": 8, ".value_kind": "global_buffer"},
+                      {".name": "y", ".offset": 16, ".size": 8, ".value_kind": "global_buffer"},
+                      {".name": "n", ".offset": 24, ".size": 4, ".value_kind": "by_value"}], ".kernarg_segment_size": 32}
+    _, alias = hr.bind_names(meta, None)
+
+    def kern(mem, ka, bias=0):                             # y[i] = x[i] + w[i] + BIAS (bytes, mod 256)
+        x, w, y = struct.unpack_from("<QQQ", ka, 0); n, = struct.unpack_from("<i", ka, 24)
+        mem[y:y + n] = ((mem[x:x + n].astype(np.int32) + mem[w:w + n] + bias) % 256).astype(np.uint8)
+    n = 3000
+    spec = {"x": (n, "u8"), "w": (n, "u8"), "y": (n, "zero")}
+    rng = np.random.default_rng(1)
+    host = {k: hr.fill(s, h, rng) for k, (s, h) in spec.items()}
+    # 1. plan: copies = fewest reaching the target over the rotated (non write-only) buffers; unknown write-only refused
+    rot, per, copies = hr.rotation_plan(spec, ["y"], 5 * 2 * n - 1)
+    ok((rot, per, copies) == (["x", "w"], 2 * n, 5), f"plan: x and w rotate, y single, 5 copies reach {5 * 2 * n - 1} B ({rot}, {per}, {copies})")
+    ok(hr.rotation_plan(spec, list(spec), 0)[2] == 1 and hr.rotation_plan(spec, ["y"], 0)[2] == 1, "rotation off: one copy")
+    try:
+        hr.rotation_plan(spec, ["q"], 100); ok(False, "an unknown --write-only name is refused")
+    except SystemExit:
+        ok(True, "an unknown --write-only name is refused")
+    # 2. measure: copies allocated apart and filled identically; launches cycle copies 0..K-1 in order across arms
+    dev = FakeDev()
+    res, rc = hr.measure(dev, [("A", kern), ("B", kern)], meta, alias, {"n": n}, spec, host, rot, copies, compare=["y:f32"], reps=6, warmup=1)
+    xs = [struct.unpack_from("<Q", p, 0)[0] for p in dev.timed_packets]
+    ys = [struct.unpack_from("<Q", p, 16)[0] for p in dev.timed_packets]
+    xaddr = sorted(set(xs))
+    ok(len(xaddr) == copies and all(b - a >= n for a, b in zip(xaddr, xaddr[1:])), f"{copies} distinct, non-overlapping copies of x launched")
+    ok(len(set(ys)) == 1, "the write-only output stays single")
+    seq = [xaddr.index(v) for v in xs]
+    ok(seq == [j % copies for j in range(len(seq))], f"each launch takes the next copy, across arms (sequence {seq[:12]})")
+    ok(res["copy_order"]["A"] == [j % copies for j in range(2, 14, 2)] and res["copy_order"]["B"] == [j % copies for j in range(3, 14, 2)],
+       f"recorded copy order per arm after the warm-up round ({res['copy_order']})")
+    ok(all(np.array_equal(dev.read(a, n), host["x"]) for a in xaddr), "every copy of x holds the same bytes as the host fill")
+    ok(rc == 0 and any(f"all {copies} copies equal" in l for l in res["compare"]), f"--compare checks every copy ({res['compare']})")
+    # 3. a copy whose result differs is reported and fails (exit 1): every copy but the first adds 1
+    first = {}
+
+    def kern2(mem, ka):
+        x, = struct.unpack_from("<Q", ka, 0); first.setdefault("x", x)
+        kern(mem, ka, bias=int(x != first["x"]))
+    res2, rc2 = hr.measure(FakeDev(), [("A", kern2)], meta, alias, {"n": n}, spec, host, rot, copies, compare=["y:f32"], reps=1, warmup=0)
+    ok(rc2 == 1 and any("copy 1 !=" in l for l in res2["compare"]), f"a copy with a different result fails the compare ({res2['compare'][:1]})")
+    # 4. memory guard: refuses over budget x free memory, passes under it; free = min(MemAvailable, free GTT)
+    with tempfile.TemporaryDirectory() as t:
+        mi = os.path.join(t, "meminfo"); open(mi, "w").write("MemTotal: 100 kB\nMemAvailable:   1000 kB\n")
+        card = os.path.join(t, "card0", "device"); os.makedirs(card)
+        open(os.path.join(card, "mem_info_gtt_total"), "w").write(str(900 * 1024)); open(os.path.join(card, "mem_info_gtt_used"), "w").write(str(100 * 1024))
+        free = hr.free_memory(mi, os.path.join(t, "card*", "device"))
+        ok(free[0] == 800 * 1024 and "GTT free" in free[1], f"free memory = the smaller of MemAvailable and free GTT ({free})")
+        big = {"x": (100 * 1024, "u8"), "y": (4096, "zero")}
+        try:
+            hr.memory_guard(big, ["x"], 5, free, 0.5); ok(False, "memory guard refuses 5 x 100 KiB over 0.5 x 800 KiB")
+        except SystemExit as e:
+            ok("free memory" in str(e), "memory guard refuses 5 x 100 KiB over 0.5 x 800 KiB")
+        ok(hr.memory_guard(big, ["x"], 3, free, 0.5) == 3 * 100 * 1024 + 4096, "memory guard passes 3 copies (304 KiB) and counts the single buffer once")
+        # 5. LLC from a KFD topology: the GPU node (simd_count > 0), levels >= 2 summed, L1 left out
+        for node, simd, caches in (("0", 0, [(3, 99999)]), ("1", 80, [(1, 32), (2, 2048), (3, 32768)])):
+            d = os.path.join(t, "nodes", node); os.makedirs(d)
+            open(os.path.join(d, "properties"), "w").write(f"cpu_cores_count 16\nsimd_count {simd}\n")
+            for i, (lv, kib) in enumerate(caches):
+                os.makedirs(os.path.join(d, "caches", str(i)))
+                open(os.path.join(d, "caches", str(i), "properties"), "w").write(f"processor_id_low 1\nlevel {lv}\nsize {kib}\n")
+        llc = hr.llc_bytes(os.path.join(t, "nodes"))
+        ok(llc[0] == (2048 + 32768) * 1024 and "L2 2048 KiB + L3 32768 KiB" in llc[1], f"LLC from the GPU node, L2 + L3 ({llc})")
+    # 6. anchor drift: arm A's window medians against the first window; drifting windows flagged, every round kept
+    ta = [1.0] * 4 + [1.02] * 4 + [1.2] * 4 + [1.0, 1.0]
+    an = hr.anchor_drift(ta, 4, 0.10)
+    ok([round(w[3], 3) for w in an["windows"]] == [0.0, 0.02, 0.2, 0.0] and an["flagged"] == [8, 9, 10, 11],
+       f"drift per window against the first, rounds 8-11 flagged ({[round(w[3], 3) for w in an['windows']]}, {an['flagged']})")
+    ok(abs(an["max_drift"] - 0.2) < 1e-9 and hr.anchor_drift(ta, 0, 0.1) is None, "max drift reported; no anchor without N")
+    dev3 = FakeDev(times=[9.0, 9.0] + [x for v in ta for x in (v, 2.0)])
+    res3, _ = hr.measure(dev3, [("A", kern), ("B", kern)], meta, alias, {"n": n}, spec, host, [], 1, reps=len(ta), warmup=1, anchor=4)
+    ok(res3["anchor"]["flagged"] == [8, 9, 10, 11] and len(res3["times"]["B"]) == len(ta) and res3["times"]["A"] == ta,
+       "measure: the anchor reads arm A's timed rounds (warm-up excluded); flagged rounds stay in both arms' times")
+
+
 def main():
+    cold_cache_checks()
+    if len(sys.argv) < 3:                                  # the checks below need a real program and its code objects
+        print("(no PROGRAM.loom CODE_OBJECT_DIR: metadata, region and packer checks skipped)")
+        sys.exit(1 if fails else 0)
     prog, objdir = sys.argv[1], sys.argv[2]
     # 1. metadata against llvm-readelf, every code object
     objs = sorted(glob.glob(os.path.join(objdir, "**", "*.hsaco"), recursive=True))
@@ -154,6 +271,12 @@ def main():
             ok(r.returncode != 0 and "not auto" in (r.stdout + r.stderr), "timing at profile_standard refused (exit nonzero, 'not auto')")
             r = subprocess.run(base + ["--dry-run"], capture_output=True, text=True, env=env)
             ok("not auto" not in r.stderr, "a dry run at profile_standard is not refused")
+            # the CLI wires the rotation plan and the memory guard ahead of any device (dry run)
+            rb = [x if x != "scales=1:zero" else "scales=8192:zero" for x in base]   # scales sized to its view (8 B x rows)
+            r = subprocess.run(rb + ["--dry-run", "--rotate-bytes", "30000", "--write-only", "y"], capture_output=True, text=True, env=env)
+            ok(r.returncode == 0 and "rotation: 4 copies" in r.stdout and "single: ['y']" in r.stdout, f"--rotate-bytes plans copies in a dry run ({r.stdout[-160:]!r})")
+            r = subprocess.run(rb + ["--dry-run", "--rotate-bytes", "30000", "--mem-budget", "1e-12"], capture_output=True, text=True, env=env)
+            ok(r.returncode != 0 and "free memory" in r.stderr, "the memory guard refuses through the CLI before any device")
     sys.exit(1 if fails else 0)
 
 
