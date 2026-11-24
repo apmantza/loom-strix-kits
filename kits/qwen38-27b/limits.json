@@ -11,110 +11,110 @@
   {
    "phase": "decode",
    "unit": "ms/step",
-   "wall": 115.1,
+   "wall": 114.67,
    "screen_pct": 1.0,
    "_src_wall": "sum of the lanes below (events_summary covers every dispatch: the catch-all lane included); E369: ~123 ms with verify attention at 27.4, 19.6 with HEADPACK",
    "_src_screen": "A/A noise floor of the seeded agent bench, decode ~1 % (E374)",
    "candidates": [
     {
      "name": "target weight matvecs to floor",
-     "target": 79.4,
+     "target": 79.33,
      "to_floor": "decode: target weight matvecs",
      "overlap_group": "matvecs",
-     "src": "E301 (79.4); floor 16.58 GB at 240 GB/s (E217, E380)"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was E301 (79.4); floor 16.58 GB at 240 GB/s (E217, E380)"
     },
     {
      "name": "verify attention to floor",
-     "target": 19.6,
+     "target": 19.44,
      "to_floor": "decode: verify attention",
      "overlap_group": "verify attention",
-     "src": "E350 (HEADPACK 19.54-19.72); KV8 bytes at 240 GB/s"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was E350 (HEADPACK 19.54-19.72); KV8 bytes at 240 GB/s"
     },
     {
      "name": "drafter to floor",
-     "target": 10.5,
+     "target": 10.43,
      "to_floor": "decode: drafter",
      "overlap_group": "drafter",
-     "src": "E367 (10.49); weights + head + warm at 240 GB/s"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was E367 (10.49); weights + head + warm at 240 GB/s"
     },
     {
      "name": "GDN to floor",
-     "target": 3.6,
+     "target": 3.55,
      "to_floor": "decode: GDN",
      "overlap_group": "gdn",
-     "src": "E185 (3.58); state read + write at 240 GB/s"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was E185 (3.58); state read + write at 240 GB/s"
     },
     {
      "name": "other to 0",
-     "target": 2.0,
+     "target": 1.92,
      "to": 0,
      "overlap_group": "other",
-     "src": "limits table (small launch-bound kernels, E148; launch gaps 0.87 ms, E328)"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was limits table (small launch-bound kernels, E148; launch gaps 0.87 ms, E328)"
     }
    ],
    "expect": {
-    "wall": 115.1,
+    "wall": 114.67,
     "after": 90.1,
     "tolerance_pct": 1,
-    "_src": "wall: E369 with HEADPACK's 19.6; after: the floors at 240 GB/s on every lane (see _discrepancy)"
+    "_src": "measured: q172 checkpoint profile of live pkg-e379, mean of 3 runs (HRX-like E423); after: the floors at 240 GB/s on every lane"
    }
   },
   {
    "phase": "prefill",
    "unit": "s/prompt",
-   "wall": 196.75,
+   "wall": 191.26,
    "screen_pct": 0.2,
    "_src_wall": "sum of the lanes below; E369: ~197 s",
    "_src_screen": "A/A noise floor, prefill ~0.2 % (E374)",
    "candidates": [
     {
      "name": "GEMMs to floor",
-     "target": 111.8,
+     "target": 111.82,
      "to_floor": "prefill: GEMMs (f16 WMMA)",
      "overlap_group": "gemm",
-     "src": "E301 (111.77); 2 x 24.35e9 params x 81,430 at 43.8 TFLOP/s (E369)"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was E301 (111.77); 2 x 24.35e9 params x 81,430 at 43.8 TFLOP/s (E369)"
     },
     {
      "name": "flash2 attention to floor",
-     "target": 60.2,
+     "target": 58.9,
      "to_floor": "prefill: attention (flash2)",
      "overlap_group": "attention",
-     "src": "E301 (60.2); causal QK + PV FLOPs at 43.8 TFLOP/s"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was E301 (60.2); causal QK + PV FLOPs at 43.8 TFLOP/s"
     },
     {
      "name": "dequant to floor",
-     "target": 5.8,
+     "target": 5.63,
      "to_floor": "prefill: weight dequant to f16 scratch",
      "overlap_group": "dequant",
-     "src": "E301 (5.82); 20 chunks x (15.54 GB + 2 B x params) at 240 GB/s"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was E301 (5.82); 20 chunks x (15.54 GB + 2 B x params) at 240 GB/s"
     },
     {
      "name": "GDN to exact-form floor",
-     "target": 9.5,
+     "target": 9.15,
      "to": 3.8,
      "overlap_group": "gdn",
-     "src": "E301 (9.45); exact-form floor ~3.8 s (E186)"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was E301 (9.45); exact-form floor ~3.8 s (E186)"
     },
     {
      "name": "drafter warm to 0",
      "target": 1.25,
      "to": 0,
      "overlap_group": "drafter warm",
-     "src": "E364 (1.25)"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was E364 (1.25)"
     },
     {
      "name": "other to 0",
-     "target": 8.2,
+     "target": 4.51,
      "to": 0,
      "overlap_group": "other",
-     "src": "limits table (8.2 with F16O11, E329); EPI_FUSE 5.47 (E360) and F16O_O (E378) not yet in this table's measured column"
+     "src": "HRX-like E423: q172 checkpoint profile of live pkg-e379, mean of 3 runs at 81,432 tokens (spread 0.2-1.8 %); was limits table (8.2 with F16O11, E329); EPI_FUSE 5.47 (E360) and F16O_O (E378) not yet in this table's measured column"
     }
    ],
    "expect": {
-    "wall": 197,
-    "after": 130,
-    "tolerance_pct": 1.6,
-    "_src": "E369: ~197 s now, ~128-132 s at the cap"
+    "wall": 191.26,
+    "after": 129.66,
+    "tolerance_pct": 1,
+    "_src": "measured: q172 checkpoint profile of live pkg-e379, mean of 3 runs (HRX-like E423); after: the floors at the 85 W cap"
    }
   }
  ],

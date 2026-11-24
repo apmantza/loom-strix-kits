@@ -75,11 +75,11 @@ class Amdahl(unittest.TestCase):
         self.assertIn("DISCREPANCY", r.stdout)
 
     def test_qwen_limits_table_reproduces(self):
-        # positive check: LEDGER's limits table (E369 construction, E350's HEADPACK) at the 85 W floors
+        # positive check: the kit's limits table, measured on live pkg-e379 (HRX-like E423, q172), at the 85 W floors
         r = run("amdahl.py", os.path.join(ROOT, "kits", "qwen38-27b", "limits.json"), "--device", DEV)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("115.10 -> 90.09 ms/step", r.stdout)
-        self.assertIn("196.75 -> 129.38 s/prompt", r.stdout)
+        self.assertIn("114.67 -> 90.09 ms/step", r.stdout)
+        self.assertIn("191.26 -> 129.66 s/prompt", r.stdout)
         self.assertIn("| compute | x1.631 |", r.stdout)
         # the levers take ceiling.py's lane floors (to_floor): at cap85w no chain term binds, the trip latency is unknown
         self.assertIn("decode: GDN = 1.307 (binds: bandwidth; bandwidth 1.307, chain 0.234); chain is a lower bound, "
