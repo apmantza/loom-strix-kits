@@ -144,6 +144,25 @@ def main():
            "g_k split: 1 ms prefill (flash2 submission), 2 ms decode", {k: v["ms"] for k, v in rows.items()})
         ok(rows[("g_attention_flash2", "prefill")]["shapes"] == {128}, "shape = workgroups product", rows[("g_attention_flash2", "prefill")]["shapes"])
 
+    # counters.sh writes one CSV per preset, each numbering dispatches from 1, and SQ_WAVE_CYCLES sits in several presets: summed
+    # per dispatch id alone it counted 3x and every wait share read a third (T6: q130's any-wait 65.0 % read 32.5 %)
+    with tempfile.TemporaryDirectory() as t:
+        H2 = '"Dispatch_Id","Grid_Size","Kernel_Name","Workgroup_Size","Counter_Name","Counter_Value","Start_Timestamp","End_Timestamp"\n'
+        WC = 1e9
+        for name, cs in (("waits", {"SQ_WAVE_CYCLES": WC, "SQ_WAIT_CNT_VMVS": 0.4 * WC, "SQ_WAIT_ANY": 0.8 * WC}),
+                         ("lds", {"SQ_WAVE_CYCLES": WC, "SQC_LDS_BANK_CONFLICT": 5e4, "SQC_LDS_IDX_ACTIVE": 1e6}),
+                         ("split", {"SQ_WAVE_CYCLES": WC, "SQ_WAIT_INST_ANY": 0.3 * WC, "SQ_WAIT_ANY": 0.8 * WC})):
+            os.makedirs(f"{t}/{name}")
+            with open(f"{t}/{name}/{name}_counter_collection.csv", "w") as f:
+                f.write(H2)
+                for i in (1, 2):
+                    for c, v in cs.items():
+                        f.write(f'{i},327680,"g_k",256,"{c}",{v},{1000 * i},{1000 * i + 1000000}\n')
+        m = lc.metrics(lc.read_rows(t)["g_k"], set())
+        ok(abs(m["vmem"] - 40) < 1e-6 and abs(m["any"] - 80) < 1e-6 and abs(m["issue"] - 30) < 1e-6,
+           "counters.sh presets: a counter in two presets is not summed twice (vmem 40, any 80, issue 30)",
+           {k: round(m[k], 1) for k in ("vmem", "any", "issue")})
+
     print(f"{'FAILED ' + str(fails) if fails else 'all ok'}")
     sys.exit(1 if fails else 0)
 

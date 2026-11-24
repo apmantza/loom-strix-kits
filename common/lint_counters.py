@@ -190,7 +190,7 @@ def read_rows(d):
                     v = float(r["counter_value"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                did = r.get("dispatch_id") or r.get("correlation_id")
+                did = (f, r.get("dispatch_id") or r.get("correlation_id"))   # per file: counters.sh presets each number dispatches from 1 (T6)
                 acc[k][c][did] += v
                 try:
                     dur[k][c][did] = int(r["end_timestamp"]) - int(r["start_timestamp"])
