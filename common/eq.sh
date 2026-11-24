@@ -14,4 +14,4 @@ if [ -d "$REF" ]; then r=$(lsk_pkg "$REF"); save "$r" "$OUT/ref-$(basename "$r")
 [ -f "$REF" ] || die "no reference $REF"
 save "$C" "$OUT/$(basename "$C").json"
 "$PYTHON" "$H/compare_outputs.py" --diff "$REF" "$OUT/$(basename "$C").json"; d=$?
-echo "eq: $(basename "$C") vs $(basename "$REF"): $([ $d -eq 0 ] && echo EXACT || echo DIFFERS) (exit $d)"; exit $d
+echo "eq: $(basename "$C") vs $(basename "$REF"): $(case $d in 0) echo EXACT;; 3) echo "CONTROL FAILED (no verdict)";; *) echo DIFFERS;; esac) (exit $d)"; exit $d

@@ -1,0 +1,83 @@
+target.decl @device
+amdgpu.target<gfx11-generic> @rdna3
+
+// kit/test_kernel_lint.py's binary_gate fixture: two kernels sharing an inline load helper (the E372 shape: a rewrite meant
+// for one caller of a helper reaches the other) and one kernel that does not call it.
+func.def inline @bg_load(%w: buffer, %i: index) -> (f32) {
+  %c0 = index.constant 0 : index
+  %four = index.constant 4 : offset
+  %off = index.scale %i, %four : index, offset -> offset
+  %v = buffer.view %w[%off] : buffer -> view<1xf32>
+  %x = view.load %v[%c0] : view<1xf32> -> f32
+  func.return %x : f32
+}
+
+kernel.def target(@rdna3) export("bg_store") @bg_store(%n: index) {
+  %c1 = index.constant 1 : index
+  %c64 = index.constant 64 : index
+  %g = index.div %n, %c64 : index
+  kernel.launch.config workgroups(%g, %c1, %c1) workgroup_size(%c64, %c1, %c1) : index
+} launch(%n_arg: index, %w: buffer, %y: buffer) {
+  %n = index.assume %n_arg [range(%n_arg, 64, 65536), multiple_of(%n_arg, 64)] : index
+  %c64 = index.constant 64 : index
+  %wg = kernel.workgroup.id<x> : index
+  %lid = kernel.workitem.id<x> : index
+  %b = index.mul %wg, %c64 : index
+  %i = index.add %b, %lid : index
+  %x = func.call @bg_load(%w, %i) : (buffer, index) -> (f32)
+  %two = scalar.constant 2.0 : f32
+  %r = scalar.mulf %x, %two : f32
+  %z = index.constant 0 : offset
+  %live = index.cmp ult, %i, %n : index
+  scf.if %live {
+    %yv = buffer.view %y[%z] : buffer -> view<[%n]xf32>
+    view.store %r, %yv[%i] : f32, view<[%n]xf32>
+  }
+  kernel.return
+}
+
+kernel.def target(@rdna3) export("bg_swiglu") @bg_swiglu(%n: index) {
+  %c1 = index.constant 1 : index
+  %c64 = index.constant 64 : index
+  %g = index.div %n, %c64 : index
+  kernel.launch.config workgroups(%g, %c1, %c1) workgroup_size(%c64, %c1, %c1) : index
+} launch(%n_arg: index, %w: buffer, %w2: buffer, %y: buffer) {
+  %n = index.assume %n_arg [range(%n_arg, 64, 65536), multiple_of(%n_arg, 64)] : index
+  %c64 = index.constant 64 : index
+  %wg = kernel.workgroup.id<x> : index
+  %lid = kernel.workitem.id<x> : index
+  %b = index.mul %wg, %c64 : index
+  %i = index.add %b, %lid : index
+  %g0 = func.call @bg_load(%w, %i) : (buffer, index) -> (f32)
+  %u0 = func.call @bg_load(%w2, %i) : (buffer, index) -> (f32)
+  %r = scalar.mulf %g0, %u0 : f32
+  %z = index.constant 0 : offset
+  %live = index.cmp ult, %i, %n : index
+  scf.if %live {
+    %yv = buffer.view %y[%z] : buffer -> view<[%n]xf32>
+    view.store %r, %yv[%i] : f32, view<[%n]xf32>
+  }
+  kernel.return
+}
+
+kernel.def target(@rdna3) export("bg_other") @bg_other(%n: index) {
+  %c1 = index.constant 1 : index
+  %c64 = index.constant 64 : index
+  %g = index.div %n, %c64 : index
+  kernel.launch.config workgroups(%g, %c1, %c1) workgroup_size(%c64, %c1, %c1) : index
+} launch(%n_arg: index, %y: buffer) {
+  %n = index.assume %n_arg [range(%n_arg, 64, 65536), multiple_of(%n_arg, 64)] : index
+  %c64 = index.constant 64 : index
+  %wg = kernel.workgroup.id<x> : index
+  %lid = kernel.workitem.id<x> : index
+  %b = index.mul %wg, %c64 : index
+  %i = index.add %b, %lid : index
+  %one = scalar.constant 1.0 : f32
+  %z = index.constant 0 : offset
+  %live = index.cmp ult, %i, %n : index
+  scf.if %live {
+    %yv = buffer.view %y[%z] : buffer -> view<[%n]xf32>
+    view.store %one, %yv[%i] : f32, view<[%n]xf32>
+  }
+  kernel.return
+}

@@ -56,10 +56,11 @@ common/serve.sh qwen38-27b pkg                        # OpenAI-compatible API, t
 | `common/state.sh KIT [--pkg\|--idle]` | shows what serves on the port, read-only |
 | `common/ktest.sh KIT PKG DIR` | runs the kernel tests for exactly the switches PKG was built with |
 | `common/serve_as.sh KIT PKG` | serves one package for a measurement: stops other servers, waits for a quiet machine, checks the port serves PKG |
-| `common/eq.sh KIT PKG REF OUT` | greedy outputs and draft counters against a reference, one server at a time; exits 1 on any difference |
+| `common/eq.sh KIT PKG REF OUT` | greedy outputs and draft counters against a reference, one server at a time; exits 1 on any difference, 3 (CONTROL FAILED) when the comparison misses a planted one-character / one-counter difference |
 | `common/gates.sh KIT PKG OUT` | runs loom-skills' quick gates (llama.cpp reference outputs, chat, tools, vision, concurrency) |
 | `common/agent_ab.sh KIT A B OUT SESSION` | A/B on a frozen agent session (`agent_bench/freeze.py`), ABBA halves |
 | `common/loop_census.py`, `kernel_lint.py`, `load_cover.py`, `load_events.py` | code-object analysis: hot loops, register moves, load-to-wait cover; the lint over a package, against another build or compiler |
+| `common/binary_gate.py BASE CAND --allow REGEX` | untouched-kernel gate between two packages: per kernel, the source closure (own text + every helper it reaches); changed closures compiled and compared on ISA, VGPR, SGPR, scratch, LDS; fails on an unallowed change, a missing kernel, new scratch, or an `--allow` that changed nothing |
 | `common/serve_code_dump.py` | dumps the kernels a running loom-serve compiled, which are not always the ones a benchmark compiles |
 | `common/agent_run_summary.py` | summarizes server-side numbers of an agent run from /metrics snapshots |
 | `common/events_ab.sh KIT OUT LEN PKG...` | served per-dispatch profiles (ABBA order) at one prompt size, then every lane against its hardware floor (`kits/<kit>/lanes.json`) |

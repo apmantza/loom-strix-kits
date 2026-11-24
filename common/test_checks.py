@@ -8,9 +8,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import checks  # noqa: E402
 
 fails = []
+ran = []
 
 
 def case(name, cond):
+    ran.append(name)
     print(("PASS " if cond else "FAIL ") + name)
     if not cond:
         fails.append(name)
@@ -51,5 +53,30 @@ with tempfile.TemporaryDirectory() as d:
     m = checks.drm_memory(1234, proc=d)
     case("drm: one client counted once, resident used when memory is absent", m == {"gtt": 1048576 + 2048, "vram": 1024})
 
-print(f"{8 + 1 - len(fails)}/{8 + 1} passed" if not fails else f"{len(fails)} FAILED")
+# compare_outputs.py --diff decides EXACT; its planted-fault control must refuse a comparison that cannot fail. Recurrence: an
+# always-equal comparison (a key never compared, an edit that makes eq constant) would report every candidate EXACT.
+import json, subprocess  # noqa: E401,E402
+CO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compare_outputs.py")
+with tempfile.TemporaryDirectory() as d:
+    ref = {"p1": {"text": "the same answer", "prompt_tokens": 70, "draft": {"draft_proposed_tokens": 9.0}},
+           "p2": {"text": "", "prompt_tokens": 80, "draft": {}}}
+    json.dump(ref, open(f"{d}/a.json", "w"))
+    bad = json.loads(json.dumps(ref)); bad["p1"]["text"] = "the same answeR"
+    json.dump(bad, open(f"{d}/b.json", "w"))
+    run = lambda prog, b: subprocess.run([sys.executable, prog, "--diff", f"{d}/a.json", f"{d}/{b}.json"], capture_output=True,
+                                         text=True, env=dict(os.environ, LOOM_SKILLS=""))
+    r = run(CO, "a")
+    case("eq: identical outputs pass after the control, offline (no LOOM_SKILLS)", r.returncode == 0 and "control ok: 4 planted" in r.stdout)
+    case("eq: one changed character differs", run(CO, "b").returncode == 1)
+    src = open(CO).read()
+    for what, a_, b_ in (("always-equal texts and drafts", "eq = x == y", "eq = True"),
+                         ("drafts never compared", "(text_only or dsame == len(A))", "True")):
+        assert src.count(a_) == 1, f"compare_outputs.py changed: update the mutation of {what}"
+        m = src.replace(a_, b_).replace("dsame += da == db", "dsame += True") if what.startswith("always") else src.replace(a_, b_)
+        open(f"{d}/mut.py", "w").write(m)
+        os.symlink(os.path.join(os.path.dirname(CO), "checks.py"), f"{d}/checks.py") if not os.path.exists(f"{d}/checks.py") else None
+        r = run(f"{d}/mut.py", "a")
+        case(f"eq control: a comparison with {what} is refused (exit 3, CONTROL FAILED)", r.returncode == 3 and "CONTROL FAILED" in r.stdout)
+
+print(f"{len(ran) - len(fails)}/{len(ran)} passed" if not fails else f"{len(fails)} FAILED")
 sys.exit(1 if fails else 0)
