@@ -119,7 +119,8 @@ for a fraction of the next one's cost.
 
 Before designing a fix (not after a refuted try), ask how other engines met the same bottleneck. Sources,
 all of them every time: llama.cpp HIP and Vulkan, Strata (github.com/Niko1221/Strata), DwarfStar, strix-halo-engine-lab
-(github.com/hyukudan/strix-halo-engine-lab, Strix-specific), TensorFold (github.com/ashhart/TensorFold, Apache-2.0: CUDA, Metal
+(github.com/hyukudan/strix-halo-engine-lab, Strix-specific), strix-llama.cpp (github.com/halo-box/strix-llama.cpp, MIT,
+Strix-specific llama.cpp fork with measured gfx1151 findings), TensorFold (github.com/ashhart/TensorFold, Apache-2.0: CUDA, Metal
 and a HIP backend with kernel cost tables measured on gfx1151 (zig/src/hip/tuning/gfx1151.zon); GDN, attention and drafter paths for a
 Qwen3.8 hybrid), vLLM and SGLang, and loom-fun/loom-skills' knowledge base.
 Read a closed-licence engine for technique notes only, never derived code. Give each surveyor the measured diagnosis
