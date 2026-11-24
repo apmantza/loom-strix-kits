@@ -55,7 +55,7 @@ def items(text):
             if m:
                 name = m.group(1)
             else:
-                h = re.sub(r"target\(@\w+\)|<@[\w.]+>", "", line)
+                h = re.sub(r"target(?:<[^>]*>)?\(@\w+\)|<@[\w.]+>", "", line)   # low.func.def target<core>(@t) @f: named @f, not @t
                 r = REF.search(h)
                 name = r.group(1) if r else line.split()[0] + "#" + str(len(out))
             buf = [line]

@@ -7,6 +7,9 @@ helper @bg_load, bg_other calls nothing) and on synthetic metrics. Recurrences i
   - a switch that did not apply passing its step (the per-step "rewrites present" greps this replaces): an --allow that matches no
     changed kernel fails;
   - a kernel dropped by a switch, a new spill, a kernel that no longer compiles passing (fail closed);
+  - an authored Low helper (`low.func.def target<core>(@rdna3) @f`, called through low.invoke) filed under the target @rdna3
+    instead of @f (FLASH2_SMX2, 11-24): a changed helper then left its untargeted caller "same" (never compiled) and marked every
+    @rdna3 kernel changed;
   - renames / comment edits that do not change code flagged (false reds teach people to route around a gate): text-only passes,
     and an unchanged closure is not compiled at all.
 usage: python3 kit/test_binary_gate.py   (needs loom-compile: VENV from the environment or the machine env file)"""
@@ -27,7 +30,33 @@ def ok(cond, what):
     fails += not cond
 
 
+LOW = """amdgpu.target<gfx11-generic> @rdna3
+
+low.func.def target<amdgpu.gfx11.generic.core>(@rdna3) @lowh(%a: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr>) asm {
+  %b = v_mov_b32 %a
+  return %b
+}
+
+kernel.def export("k_uses") @k_uses(%n: index) {
+  %y = low.invoke @lowh(%x) : (i32) -> (i32)
+} launch(%n: index) {
+}
+
+kernel.def target(@rdna3) export("k_other") @k_other(%n: index) {
+} launch(%n: index) {
+}
+"""
+
+
+def low_helper_closure():
+    """compile-free: a low.func.def helper is its own item, in its invoker's closure only"""
+    a, b = bg.closures(LOW), bg.closures(LOW.replace("v_mov_b32 %a", "v_not_b32 %a"))
+    ok("lowh" in bg.items(LOW) and a["k_uses"] != b["k_uses"] and a["k_other"] == b["k_other"],
+       f"a changed low.func.def helper changes its low.invoke caller's closure only (items {sorted(bg.items(LOW))})")
+
+
 def main():
+    low_helper_closure()
     src = open(os.path.join(HERE, "fixtures", "binary_gate.loom")).read()
     helper_load = "  %x = view.load %v[%c0] : view<1xf32> -> f32\n  func.return %x : f32\n"
     assert src.count(helper_load) == 1 and src.count("%two = scalar.constant 2.0 : f32") == 1, "fixture text changed: update this test"
