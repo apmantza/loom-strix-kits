@@ -14,6 +14,8 @@
 #            common/kernel_lint.py) a measured cost? (E245)
 # usage: counters.sh OUT_DIR PRESET[,PRESET...] [--kernel REGEX] -- COMMAND ...
 #        counters.sh OUT_DIR calibrate        (bw_probe under bytes, waits, latency; MemReadBytes against the bytes it reads)
+# Each preset ends with counter_saturation.py's verdict: a counter at k x 2^32 (32-bit instances saturated on a long launch) fails the run
+# unless COUNTERS_ALLOW_SATURATED=1; shorten the launch instead (fewer tokens or less context).
 # Trusted counts need power_dpm_force_performance_level=profile_standard (root; restore auto); run on a quiet machine.
 set -u -o pipefail
 H=$(cd "$(dirname "$0")" && pwd)
@@ -50,5 +52,8 @@ for p in ${P//,/ }; do
     ${KER:+--kernel-include-regex "$KER"} --output-format csv -d "$OUT/$p" -o "$p" -- "$@" > "$OUT/$p/run.log" 2>&1 \
     || { echo "counters: preset $p failed (exit $?): $OUT/$p/run.log"; tail -5 "$OUT/$p/run.log"; rc=1; continue; }
   echo "== $p"; python3 "$H/counters_summary.py" "$OUT/$p" ${KER:+--kernel "$KER"} || rc=1
+  python3 "$H/counter_saturation.py" "$OUT/$p" ${KER:+--kernel "$KER"}; s=$?   # 32-bit counters stop at 2^32 per instance on long launches
+  [ $s = 1 ] && [ "${COUNTERS_ALLOW_SATURATED:-0}" = 1 ] && { echo "counters: saturated counters allowed (COUNTERS_ALLOW_SATURATED=1): ratios on them are wrong"; s=0; }
+  [ $s = 0 ] || rc=1
 done
 exit $rc
