@@ -49,7 +49,7 @@ def twin(text):
             if V == "%w_wave_view":   # m256: a per-lane view at row (wave_col + lane%16); constant rows within it
                 used["%w_stage_view"] = None
                 out.append(f"{ind}{rv}_b = index.add %wave_col, {row} : index")
-                out.append(f"{ind}{fm.group(1)} = vector.fragment.load<rhs> %w_stage_view_t[{k}, {rv}_b] shape [%c16, %c16] : view<72x{views['%w_stage_view'][2]}xf16, %w_stage_view_tl> -> vector<8xf16>")
+                out.append(f"{ind}{fm.group(1)} = vector.fragment.load<rhs> %w_stage_view_t[{k}, {rv}_b] shape [%c16, %c16] : view<{views['%w_stage_view'][3]}x{views['%w_stage_view'][2]}xf16, %w_stage_view_tl> -> vector<8xf16>")
             else:
                 used[V] = None
                 out.append(f"{ind}{rv}_b = index.sub {row}, %lane_row : index")
@@ -67,7 +67,10 @@ def twin(text):
         t = t.replace(decl, decl + f"  {V}_tl = encoding.layout.strided [1, {C}] : encoding<layout>\n"
                       f"  {V}_t = buffer.view {buf}[{off}] : buffer -> view<{C}x{R}xf16, {V}_tl>\n", 1)
     assert "%lane_row = " in t, old
-    assert "vector<16xf16>, vector<16xf16>" not in t and "vector.fragment<rhs>" not in t, old
+    # every WMMA operand converted: no gfx11 mma operand triple and no rhs register fragment left. Not a bare 'vector<16xf16>,
+    # vector<16xf16>' test: GEMM256_KT=32 carries 16-value activation prefetches as such pairs (scf.if / scf.yield), which are
+    # not WMMA operands and stay (HRX-like E407: that over-broad check refused every KT=32 build).
+    assert ": vector<16xf16>, vector<16xf16>, vector<8xf32>" not in t and "vector.fragment<rhs>" not in t, old
     return t
 
 

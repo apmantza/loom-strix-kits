@@ -16,6 +16,11 @@ import re
 
 def flataddr(text):
     """rewrite one g_gemm_f16_*_m256 kernel's text (from gemm_big256, f16)"""
+    import os
+    if os.environ.get("GEMM256_KT", "64") != "64":
+        # the anchors are the K-tile-64 forms (32-value activation loads); GEMM256_KT=32 stages 16-value loads. KT=32 was measured
+        # exact and 1.21-1.43x slower (HRX-like E163), so the rewrite is not ported to it: refuse the combination by name (E407).
+        raise SystemExit("GEMM256_FLATADDR supports GEMM256_KT=64 only (KT=32: exact but slower, HRX-like E163); unset one of them")
     def one(old, new, what):
         nonlocal text
         n = text.count(old)
