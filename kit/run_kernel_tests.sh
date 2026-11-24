@@ -26,14 +26,21 @@ except ValueError:  # loom-test did not get to run the cases: a compile/link err
     print("(a case launching a kernel the generator no longer emits shows up as a SYMBOL error: regenerate the tests "
           "with make_kernel_tests.py after changing the generator)")
     sys.exit(1)
-bad = 0
+bad = nneg = 0
 for s in d["samples"]:
     fails = [f.get("detail", f.get("message", "")) if isinstance(f, dict) else str(f) for f in s["expectations"].get("failures", [])]
     issues = [i.get("message", "") for i in s.get("issues", [])]
-    neg = "_negcontrol" in s["case"]   # a negative control must FAIL (it feeds the kernel data in the wrong layout)
-    ok = (not s["passed"]) if neg else s["passed"]
+    # A negative control (any case named *_negcontrol: a planted difference its checks must see) must FAIL, and on an
+    # expectation: one that fails only on an issue (a fault, a timeout) proves nothing about its checks (HRX-like E398).
+    neg = "_negcontrol" in s["case"]
+    nneg += neg
+    ok = (not s["passed"] and (bool(fails) or s["expectations"].get("failure_count", 0) > 0) and not issues) if neg else s["passed"]
     bad += not ok
-    print(("PASS " if ok else "FAIL ") + s["case"] + (" (negative control failed, as it must)" if neg and ok else " (negative control passed: the test cannot see a layout error)" if neg else ""), *(x[:300] for x in issues + fails[:2]))
+    why = ("" if not neg else " (negative control failed on an expectation, as it must)" if ok else
+           " (negative control failed only on an issue: its checks are unproven)" if not s["passed"] else
+           " (negative control passed: its checks cannot see the planted difference)")
+    print(("PASS " if ok else "FAIL ") + s["case"] + why, *(x[:300] for x in issues + fails[:2]))
+print(f"negative controls: {nneg}")
 print(f"{len(d['samples']) - bad}/{len(d['samples'])} passed")
 sys.exit(1 if bad else 0)
 PY

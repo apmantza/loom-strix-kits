@@ -11,7 +11,7 @@ when you add a kernel: a kernel that passes here but breaks end-to-end is
 usually a launch-shape/indexing assumption (e.g. one-wave rows), so test the
 real shapes of the model, not toy ones.
 """
-import json, sys, os, numpy as np
+import json, sys, os, re, numpy as np
 _PFPAD = int(os.environ.get("PF16_PAD", "0") or 0)   # HRX-like E167: f16 GEMM operand rows padded to K + PF16_PAD halves
 
 
@@ -97,6 +97,25 @@ def ffn_act(g):
 cases = []
 KS = os.environ.get("KTEST_HEADS_SFX", "")   # a child run for a narrower query-head count (see the end): _h<heads>
 def save(n, a): np.save(os.path.join(out, n + KS + ".npy"), a)
+
+
+def negtwin(case, *subs):
+    """The negative-control twin of a case's text: the case renamed @<name>_negcontrol (run_kernel_tests.sh: it must FAIL on an
+    expectation) and each (old, new) of SUBS applied; each OLD must occur exactly once, so a twin cannot silently stop
+    differing from its case when the case's text changes."""
+    t = re.sub(r"^check\.case public @(\w+) \{", r"check.case public @\1_negcontrol {", case, count=1)
+    assert t != case, "negtwin: not a case"
+    for old, new in subs:
+        assert t.count(old) == 1, f"negtwin: {old!r} occurs {t.count(old)} times"
+        t = t.replace(old, new)
+    return t
+
+
+def one_off(e, atol, rtol, at=0):
+    """A copy of expected array E with its flat element AT moved by 10x the tolerance of a close check (atol + rtol |e|)."""
+    n = np.array(e, copy=True); f = n.reshape(-1)
+    f[at] += 10 * (atol + rtol * abs(float(f[at]))) + 1e-3
+    return n
 # The output gate as llama.cpp applies it (cfg attn_gate_act): sigmoid, or softplus (laguna, applied per head by
 # g_gate_heads); gate_mul is what the combine / flash kernels apply to the gate buffer (softplus: the value as stored).
 def gate_act(g): return np.log1p(np.exp(g)) if cfg.get("attn_gate_act") == "softplus" else 1 / (1 + np.exp(-g))
@@ -266,6 +285,9 @@ for name, K in todo:
   check.return
 }}
 """)
+        if (name, tg) == (todo[0][0], 1):   # negative control (E398): one expected value 10x the tolerance off; guards a loosened close check
+            save(tag + "_yn", one_off(y.astype(np.float32), 2.0e-3, 2.0e-3))
+            cases.append(negtwin(cases[-1], (f'path("{tag}_y.npy")', f'path("{tag}_yn.npy")')))
     if ACT_Q8 and fmt in IQ_FMTS:   # g_quant_q8 then the int8 matvec, at the 1-, 4- and 8-token variants
         for tg in (1, 4, 8, 16):
             xs = rng.standard_normal((tg, K)).astype(np.float32); y = q8_ref(xs).astype(np.float64) @ W.T.astype(np.float64)
@@ -298,6 +320,23 @@ for name, K in todo:
 {same}  check.return
 }}
 """)
+            # Negative controls on the first tensor only (HRX-like E398: the mv family had none). @mv_<tag>_t1_negcontrol: one
+            # expected value moved by 10x the tolerance. Recurrence it guards: a close check loosened (atol / rtol widened, the
+            # actual compared with itself) so a wrong row passes. @mv_<tag>_t8_negcontrol: the 1-token kernel of the verify ==
+            # decode comparison reads activations with one value moved by 1.0 (its int8 group changes); only that equality can
+            # fail. Recurrence it guards: a blind verify == decode comparison (the same kernel launched twice, or %y vs %y).
+            if name == todo[0][0] and tg in (1, 8):
+                if tg == 1:
+                    save(tag + "_yn", one_off(y.astype(np.float32), 2.0e-3, 2.0e-3))
+                    cases.append(negtwin(cases[-1], (f'path("{tag}_y.npy")', f'path("{tag}_yn.npy")')))
+                else:
+                    _xn = xs.copy(); _xn[0, 0] += 1.0; save(tag + "_xn", _xn)
+                    cases.append(negtwin(cases[-1],
+                        (f"  %xq = check.generate.fill", f'  %xn = check.file.read.npy path("{tag}_xn.npy") : tensor<{tg}x{K}xf32>\n  %xq1 = check.generate.fill value(0) : tensor<{tg}x{2 * K}xi8>\n  %xq = check.generate.fill'),
+                        (f"  kernel.launch @g_quant_q8[%t, %k](%t, %k, %x, %xq) : [index, index](index, index, tensor<{tg}x{K}xf32>, tensor<{tg}x{2 * K}xi8>)\n",
+                         f"  kernel.launch @g_quant_q8[%t, %k](%t, %k, %x, %xq) : [index, index](index, index, tensor<{tg}x{K}xf32>, tensor<{tg}x{2 * K}xi8>)\n"
+                         f"  kernel.launch @g_quant_q8[%t, %k](%t, %k, %xn, %xq1) : [index, index](index, index, tensor<{tg}x{K}xf32>, tensor<{tg}x{2 * K}xi8>)\n"),
+                        (f"(%n, %t, %acc, %xq, %w{sa}, %y1)", f"(%n, %t, %acc, %xq1, %w{sa}, %y1)")))
 # 2'. split-plane formats: every output width of one K picks its own rows-per-workgroup variant (pick_r), and prefill takes the 16-row
 # 4-token kernel for a 48-row projection (gen_llm.lin_mv): one case per (K, output width) the model's projections have beyond section 2's first
 seen_split = {(T[nm].tensor_type.name.lower(), K, int(T[nm].shape[1])) for nm, K in todo}
@@ -405,7 +444,7 @@ if ACT_Q8 and _g is not None:
     if fmt in IQ_FMTS and T[un].tensor_type.name.lower() == fmt:
         save("sw_g", raw(gn)); save("sw_u", raw(un)); gt, ut = ty(raw(gn)), ty(raw(un))
         for tg in (8, 16):
-            save(f"sw_x{tg}", rng.standard_normal((tg, H)).astype(np.float32))
+            _swx = rng.standard_normal((tg, H)).astype(np.float32); save(f"sw_x{tg}", _swx)
             R1, Rt = iq_r(n, H, 1, True), iq_r(n, H, tg, True)
             k1 = f"g_mv_{fmt}_k{H}_swiglu_q8" + (f"_r{R1}" if R1 != 16 else "")
             kt = f"g_mv_{fmt}_k{H}_swiglu_t{tg}_q8" + (f"_r{Rt}" if Rt != 16 else "")
@@ -428,6 +467,15 @@ if ACT_Q8 and _g is not None:
   check.return
 }}
 """)
+            # @mvsw_same_t8_negcontrol (E398): the 1-token kernel reads activations with one value moved by 1.0, so the atol-0
+            # comparison must FAIL. Recurrence it guards: a blind equality-only comparison (one kernel launched twice, a buffer
+            # compared with itself, neither writing): the case has no numpy reference of its own.
+            if tg == 8:
+                _xn = _swx.copy(); _xn[0, 0] += 1.0; save("sw_x8n", _xn)
+                cases.append(negtwin(cases[-1],
+                    ("  %xq = check.generate.fill", f'  %xn = check.file.read.npy path("sw_x8n.npy") : tensor<{tg}x{H}xf32>\n  %xq1 = check.generate.fill value(0) : tensor<{tg}x{2 * H}xi8>\n  %xq = check.generate.fill'),
+                    (f"  kernel.launch @{kt}[", f"  kernel.launch @g_quant_q8[%t, %k](%t, %k, %xn, %xq1) : [index, index](index, index, tensor<{tg}x{H}xf32>, tensor<{tg}x{2 * H}xi8>)\n  kernel.launch @{kt}["),
+                    ("(%n, %t, %acc, %xq, %w, %wu, %y1)", "(%n, %t, %acc, %xq1, %w, %wu, %y1)")))
         # the 1-token kernel against numpy: act(gate) * up on the int8 activations (SwiGLU, or GEGLU for ffn_act gelu)
         xs = rng.standard_normal((1, H)).astype(np.float32); xq = q8_ref(xs).astype(np.float64)
         ysw = ffn_act(xq @ deq(gn).T.astype(np.float64)) * (xq @ deq(un).T.astype(np.float64))
@@ -980,6 +1028,10 @@ cases.append(f"""check.case public @head_argmax {{
   check.return
 }}
 """)
+# @head_argmax_negcontrol (E398): the runner-up token expected (one code off the argmax) must FAIL. Recurrence it guards: a select
+# check that cannot tell the argmax from its neighbour (e.g. %out unwritten and the expectation zero-filled, or compared with itself).
+save("hd_outn", np.array([order[1]], np.int32))
+cases.append(negtwin(cases[-1], ('path("hd_out.npy")', 'path("hd_outn.npy")')))
 # 3a''. logits export (loom-skills#736): the flagged selected span's full row lands in `outputs` at the 32768-byte region, bit-exact;
 # a selected span without the top_k flag and a flagged span beyond the slots export nothing. (Softcap models: the capped value, close.)
 LS, SLOTS = 3, 2
@@ -1391,6 +1443,11 @@ if cfg.get("recurrent_layers"):
   check.return
 }}
 """)
+    # @gdn_chain_negcontrol (E398): the chain's output (g_gdn_norm_gate) with one value 10x its tolerance off must FAIL. Recurrence it
+    # guards: the chain's last close check loosened or blind (an unwritten %o read as zeros against a zero expectation, nan(same))
+    # so a wrong chain passes.
+    save("g_on", one_off(o.reshape(t, VD).astype(np.float32), 1.0e-3, 2.0e-3, at=(t - 1) * VD))
+    cases.append(negtwin(cases[-1], ('path("g_o.npy")', 'path("g_on.npy")')))
 # 4b. g_gdn_recurrence alone on one launch of two spans: a fresh 37-token span (position 0) and a 5-token span that
 # continues its reader slot, plus a 70-token span that runs in the prefill-form kernel (odd lengths: partial output batches; each span's own reader/writer slots).
 if cfg.get("recurrent_layers"):
@@ -1450,6 +1507,11 @@ if cfg.get("recurrent_layers"):
   check.return
 }}
 """)
+    # @gdn_recurrence_spans_negcontrol (E398): one value of the continuing span's published state (its writer slot, the state the next
+    # decode step reads) 10x the tolerance off must FAIL. Recurrence it guards: an arena check that cannot see a wrong published state
+    # (loosened, or comparing the reader slot both sides leave as input).
+    _wr = finals[-1][0] // 4; save("gr_expectn", one_off(expect, 1.0e-4, 1.0e-3, at=_wr))
+    cases.append(negtwin(cases[-1], ('path("gr_expect.npy")', 'path("gr_expectn.npy")')))
 def _pend_fix(arena, nslots):
     """decode.spec.gdn_fold_defer: test slots at the layer stride LB hold layer 0 only; its pending fold lives at the slot + pend_base
     (gen_gdn.gdn_geometry): the arena is extended to hold every slot's block and the blocks are zero (no pending fold)."""
@@ -1567,6 +1629,15 @@ if cfg.get("recurrent_layers") and cfg.get("draft") and _fold_on(gdn_geometry(cf
   check.return
 }}
 """)
+    # @gdn_fold_vs_replay_negcontrol (E398): the replay path's launches read qkv with token 0's last channel (a V value of span 0, an
+    # accepted token) moved by 1.0, and the numpy check is dropped: the verification outputs and the published state differ, so the
+    # equalities must FAIL. Recurrence it guards: a blind fold == replay comparison (neither path publishing, so both arenas keep
+    # the input bytes; or a buffer compared with itself).
+    _qn = qkv.copy(); _qn[0, C - 1] += 1.0; save("gf_qkvn", _qn)
+    _tw = cases[-1].split("  kernel.launch @g_gdn_conv[%t]", 1)
+    _tw = _tw[0] + "  kernel.launch @g_gdn_conv[%t]" + _tw[1].replace("%qkv,", "%qkvn,").replace("%qkv)", "%qkvn)")
+    cases.append(negtwin(_tw, (f'  %w = check.file.read.npy path("g_conv_w.npy")', f'  %qkvn = check.file.read.npy path("gf_qkvn.npy") : {XT}\n  %w = check.file.read.npy path("g_conv_w.npy")'),
+                         (f"  check.expect.close actual(%arena2) expected(%expect) atol(1.0e-4) rtol(1.0e-3) nan(different) : {AT}\n", "")))
 # 4e. decode.spec.gdn_fold_defer (gen_gdn.defer_kernels): two drafted verifications of three speculative spans in a row (the first at a
 # fork: reader != writer), once with the eager fold (g_gdn_fold after each acceptance; g_gdn_pend + g_gdn_pend_clear also run so the
 # pending blocks hold the same bytes) and once deferred (g_gdn_pend only; the second verification's recurrence applies the first's
@@ -2209,6 +2280,13 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and _F16O_K:
 {_tail}  check.return
 }}
 """)
+            # @f16o11_eq_negcontrol_<K> (E398; first kernel only): the f16o kernel is given the gate weights as its up weights, the
+            # shape of E372's defect (the FLATADDR rewrite loaded %w where the swiglu kernels choose %w or %w2 per lane): the
+            # f16 rows must differ and the equality FAIL. Recurrence it guards: an equality-only comparison that cannot see a
+            # wrong-operand f16o kernel (e.g. %hb compared with %ha after one producer wrote both).
+            if _case == "eq" and _k == _F16O_K[0]:
+                cases.append(negtwin(cases[-1], ("(%rows, %k, %n, %x, %s, %w, %u, %hb, %sb)", "(%rows, %k, %n, %x, %s, %w, %w, %hb, %sb)"))
+                             .replace(f"@f16o11_eq_{_k}_negcontrol ", f"@f16o11_eq_negcontrol_{_k} "))
 # 3a''-o. F16O_O (HRX-like E375, kit f16o_o.py): the attention / GDN output producers' f16 copies must equal the live chain bit for bit:
 # the f32 producer then g_row_scale_f16_live_lv (f16 rows at the padded stride + row scales). Exact while every live row's max|o| <
 # 2^14 (row scale 1); E375: every served row < 2^11. @f16oo_eq_gdn_norm_gate: 64 rows of max ~10, 5 dead (info word 2 = 0: no f16
@@ -3570,29 +3648,37 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
 }
 """
 
-    def invariance_case(sliding, start=5):   # start: X's first position mod 16, or 'zero' (a prompt's own start)
+    def invariance_case(sliding, start=5, neg=False):   # start: X's first position mod 16, or 'zero' (a prompt's own start)
+        # neg (@..._negcontrol): two packings, and in the second one Q value of X's token 50 (a whole flash tile's) moved by 4.0,
+        # so that token's output differs and the atol-0 comparison must FAIL. Recurrence it guards: a blind invariance
+        # comparison (test_copy_rows copying rows both epochs leave equal, e.g. padding or an unwritten buffer, or a
+        # comparison of a buffer with itself) passes whatever the kernels do. Own generator and files: the real cases'
+        # inputs do not move.
+        r_ = np.random.default_rng(3609) if neg else rng; sx = "n" if neg else ""
         n, QD = 100, QH * D
         p0 = 0 if start == 'zero' else (DEEP - 64 if DEEP else 896) + start
-        x_q = (rng.standard_normal((n, QH, D)) * 2.5).astype(np.float32); x_g = rng.standard_normal((n, QH, D)).astype(np.float32)
-        packings = [(0, 0), (7, 14), (19, 1), (80, 0), (37, 21)]   # tokens of other rows before / after X
+        x_q = (r_.standard_normal((n, QH, D)) * 2.5).astype(np.float32); x_g = r_.standard_normal((n, QH, D)).astype(np.float32)
+        packings = [(0, 0), (7, 14), (19, 1), (80, 0), (37, 21)][:2 if neg else 5]   # tokens of other rows before / after X
         text, ref, t_0 = "", None, None
         for k, (a, b) in enumerate(packings):
             info3 = epoch_info([(1, 333, a), (0, p0, n), (2, 5 + 16 * a, b)]); t = len(info3)
             info = np.zeros((t, 4), np.int32); info[:, :3] = info3
-            q = (rng.standard_normal((t, QH, D)) * 2.5).astype(np.float32); g = rng.standard_normal((t, QH, D)).astype(np.float32)
+            q = (r_.standard_normal((t, QH, D)) * 2.5).astype(np.float32); g = r_.standard_normal((t, QH, D)).astype(np.float32)
             q[a:a + n], g[a:a + n] = x_q, x_g
+            if neg and k == 1:
+                q[a + 50, 0, 0] += 4.0
             if k == 0:
                 ref = aliased_ref(q.astype(np.float16).astype(np.float64), info, WIN if sliding else 0)[:n]
                 ref = ref * gate_mul(x_g) if cfg.get("attn_gate") else ref
-                save(f"fi_ref{sliding}_{start}", ref.reshape(n, QD).astype(np.float32))
+                save(f"fi_ref{sliding}_{start}{sx}", ref.reshape(n, QD).astype(np.float32))
             for nm, arr in (("info", info), ("q", q.reshape(t, QD)), ("g", g.reshape(t, QD))):
-                save(f"fi_{nm}{sliding}_{start}_{k}", arr)
+                save(f"fi_{nm}{sliding}_{start}{sx}_{k}", arr)
             OT = f"tensor<{t}x{QD}xf32>"; IT = f"tensor<{t}x4xi32>"; XT = f"tensor<{n}x{QD}xf32>"; PT = f"tensor<{t * QH * 64 * D}xf32>"; MT = f"tensor<{t * QH * 64 * 2}xf32>"
             text += f"""  %t{k} = check.literal value({t}) : index
   %skip{k} = check.literal value({a}) : index
-  %q{k} = check.file.read.npy path("fi_q{sliding}_{start}_{k}.npy") : {OT}
-  %g{k} = check.file.read.npy path("fi_g{sliding}_{start}_{k}.npy") : {OT}
-  %info{k} = check.file.read.npy path("fi_info{sliding}_{start}_{k}.npy") : {IT}
+  %q{k} = check.file.read.npy path("fi_q{sliding}_{start}{sx}_{k}.npy") : {OT}
+  %g{k} = check.file.read.npy path("fi_g{sliding}_{start}{sx}_{k}.npy") : {OT}
+  %info{k} = check.file.read.npy path("fi_info{sliding}_{start}{sx}_{k}.npy") : {IT}
   %o{k} = check.generate.fill value(0.0) : {OT}
   %pacc{k} = check.generate.fill value(0.0) : {PT}
   %pml{k} = check.generate.fill value(0.0) : {MT}
@@ -3605,8 +3691,8 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
             if k:
                 text += f"  check.expect.close actual(%x{k}) expected(%x0) atol(0.0) rtol(0.0) nan(different) : {XT}\n"
         XT = f"tensor<{n}x{QD}xf32>"
-        check = f"  %ref = check.file.read.npy path(\"fi_ref{sliding}_{start}.npy\") : {XT}\n  check.expect.close actual(%x0) expected(%ref) atol(4.0e-3) rtol(4.0e-3) nan(different) : {XT}\n" if not sliding else ""
-        return f"""check.case public @flash_batch_invariant{'_window' if sliding else ''}_s{start} {{
+        check = f"  %ref = check.file.read.npy path(\"fi_ref{sliding}_{start}{sx}.npy\") : {XT}\n  check.expect.close actual(%x0) expected(%ref) atol(4.0e-3) rtol(4.0e-3) nan(different) : {XT}\n" if not sliding else ""
+        return f"""check.case public @flash_batch_invariant{'_window' if sliding else ''}_s{start}{'_negcontrol' if neg else ''} {{
   %layer = check.literal value(0) : index
   %sliding = check.literal value({sliding}) : i32
   %ctx = check.literal value({ctx_a}) : index
@@ -3618,28 +3704,34 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
 {text}{check}  check.return
 }}
 """
-    def order_case(sliding):
+    def order_case(sliding, neg=False):
         """Three prompts of unequal length, each from position 0 (rows 0-2), packed in every order: each prompt's output
-        must be the same in all six epochs (the situation of concurrent requests in one prefill epoch)."""
+        must be the same in all six epochs (the situation of concurrent requests in one prefill epoch).
+        NEG (@..._negcontrol): the first two orders only, and in the second one Q value of prompt 0's token 40 (a whole flash
+        tile's) moved by 4.0: that row differs and the atol-0 comparison must FAIL. Recurrence it guards: a blind comparison
+        (rows copied from offsets both epochs leave equal, or a buffer compared with itself) that passes whatever the kernels do."""
+        r_ = np.random.default_rng(3658) if neg else rng; sx = "n" if neg else ""
         lens, QD = (156, 190, 287), QH * D
-        qs = [(rng.standard_normal((n, QH, D)) * 2.5).astype(np.float32) for n in lens]
-        gs = [rng.standard_normal((n, QH, D)).astype(np.float32) for n in lens]
+        qs = [(r_.standard_normal((n, QH, D)) * 2.5).astype(np.float32) for n in lens]
+        gs = [r_.standard_normal((n, QH, D)).astype(np.float32) for n in lens]
         import itertools
         text = ""
-        for k, order in enumerate(itertools.permutations(range(3))):
+        for k, order in enumerate(list(itertools.permutations(range(3)))[:2 if neg else 6]):
             info3 = epoch_info([(i, 0, lens[i]) for i in order]); t = len(info3)
             info = np.zeros((t, 4), np.int32); info[:, :3] = info3
-            q = (rng.standard_normal((t, QH, D)) * 2.5).astype(np.float32); g = rng.standard_normal((t, QH, D)).astype(np.float32)
+            q = (r_.standard_normal((t, QH, D)) * 2.5).astype(np.float32); g = r_.standard_normal((t, QH, D)).astype(np.float32)
             at, off = {}, 0
             for i in order:
                 at[i] = off; q[off:off + lens[i]], g[off:off + lens[i]] = qs[i], gs[i]; off += lens[i]
+            if neg and k == 1:
+                q[at[0] + 40, 0, 0] += 4.0
             for nm, arr in (("info", info), ("q", q.reshape(t, QD)), ("g", g.reshape(t, QD))):
-                save(f"fo_{nm}{sliding}_{k}", arr)
+                save(f"fo_{nm}{sliding}{sx}_{k}", arr)
             OT = f"tensor<{t}x{QD}xf32>"; IT = f"tensor<{t}x4xi32>"; PT = f"tensor<{t * QH * 64 * D}xf32>"; MT = f"tensor<{t * QH * 64 * 2}xf32>"
             text += f"""  %t{k} = check.literal value({t}) : index
-  %q{k} = check.file.read.npy path("fo_q{sliding}_{k}.npy") : {OT}
-  %g{k} = check.file.read.npy path("fo_g{sliding}_{k}.npy") : {OT}
-  %info{k} = check.file.read.npy path("fo_info{sliding}_{k}.npy") : {IT}
+  %q{k} = check.file.read.npy path("fo_q{sliding}{sx}_{k}.npy") : {OT}
+  %g{k} = check.file.read.npy path("fo_g{sliding}{sx}_{k}.npy") : {OT}
+  %info{k} = check.file.read.npy path("fo_info{sliding}{sx}_{k}.npy") : {IT}
   %o{k} = check.generate.fill value(0.0) : {OT}
   %pacc{k} = check.generate.fill value(0.0) : {PT}
   %pml{k} = check.generate.fill value(0.0) : {MT}
@@ -3655,7 +3747,7 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
 """
                 if k:
                     text += f"  check.expect.close actual(%x{k}_{i}) expected(%x0_{i}) atol(0.0) rtol(0.0) nan(different) : {XT}\n"
-        return f"""check.case public @flash_batch_invariant_order{'_window' if sliding else ''} {{
+        return f"""check.case public @flash_batch_invariant_order{'_window' if sliding else ''}{'_negcontrol' if neg else ''} {{
   %layer = check.literal value(0) : index
   %sliding = check.literal value({sliding}) : i32
   %ctx = check.literal value({ctx_a}) : index
@@ -3681,25 +3773,31 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
     info_r4 = np.zeros((len(info_r), 4), np.int32); info_r4[:, :3] = info_r
     cases.append(epoch_case("flash_prefill_runs", info_r, q_r, g_r, np.where(flash_covered(info_r4)[:, None, None], o_r, SENT), 0,
                             ("g_attention_flash2", "g_attention_flash2_partial")))
-    def cut_case(sliding, cut):
+    def cut_case(sliding, cut, neg=False):
         """One prompt (row 1, positions 0..n-1) attended in one epoch, and as two epochs cut at position CUT (the scheduler cuts
         a prefill wherever its budget ends): every token's result is bit-identical. A cut leaves partial 16-token tiles,
-        which the partial kernel computes with the bits of the whole tile (a run of 9 or more tokens is cut-invariant)."""
+        which the partial kernel computes with the bits of the whole tile (a run of 9 or more tokens is cut-invariant).
+        NEG (@..._negcontrol): in the first cut epoch one Q value of token 20 (a whole flash tile's) moved by 4.0: that row
+        differs from the one epoch's and the atol-0 comparison must FAIL. Recurrence it guards: a blind cut comparison (rows
+        copied from offsets both sides leave equal, e.g. the cut epoch's padding, or the 1.0 / 0.0 fills compared unwritten)."""
+        r_ = np.random.default_rng(3684) if neg else rng; sx = "n" if neg else ""
         n, QD = 100, QH * D
-        x_q = (rng.standard_normal((n, QH, D)) * 2.5).astype(np.float32); x_g = rng.standard_normal((n, QH, D)).astype(np.float32)
+        x_q = (r_.standard_normal((n, QH, D)) * 2.5).astype(np.float32); x_g = r_.standard_normal((n, QH, D)).astype(np.float32)
         text = ""
         for k, (lo, hi) in enumerate(((0, n), (0, cut), (cut, n))):
             info3 = epoch_info([(1, lo, hi - lo)]); t = len(info3)
             info = np.zeros((t, 4), np.int32); info[:, :3] = info3
             q = np.zeros((t, QH, D), np.float32); g = np.zeros((t, QH, D), np.float32)
             q[:hi - lo], g[:hi - lo] = x_q[lo:hi], x_g[lo:hi]
+            if neg and k == 1:
+                q[20, 0, 0] += 4.0
             for nm, arr in (("info", info), ("q", q.reshape(t, QD)), ("g", g.reshape(t, QD))):
-                save(f"fc_{nm}{sliding}_{cut}_{k}", arr)
+                save(f"fc_{nm}{sliding}_{cut}{sx}_{k}", arr)
             OT = f"tensor<{t}x{QD}xf32>"; IT = f"tensor<{t}x4xi32>"; PT = f"tensor<{t * QH * 64 * D}xf32>"; MT = f"tensor<{t * QH * 64 * 2}xf32>"
             text += f"""  %t{k} = check.literal value({t}) : index
-  %q{k} = check.file.read.npy path("fc_q{sliding}_{cut}_{k}.npy") : {OT}
-  %g{k} = check.file.read.npy path("fc_g{sliding}_{cut}_{k}.npy") : {OT}
-  %info{k} = check.file.read.npy path("fc_info{sliding}_{cut}_{k}.npy") : {IT}
+  %q{k} = check.file.read.npy path("fc_q{sliding}_{cut}{sx}_{k}.npy") : {OT}
+  %g{k} = check.file.read.npy path("fc_g{sliding}_{cut}{sx}_{k}.npy") : {OT}
+  %info{k} = check.file.read.npy path("fc_info{sliding}_{cut}{sx}_{k}.npy") : {IT}
   %o{k} = check.generate.fill value(0.0) : {OT}
   %pacc{k} = check.generate.fill value(0.0) : {PT}
   %pml{k} = check.generate.fill value(0.0) : {MT}
@@ -3719,7 +3817,7 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
   kernel.launch @test_copy_rows[%nx{nm}](%nx{nm}, %wd, %skipk{nm}, %t{k}, %o{k}, %xc{nm}) : [index](index, index, index, index, {OTk}, {XT})
   check.expect.close actual(%xc{nm}) expected(%xf{nm}) atol(0.0) rtol(0.0) nan(different) : {XT}
 """
-        return f"""check.case public @flash_cut_invariant{'_window' if sliding else ''}_c{cut} {{
+        return f"""check.case public @flash_cut_invariant{'_window' if sliding else ''}_c{cut}{'_negcontrol' if neg else ''} {{
   %layer = check.literal value(0) : index
   %sliding = check.literal value({sliding}) : i32
   %ctx = check.literal value({ctx_a}) : index
@@ -3779,6 +3877,7 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
               # inside a whole tile: token 304 (the tile's first) must not see the V of tokens 305-335
               masked_case(304, 32, "whole", compare=1, diff_from=305)]
     cases += [cut_case(s, c) for s in ((0, 1) if WIN else (0,)) for c in (53, 48, 75)]   # cuts inside a tile / on a tile boundary / in a later tile
+    cases.append(cut_case(0, 53, neg=True))
     # Keys past a run's last position are not written yet: stale memory, possibly NaN. A partial tail tile must not let them
     # reach the output (0 * NaN): the run (row 1, positions 301-400) ends one token into a block, over an arena whose row-1
     # keys and values past position 400 are NaN.
@@ -3807,6 +3906,7 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
                             ("g_attention_flash2", "g_attention_flash2_partial")).replace("f_arena_a.npy", "f_arena_nan.npy"))
     cases += [invariance_case(s, st) for s in ((0, 1) if WIN else (0,)) for st in (5, 0, 'zero')]
     cases += [order_case(s) for s in ((0, 1) if WIN else (0,))]
+    cases += [invariance_case(0, 5, neg=True), order_case(0, neg=True)]
     # F16O_O (HRX-like E375, kit f16o_o.py): the f16-output flash kernels (whole and partial tiles) against the live chain, the f32
     # kernels then g_row_scale_f16_live_lv over every row, bit for bit. One epoch whose live tokens are all the flash kernels'
     # (a 100-token run with partial head and tail blocks, a 9-token run, three aligned whole tiles) plus padding: the dead rows
@@ -4351,13 +4451,18 @@ def pkg_launched():
     return {k[:-6] if k.endswith("_rdna4") and k[:-6] in names else k for k in names}
 
 
+def real_cases():
+    """The cases that are not negative controls (a _negcontrol case must fail: it neither covers a kernel nor is a template to clone)."""
+    return [c for c in cases if "_negcontrol" not in c.split("{", 1)[0]]
+
+
 def cases_launched():
     """The kernels launched by cases whose every kernel the package defines (ktest_select skips the others)."""
     t = _pkg_llm_text() or ""
     defined = set(re.findall(r'^kernel\.def\b[^\n]*?\s@([\w.]+)\(', t, re.M)) | set(re.findall(r'^kernel\.def\b[^\n]*?\bexport\("([^"]+)"\)', t, re.M))
     defined |= set(re.findall(r'^kernel\.def\b[^\n]*?\s@([\w.]+)\(', "\n".join(cases), re.M))   # test helper kernels (kt_ copies)
     got = set()
-    for c in cases:
+    for c in real_cases():   # a kernel launched only by a negative control is not tested
         used = set(re.findall(r"kernel\.launch @([\w.]+)", c))
         if not t or used <= defined:
             got |= {k[3:] if k.startswith("kt_") else k for k in used}   # a kt_ copy's case tests the kernel it copies
@@ -4539,8 +4644,8 @@ if True:   # coverage: a case for every kernel the package launches
   check.return
 }}
 """)
-    cases += ktest_variants.listed_cases(cases, _lib, pkg_launched() - cases_launched(), save, KS)
-    cases += ktest_variants.clones(cases, _lib + _helpers, pkg_launched() - cases_launched(), save, KS, lambda f: np.load(os.path.join(out, f)))
+    cases += ktest_variants.listed_cases(real_cases(), _lib, pkg_launched() - cases_launched(), save, KS)
+    cases += ktest_variants.clones(real_cases(), _lib + _helpers, pkg_launched() - cases_launched(), save, KS, lambda f: np.load(os.path.join(out, f)))
     for _k in sorted(pkg_launched() - cases_launched()):
         print(f"coverage: no case launches {_k}")
 if flash2_deep_from(cfg):   # gen_llm.py launches the deep pairs' kernel after every one-tile prefill flash launch
