@@ -55,6 +55,9 @@ run() {   # half, package, first turn
   echo "  memory $tag: $(python3 "$H/mem_admit.py" frag 2>&1)" > "$OUT/$tag.mem.txt"
   "${SERVE[@]}" "$2" || { echo "agent_ab STOP: serve $2"; exit 2; }
   spid=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)   # its CPU is not contamination
+  # the replay appends to --log: a half log left by an earlier, stopped bench in this OUT would mix two runs (HRX-like E475: q190's
+  # h1 log held a pre-reboot run and the fresh one; its late-turn figure compared one against the other)
+  if [ -e "$OUT/$tag.jsonl" ]; then mv "$OUT/$tag.jsonl" "$OUT/$tag.jsonl.prev-$(date +%Y%m%d-%H%M%S)"; echo "agent_ab NOTE: $tag.jsonl existed: moved aside"; fi
   python3 "$H/gpu_telemetry.py" record "$OUT/$tag.tel.tsv" --pid "${spid:-none}" & TEL=$!
   "$T" "$REPLAY" "$SESSION" http://127.0.0.1:$PORT "$KIT_MODEL_ID" --kind loom --mode fixed \
     --turns "$3:" --every 4 --sampling card --seed 1 --label "$(basename "$2")" --log "$OUT/$tag.jsonl" > "$OUT/$tag.out" 2>&1; rc=$?
@@ -142,6 +145,11 @@ print("loop flags (8-gram repeat share >= 0.5): " + ", ".join(f"{p} {len(v)} tur
 # start temperatures and telemetry beside the verdict, in run order (a faster kernel under a power or thermal limit can lower the clock)
 tags = [f"h1-{a}", f"h1-{b}", f"h2-{b}", f"h2-{a}"]
 untrusted = []
+# one run per half log (E475): a log with two runs is judged by readers that each pick a different one (paired: the last; halves: both)
+for tag in tags:
+    p = f"{out}/{tag}.jsonl"
+    n = sum(1 for l in open(p) if '"rows"' in l) if os.path.exists(p) else 0
+    if n != 1: untrusted.append(f"{tag}.jsonl holds {n} runs (one per half)")
 for tag in tags:
     for ext in ("start.txt", "tel.txt", "mem.txt"):
         p = f"{out}/{tag}.{ext}"
