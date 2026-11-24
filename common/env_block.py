@@ -9,7 +9,7 @@ Keys, in this order (a value that cannot be read is `unknown`, a setting that is
   rocm                        $ROCM_SDK/.info/version (else /opt/rocm/.info/version)
   loom                        the *loom*.dist-info versions in $VENV (the venv loom-serve runs from)
   kit_commit                  git rev-parse --short HEAD of the kit repository, '-dirty' when a tracked file is modified
-  pkg.<name>.model_json_sha256, pkg.<name>.cmd   per --pkg: its model.json's sha256 and its build line (<pkg>.cmd beside it)
+  pkg.<name>.model_json_sha256, .program_sha256, .cmd   per --pkg: model.json's sha256, one over program/*.loom, its build line
   gpu_perf_level, gpu_power_profile, gpu_power_cap_w, platform_profile   the GPU / platform power settings sysfs exposes
   device_file                 --device FILE[:PROFILE]: its name, the profile (else its default_profile) and a sha256 prefix
   cpu_governor, cpu_epp       the set of scaling governors and energy-performance preferences over all CPUs
@@ -140,6 +140,21 @@ def sha256(p):
     return h.hexdigest()
 
 
+def program_sha256(pkg):
+    """One sha256 over the package's program/*.loom (names and bytes, sorted): the kernels. model.json alone is the same text for
+    packages built with different switches (HRX-like E481: pkg-e379 and pkg-e396 hashed alike), so it cannot show a rebuild."""
+    files = sorted(glob.glob(os.path.join(pkg, "program", "*.loom")))
+    if not files:
+        raise OSError("no program/*.loom")
+    h = hashlib.sha256()
+    for f in files:
+        h.update(os.path.basename(f).encode() + b"\0")
+        with open(f, "rb") as fh:
+            h.update(fh.read())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def pkg_lines(pkgs):
     out, seen = [], set()
     for p in pkgs:
@@ -149,6 +164,7 @@ def pkg_lines(pkgs):
             name += "#2"
         seen.add(name)
         out.append((f"pkg.{name}.model_json_sha256", guard(sha256, os.path.join(p, "model.json"))))
+        out.append((f"pkg.{name}.program_sha256", guard(program_sha256, p)))
         out.append((f"pkg.{name}.cmd", guard(text, p + ".cmd")))
     return out
 

@@ -62,7 +62,9 @@ def fake(t):
     subprocess.run(g + ["commit", "-qm", "x"], check=True)
     put(t, "w/pkg-a/model.json", '{"a": 1}\n')
     put(t, "w/pkg-a.cmd", "env KV8=1\n  kit/build.py pkg-a\n")   # a wrapped line must stay one block line
-    put(t, "w2/pkg-a/model.json", '{"a": 2}\n')   # another package with the same basename, in another directory
+    put(t, "w2/pkg-a/model.json", '{"a": 2}\n')
+    put(t, "w/pkg-a/program/llm.loom", "kernel A\n")   # E481: two packages with one model.json differ in their program
+    put(t, "w2/pkg-a/program/llm.loom", "kernel B\n")   # another package with the same basename, in another directory
     dev = os.path.join(t, "gfx.json")
     put(t, "gfx.json", json.dumps({"default_profile": "cap85w", "profiles": {"cap85w": {}, "nominal": {}}}))
     return r, sdk, venv, kit, dev
@@ -106,6 +108,10 @@ with tempfile.TemporaryDirectory() as t:
     case("pkg: same basename in two directories stays two keys, a missing .cmd reads unknown",
          b.get("pkg.pkg-a#2.model_json_sha256") == hashlib.sha256(b'{"a": 2}\n').hexdigest()
          and b.get("pkg.pkg-a#2.cmd") == "unknown")
+    case("pkg: program_sha256 tells packages with the same model.json apart (E481)",
+         b.get("pkg.pkg-a.program_sha256", "unknown") != "unknown"
+         and b.get("pkg.pkg-a#2.program_sha256", "unknown") != "unknown"
+         and b.get("pkg.pkg-a.program_sha256") != b.get("pkg.pkg-a#2.program_sha256"))
     case("power: the '*' profile, the cap in W, the perf level, the platform profile",
          b.get("gpu_power_profile") == "3D_FULL_SCREEN" and b.get("gpu_power_cap_w") == "85" and b.get("gpu_perf_level") == "auto"
          and b.get("platform_profile") == "performance")
