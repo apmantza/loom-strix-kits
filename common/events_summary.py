@@ -114,6 +114,35 @@ def summarize(ev, prompt, d):
     return steps, sum(e["duration_ns"] for e in ev) / 1e9, rows
 
 
+def busy_clock(run):
+    """The run's median shader clock while busy (GHz) from its gpu_telemetry summary (tel.txt), or None."""
+    p = os.path.join(run, "tel.txt")
+    m = re.search(r"while busy: .*?clock ([0-9.]+) ", open(p).read()) if os.path.exists(p) else None
+    return float(m.group(1)) if m else None
+
+
+def cycles_table(runs, res, lanes):
+    """Each lane's device time x the run's busy clock (HRX-like E482): at a power cap the clock follows temperature, and a
+    compute-bound lane (the f16 GEMMs: 239-241 G cycles at 2.11-2.22 GHz over four starts) keeps its cycles while its seconds move
+    5 %. Informational: the gate still judges seconds. The busy clock is the whole run's, prefill-dominated: decode lanes run at
+    another clock (~2.5 GHz) and are memory-bound; read their seconds (q187's ABBA: GEMMs 1.8 % -> 0.1 %, matvecs 0.2 % -> 1.7 %). The spread columns compare the runs in seconds and in cycles; a lane whose
+    cycle spread is the smaller one is clock-bound across these runs."""
+    clk = [busy_clock(r) for r in runs]
+    missing = [res[i][0] for i, c in enumerate(clk) if c is None]
+    if missing:
+        return [f"\ncycles: no busy clock (tel.txt) for {', '.join(missing)}: not printed"]
+    out = ["\n| lane (cycles = time x busy clock) | " + " | ".join(f"{r[0]} @ {c:.3f} GHz" for r, c in zip(res, clk))
+           + " | spread s | spread cycles |", "|---|" + "---|" * (len(res) + 2)]
+    for i, ln in enumerate(lanes):
+        unit = res[0][5][i][3]
+        secs = [r[5][i][2] for r in res]
+        cyc = [m * c for m, c in zip(secs, clk)]   # s x GHz = G cycles; ms/step x GHz = M cycles / step
+        cu = "G" if unit == "s" else "M/step"
+        sp = (f"{spread(secs):.1f} %", f"{spread(cyc):.1f} %") if len(res) > 1 and all(x == x for x in secs) else ("-", "-")
+        out.append(f"| {ln['lane']} | " + " | ".join(f"{x:.2f} {cu}" for x in cyc) + f" | {sp[0]} | {sp[1]} |")
+    return out
+
+
 def clusters(ev, kernel, cut):
     xs = sorted(e["duration_ns"] / 1e6 for e in ev if e["key"] == kernel)
     if not xs:
@@ -240,6 +269,7 @@ def main():
             _, n, meas, unit, f, pct = r[5][i]
             cells.append(f"{meas:.2f} {unit}" + (f" ({pct:.0f} %)" if pct is not None else "") + f", {n} disp")
         print(f"| {name} | " + (f"{f:.2f} {unit}" if f is not None else "-") + " | " + " | ".join(cells) + " |")
+    print("\n".join(cycles_table(a.runs, res, d["lanes"])))
     for r in res:
         print(f"\n{r[0]}: prompt {r[2]} tokens, {r[3]} verify steps, device busy {r[4]:.1f} s")
         for spec in a.split:

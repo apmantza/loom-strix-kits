@@ -132,6 +132,23 @@ class EventsSummary(unittest.TestCase):
         self.assertIn("48.00 ms/step", line)
         self.assertIn("24.00 ms/step", line)
 
+    def test_cycles_beside_seconds(self):   # E482: the GEMMs keep their cycles across starts while the clock follows temperature
+        def tel(d, ghz):
+            open(os.path.join(d, "tel.txt"), "w").write(f"  telemetry x: 10 samples; while busy: power 85.00 (p10 84, p90 85) W, "
+                                                       f"clock {ghz:.2f} (p10 2.1, p90 2.3) GHz, temp 80.00 C\n")
+        a = run_dir(self.root, "1-cool", [ev("g_attention_flash2", 7, 50.0), ev("g_gemm_f16_swiglu_m256", 7, 1000.0, (272, 16, 1))])
+        b = run_dir(self.root, "2-hot", [ev("g_attention_flash2", 7, 50.0), ev("g_gemm_f16_swiglu_m256", 7, 1100.0, (272, 16, 1))])
+        tel(a, 2.20); tel(b, 2.00)
+        r = summary(a, b)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = next(x for x in r.stdout.splitlines() if x.startswith("| prefill: GEMMs") and "G |" in x)
+        self.assertIn("2.20 G | 2.20 G", line)        # 1.0 s x 2.2 GHz, 1.1 s x 2.0 GHz
+        self.assertIn("| 9.5 % | 0.0 % |", line)       # seconds moved, cycles did not
+        os.remove(os.path.join(b, "tel.txt"))
+        r = summary(a, b)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("cycles: no busy clock (tel.txt) for 2-hot", r.stdout)
+
     def test_refuses_unreadable_prompt(self):
         # the served size decides every floor: a request record without prompt_tokens is a refusal, not a default
         d = run_dir(self.root, "x", [ev("g_attention_vsplit", 1, 1.0)], req=json.dumps({"requests": [{}]}))
