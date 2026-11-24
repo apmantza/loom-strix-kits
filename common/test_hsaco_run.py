@@ -164,8 +164,67 @@ def cold_cache_checks():
        "measure: the anchor reads arm A's timed rounds (warm-up excluded); flagged rounds stay in both arms' times")
 
 
+def arm_checks():
+    """--arm-buf / --arm-kernel (arm_options, measure's arm_host, memory_guard's arm_names) on the fake device. Recurrence (HRX-like
+    q189): an A/B of one weight matrix in two byte layouts (GGUF vs re-laid-out) must launch each arm on its own weights, under
+    rotation too; an override that reached no launch, or a misspelt label or buffer that fell back to the shared bytes, would time and
+    compare every arm on the same input and report 'bytes equal' for a layout nobody read."""
+    import numpy as np, struct
+    meta = {".args": [{".name": "x", ".offset": 0, ".size": 8, ".value_kind": "global_buffer"},
+                      {".name": "w", ".offset": 8, ".size": 8, ".value_kind": "global_buffer"},
+                      {".name": "y", ".offset": 16, ".size": 8, ".value_kind": "global_buffer"},
+                      {".name": "n", ".offset": 24, ".size": 4, ".value_kind": "by_value"}], ".kernarg_segment_size": 32}
+    _, alias = hr.bind_names(meta, None)
+
+    def kern(mem, ka):                                     # y = x + w (bytes, mod 256): the GGUF-layout reader
+        x, w, y = struct.unpack_from("<QQQ", ka, 0); n, = struct.unpack_from("<i", ka, 24)
+        mem[y:y + n] = ((mem[x:x + n].astype(np.int32) + mem[w:w + n]) % 256).astype(np.uint8)
+
+    def kern_r(mem, ka):                                   # the re-laid-out reader: w stored reversed
+        x, w, y = struct.unpack_from("<QQQ", ka, 0); n, = struct.unpack_from("<i", ka, 24)
+        mem[y:y + n] = ((mem[x:x + n].astype(np.int32) + mem[w:w + n][::-1]) % 256).astype(np.uint8)
+    n = 3000
+    spec = {"x": (n, "u8"), "w": (n, "u8"), "y": (n, "zero")}
+    host = {k: hr.fill(s, h, np.random.default_rng(1)) for k, (s, h) in spec.items()}
+    rev = {"R": {"w": host["w"][::-1].copy()}}
+    # 1. each arm launches on its own w; the relaid arm's output equals the reference's; every copy cycles per arm
+    rot, per, copies = hr.rotation_plan(spec, ["y"], 3 * 2 * n)
+    dev = FakeDev()
+    res, rc = hr.measure(dev, [("A", kern), ("R", kern_r)], meta, alias, {"n": n}, spec, host, rot, copies, compare=["y:f32"],
+                         reps=6, warmup=0, arm_host=rev)
+    ws = [struct.unpack_from("<Q", p, 8)[0] for p in dev.timed_packets]
+    wa, wr = set(ws[0::2]), set(ws[1::2])
+    ok(len(wa) == copies and len(wr) == copies and not wa & wr, f"arm R times on its own {copies} copies of w, apart from A's ({sorted(wa)}, {sorted(wr)})")
+    ok(all(np.array_equal(dev.read(a, n), rev["R"]["w"]) for a in wr) and all(np.array_equal(dev.read(a, n), host["w"]) for a in wa),
+       "R's copies hold R's bytes, A's the shared bytes")
+    xs = [struct.unpack_from("<Q", p, 0)[0] for p in dev.timed_packets]
+    ok(set(xs[0::2]) == set(xs[1::2]), "a buffer no arm overrides stays shared")
+    ok(rc == 0 and any("R == A" in l for l in res["compare"]), f"the relaid arm's output equals the reference's ({res['compare']})")
+    # 2. without the override the relaid reader reads the shared bytes: the compare fails (the override is what made it pass)
+    _, rc2 = hr.measure(FakeDev(), [("A", kern), ("R", kern_r)], meta, alias, {"n": n}, spec, host, rot, copies, compare=["y:f32"],
+                        reps=1, warmup=0)
+    ok(rc2 == 1, "without --arm-buf the relaid reader differs (exit 1)")
+    # 3. arm_options refuses what would silently fall back to the shared bytes
+    labels = ["A", "R"]
+    k, b = hr.arm_options(["R=g_mv_relaid"], ["R:w=file:/x.bin"], labels, spec)
+    ok(k == {"R": "g_mv_relaid"} and b == {"R": {"w": "file:/x.bin"}}, f"arm options parsed ({k}, {b})")
+    for what, ak, ab in (("a label that is no arm", [], ["Q:w=u8"]), ("a buffer that is no --buf", [], ["R:ww=u8"]),
+                         ("no fill", [], ["R:w="]), ("the first arm (the compare reference)", [], ["A:w=u8"]),
+                         ("a pair twice", [], ["R:w=u8", "R:w=zero"]), ("an --arm-kernel label that is no arm", ["Q=k"], []),
+                         ("an --arm-kernel twice", ["R=k", "R=k2"], [])):
+        try:
+            hr.arm_options(ak, ab, labels, spec); ok(False, f"arm options refuse {what}")
+        except SystemExit:
+            ok(True, f"arm options refuse {what}")
+    # 4. the memory guard counts each arm's own copies
+    free = (10 ** 9, "test")
+    base = hr.memory_guard(spec, rot, copies, free, 1.0)
+    ok(hr.memory_guard(spec, rot, copies, free, 1.0, ["w"]) == base + copies * 4096, "memory guard adds an arm's own w copies")
+
+
 def main():
     cold_cache_checks()
+    arm_checks()
     if len(sys.argv) < 3:                                  # the checks below need a real program and its code objects
         print("(no PROGRAM.loom CODE_OBJECT_DIR: metadata, region and packer checks skipped)")
         sys.exit(1 if fails else 0)

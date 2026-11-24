@@ -20,9 +20,15 @@ auto = 2 x the GPU's L2 + L3 from the KFD topology, 2 x 34 MiB on gfx1151) and g
 what the one before it left in cache; --compare then checks every copy's output. Refused over --mem-budget x free memory.
 --anchor N: arm A's median per N-round window against the first window's; rounds past --drift are flagged, kept. --json FILE: the
 result, every figure labelled a hypothesis (harness figures diagnose; the seeded served bench decides).
+Arms that differ in more than the code object: --arm-kernel LABEL=NAME launches kernel NAME from LABEL's object (a prototype compiled
+under another export name; --kernel still names the .loom launch region and the argument layout every arm must share);
+--arm-buf LABEL:NAME=FILL gives arm LABEL its own buffer NAME (same size as --buf NAME, its own copies under --rotate) filled with
+FILL, e.g. the same weights in another byte layout: every other arm reads the shared buffer, and --compare still checks every arm's
+output against the first arm's.
 usage: hsaco_run.py [--loom FILE --workload k=v,...] [--grid X,Y,Z] --kernel NAME [--scalar k=v ...] --buf NAME=BYTES[:FILL] ...
                     [--reps 20] [--warmup 3] [--bytes N (GB/s)] [--compare NAME] [--rotate auto|N [--write-only NAME]]
-                    [--anchor N [--drift 0.10]] [--json FILE] [--dry-run] LABEL=OBJ.hsaco [LABEL=OBJ ...]"""
+                    [--anchor N [--drift 0.10]] [--json FILE] [--arm-kernel LABEL=NAME] [--arm-buf LABEL:NAME=FILL]
+                    [--dry-run] LABEL=OBJ.hsaco [LABEL=OBJ ...]"""
 import os
 import argparse, ctypes as C, math, re, statistics, struct, sys
 
@@ -301,9 +307,11 @@ def rotation_plan(bufspec, write_only, rotate_bytes):
     return rot, per, copies
 
 
-def memory_guard(bufspec, rot, copies, free, budget):
-    """refuse when the buffers (rotated ones x COPIES, each copy page-aligned) exceed BUDGET x the free memory"""
-    need = sum((-(-n // ALIGN) * ALIGN) * (copies if k in rot else 1) for k, (n, _) in bufspec.items())
+def memory_guard(bufspec, rot, copies, free, budget, arm_names=()):
+    """refuse when the buffers (rotated ones x COPIES, each copy page-aligned; ARM_NAMES: one more of that buffer per arm that has
+    its own, --arm-buf) exceed BUDGET x the free memory"""
+    per = {k: (-(-n // ALIGN) * ALIGN) * (copies if k in rot else 1) for k, (n, _) in bufspec.items()}
+    need = sum(per.values()) + sum(per[k] for k in arm_names)
     if need > budget * free[0]:
         sys.exit(f"rotation: {copies} copies need {need / 2**30:.2f} GiB, over {budget:g} x free memory ({free[1]}): "
                  f"lower --rotate-bytes, mark write-only buffers, or stop the live server")
@@ -328,6 +336,32 @@ def anchor_drift(times_a, every, threshold):
             flagged += range(s, e + 1)
     return {"every": every, "threshold": threshold, "windows": rows, "flagged": flagged,
             "max_drift": max((abs(r[3]) for r in rows), default=0.0)}
+
+
+def arm_options(arm_kernel, arm_buf, labels, bufspec):
+    """({label: kernel}, {label: {buffer: fill}}) from --arm-kernel LABEL=NAME and --arm-buf LABEL:NAME=FILL. Refuses a label that
+    is no arm, a buffer that is no --buf, a pair given twice, and an override of the first arm (the --compare reference). Recurrence
+    (HRX-like q189): an A/B of one matrix in two byte layouts must give each arm its own weights; an override that silently missed
+    (a misspelt label or buffer) would time and compare every arm on the shared bytes."""
+    kern, bufs = {}, {}
+    for it in arm_kernel:
+        lab, _, name = it.partition("=")
+        if lab not in labels or not name:
+            sys.exit(f"--arm-kernel {it!r}: LABEL=NAME with LABEL one of {labels}")
+        if lab in kern:
+            sys.exit(f"--arm-kernel: {lab} given twice")
+        kern[lab] = name
+    for it in arm_buf:
+        lab, _, rest = it.partition(":")
+        name, _, how = rest.partition("=")
+        if lab not in labels or name not in bufspec or not how:
+            sys.exit(f"--arm-buf {it!r}: LABEL:NAME=FILL with LABEL one of {labels} and NAME one of {sorted(bufspec)}")
+        if lab == labels[0]:
+            sys.exit(f"--arm-buf {it!r}: {lab} is the first arm, the --compare reference: give the shared --buf instead")
+        if name in bufs.get(lab, {}):
+            sys.exit(f"--arm-buf: {lab}:{name} given twice")
+        bufs.setdefault(lab, {})[name] = how
+    return kern, bufs
 
 
 # ------------------------------------------------------------------------------------------------------------ HIP
@@ -383,29 +417,38 @@ class Hip:
 
 
 def measure(dev, fns, meta, alias, scalars, bufspec, host, rot, copies, compare=(), save=(), reps=20, warmup=3, anchor=0,
-            drift=0.10):
-    """Allocate (rotated buffers: COPIES page-aligned copies in one block, each filled from the same host bytes), launch every object
-    once per copy (outputs of every copy kept for --compare), then time WARMUP + REPS interleaved rounds, launch j on copy j mod
-    COPIES. Returns (result dict, exit code)."""
-    base, stride = {}, {}
-    for k, (n, _) in bufspec.items():
-        stride[k] = -(-n // ALIGN) * ALIGN if k in rot else 0
-        base[k] = dev.alloc(stride[k] * copies if k in rot else n)
-    addr = [{k: base[k] + c * stride[k] for k in bufspec} for c in range(copies)]
-    preps = [dev.prepare(pack_kernargs(meta, alias, scalars, addr[c])) for c in range(copies)]
+            drift=0.10, arm_host=None):
+    """Allocate (rotated buffers: COPIES page-aligned copies in one block, each filled from the same host bytes; ARM_HOST {label:
+    {buffer: bytes}}: that arm's own allocation of the buffer, copied the same way), launch every object once per copy (outputs of
+    every copy kept for --compare), then time WARMUP + REPS interleaved rounds, launch j on copy j mod COPIES. Returns (result dict,
+    exit code)."""
+    arm_host = arm_host or {}
+
+    def block(k):
+        n = bufspec[k][0]
+        stride = -(-n // ALIGN) * ALIGN if k in rot else 0
+        b = dev.alloc(stride * copies if k in rot else n)
+        return [b + c * stride for c in range(copies)]
+    shared = {k: block(k) for k in bufspec}
+    addr, preps, data = {}, {}, {}
+    for lab, _ in fns:
+        own = {k: block(k) for k in arm_host.get(lab, {})}
+        addr[lab] = [{k: (own.get(k) or shared[k])[c] for k in bufspec} for c in range(copies)]
+        preps[lab] = [dev.prepare(pack_kernargs(meta, alias, scalars, addr[lab][c])) for c in range(copies)]
+        data[lab] = {**host, **arm_host.get(lab, {})}
     names = [c.split(":")[0] for c in compare]
     outs, rc, lines = {}, 0, []
     for lab, fn in fns:                                    # clean launches: every copy, outputs kept for --compare
         outs[lab] = []
         for c in range(copies):
-            for k, v in host.items():
-                dev.write(addr[c][k], v)
-            dev.launch(fn, preps[c], lab)
-            outs[lab].append({n: dev.read(addr[c][n], len(host[n])) for n in names})
+            for k, v in data[lab].items():
+                dev.write(addr[lab][c][k], v)
+            dev.launch(fn, preps[lab][c], lab)
+            outs[lab].append({n: dev.read(addr[lab][c][n], len(host[n])) for n in names})
             if c == 0:
                 for sv in save:
                     name, _, prefix = sv.partition("=")
-                    dev.read(addr[0][name], len(host[name])).tofile(f"{prefix or name}.{lab}.bin")
+                    dev.read(addr[lab][0][name], len(host[name])).tofile(f"{prefix or name}.{lab}.bin")
     for cmp in compare:
         name, _, dt = cmp.partition(":")
         ref = outs[fns[0][0]][0][name]
@@ -432,7 +475,7 @@ def measure(dev, fns, meta, alias, scalars, bufspec, host, rot, copies, compare=
         for lab, fn in fns:
             c = j % copies
             j += 1
-            ms = dev.timed(fn, preps[c])
+            ms = dev.timed(fn, preps[lab][c])
             if r >= 0:
                 times[lab].append(ms); order[lab].append(c)
     anc = anchor_drift(times[fns[0][0]], anchor, drift)
@@ -473,9 +516,23 @@ def main():
                     "rounds in a window drifting more than --drift are flagged, not dropped")
     ap.add_argument("--drift", type=float, default=0.10, help="anchor drift that flags a window (default 0.10, llama.cpp's tuner figure)")
     ap.add_argument("--json", help="write the result (times, rotation, anchor drift, each figure labelled a hypothesis) to this file")
+    ap.add_argument("--arm-kernel", action="append", default=[], help="LABEL=NAME: launch kernel NAME from LABEL's object (default "
+                    "--kernel, which still names the launch region and the shared argument layout)")
+    ap.add_argument("--arm-buf", action="append", default=[], help="LABEL:NAME=FILL: arm LABEL reads its own buffer NAME (the --buf "
+                    "size, own copies under --rotate) filled with FILL; not the first arm")
     a = ap.parse_args()
     objs = [o.split("=", 1) if "=" in o else (o, o) for o in a.objects]
-    metas = [name_args(kernel_meta(p, a.kernel), a.arg_names.split(",") if a.arg_names else None) for _, p in objs]
+    labels = [lab for lab, _ in objs]
+    if len(set(labels)) != len(labels):
+        sys.exit(f"arm labels repeat: {labels}")
+    bufspec = {}
+    for b in a.buf:
+        n, _, rest = b.partition("=")
+        sz, _, how = rest.partition(":")
+        bufspec[n] = (int(float(sz)), how or "zero")
+    arm_kern, arm_bufs = arm_options(a.arm_kernel, a.arm_buf, labels, bufspec)
+    kname = {lab: arm_kern.get(lab, a.kernel) for lab in labels}
+    metas = [name_args(kernel_meta(p, kname[lab]), a.arg_names.split(",") if a.arg_names else None) for lab, p in objs]
     lay = [[(x[".name"], x[".offset"], x[".size"], x[".value_kind"]) for x in m[".args"]] for m in metas]
     if any(l != lay[0] for l in lay):
         sys.exit("the code objects' argument layouts differ: not an A/B of one kernel")
@@ -501,11 +558,6 @@ def main():
         sys.exit(f"workgroup {block} exceeds the kernel's max_flat_workgroup_size {metas[0]['.max_flat_workgroup_size']}")
     args, alias = bind_names(metas[0], dev)
     scalars = kv(a.scalar)
-    bufspec = {}
-    for b in a.buf:
-        n, _, rest = b.partition("=")
-        sz, _, how = rest.partition(":")
-        bufspec[n] = (int(float(sz)), how or "zero")
     print(f"kernel {a.kernel}: grid {grid} x workgroup {block}; kernarg {metas[0]['.kernarg_segment_size']} B")
     lv = power_levels()
     print(f"  power level {'/'.join(lv)}" + ("" if lv == ["auto"] else "  ** NOT the serving level (auto): times here need not hold in service (HRX-like E300) **"))
@@ -523,7 +575,9 @@ def main():
         names = sorted(alias[x[".name"]])
         print(f"  {x['.offset']:4d} {x['.size']}B {x['.value_kind']:13s} {'/'.join(names)}")
     for (lab, p), m in zip(objs, metas):
-        print(f"  {lab}: {p}  vgpr {m.get('.vgpr_count')} sgpr {m.get('.sgpr_count')} lds {m.get('.group_segment_fixed_size')} B")
+        print(f"  {lab}: {p}" + (f" kernel {kname[lab]}" if kname[lab] != a.kernel else "")
+              + f"  vgpr {m.get('.vgpr_count')} sgpr {m.get('.sgpr_count')} lds {m.get('.group_segment_fixed_size')} B"
+              + "".join(f"  own {k}={h}" for k, h in arm_bufs.get(lab, {}).items()))
     if a.rotate and a.rotate_bytes:
         sys.exit("give --rotate or --rotate-bytes, not both")
     rspec = a.rotate if a.rotate else (str(int(a.rotate_bytes)) if a.rotate_bytes else None)
@@ -539,7 +593,7 @@ def main():
              "copies": copies, "per_copy_bytes": per, "rotated": rot if rspec else [], "single": [k for k in bufspec if k not in rot]}
     if rspec:
         free = free_memory()
-        total = memory_guard(bufspec, rot, copies, free, a.mem_budget)
+        total = memory_guard(bufspec, rot, copies, free, a.mem_budget, [k for d in arm_bufs.values() for k in d])
         rinfo.update(total_bytes=total, free=free[1], budget=a.mem_budget)
         print(f"  rotation: {copies} copies x {per / 2**20:.1f} MiB of {rot} (target {rbytes / 2**20:.1f} MiB"
               + (f" = 2 x {llc[0] / 2**20:.0f} MiB, {llc[1]}" if llc else "") + f"); single: {rinfo['single']}; "
@@ -550,9 +604,10 @@ def main():
         return
     hip, rng = Hip(grid, block), np.random.default_rng(a.seed)
     host = {k: fill(n, how, rng) for k, (n, how) in bufspec.items()}
-    fns = [(lab, hip.load(p, a.kernel)) for lab, p in objs]
+    arm_host = {lab: {k: fill(bufspec[k][0], how, rng) for k, how in d.items()} for lab, d in arm_bufs.items()}
+    fns = [(lab, hip.load(p, kname[lab])) for lab, p in objs]
     res, rc = measure(hip, fns, metas[0], alias, scalars, bufspec, host, rot if rspec else [], copies, a.compare, a.save,
-                      a.reps, a.warmup, a.anchor, a.drift)
+                      a.reps, a.warmup, a.anchor, a.drift, arm_host)
     for l in res["compare"]:
         print(l)
     times, anc = res["times"], res["anchor"]
@@ -575,7 +630,7 @@ def main():
         import json
         out = {"status": HYPOTHESIS, "kernel": a.kernel, "grid": grid, "block": block, "power_level": lv, "reps": a.reps,
                "warmup": a.warmup, "rotation": rinfo, "anchor": anc, "arms": arms, "copy_order": res["copy_order"],
-               "compare": res["compare"], "exit": rc}
+               "compare": res["compare"], "exit": rc, "arm_kernel": kname, "arm_buf": arm_bufs}
         json.dump(out, open(a.json, "w"), indent=1)
     sys.exit(rc)
 
