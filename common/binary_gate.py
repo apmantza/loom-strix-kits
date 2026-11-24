@@ -118,12 +118,14 @@ def kernels(pkg):
     return out
 
 
-def measure(lc, prog, k, out):
-    """compile kernel K of PROG for gfx1151 into OUT: {isa, vgpr, sgpr, scratch, lds}, or {error}"""
+def measure(lc, prog, k, out, report=False):
+    """compile kernel K of PROG for gfx1151 into OUT: {isa, vgpr, sgpr, scratch, lds}, or {error}; REPORT: Loom's summary
+    report beside the code object as OUT/K.json (kernel_lint.lint reads its residency; common/autotune.py)"""
     import hsaco_run
     import loop_census
     hs = os.path.join(out, f"{k}.hsaco")
-    r = subprocess.run([lc, prog, "--target=amdgpu:gfx1151", f"--root={k}", f"--output={hs}"], capture_output=True, text=True)
+    rep = ["--compile-report=summary", f"--compile-report-output={os.path.join(out, k + '.json')}"] if report else []
+    r = subprocess.run([lc, prog, "--target=amdgpu:gfx1151", f"--root={k}", f"--output={hs}"] + rep, capture_output=True, text=True)
     if r.returncode:
         return {"error": (r.stderr.strip().split("\n") or [""])[0][:200]}
     ins, _ = loop_census.disasm(hs)

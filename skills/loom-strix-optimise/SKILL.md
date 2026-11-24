@@ -56,6 +56,13 @@ This file is the entry point and the loop; the companion skills hold one procedu
    be exact (texts and draft counters), `common/gates.sh KIT PKG OUT`, then the served ABBA
    (`common/events_ab.sh KIT OUT LENGTH REF CAND CAND REF`) and the agent bench
    (`common/agent_ab.sh KIT REF CAND OUT SESSION`: its paired CI must exclude 1 and its neighbour rule must ACCEPT).
+   **A generator knob with several values** (tile sizes, rows per workgroup, unroll, GEMM256_KT): `common/autotune.py search
+   SPACE.json --out DIR` instead of hand-built variants. It builds each configuration (the base .cmd's recipe), compiles the family's
+   kernels and disqualifies a spill, a kernel_lint flag the base lacked, fewer waves (unless the knob declares `trades_occupancy`)
+   and generation or compile errors; survivors are ranked by instructions per MMA, then waves. `autotune.py step` writes the
+   window step that times the finalists through common/hsaco_run.py (A/A pair, rotated order) and builds the best for this
+   check. Both rankings only screen: decode runs at the 85 W cap, so device time can fall while served time does not (a faster
+   kernel can lower the clock of the whole step); a finalist goes forward on the agent bench like any other candidate.
 9. **Adopt** only after both pass, with the rollback package named.
 10. **New weights** (another quant, a re-upload): `common/quant_eval.sh` against the reference quant, a `variants/<name>/` in the
    kit, `KIT_VARIANT=<name> common/kit_check.sh`, then the same candidate check.
