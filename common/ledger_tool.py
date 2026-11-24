@@ -12,6 +12,12 @@ compare them with (a harness said 2x where serving gave 3-8 %).
 Row contract: a line starting `| ID |` (ID matches --id, default [A-Z]+\\d+). Its result / decision text is the cells from
 --result-from on (default -2: the last two). The whole row is matched for terms; only the result / decision text for loss words.
 
+Archive: a log kept short (active rows only) names the file its closed rows moved to on a line of its own, `Archive: HISTORY.md`
+(a path relative to the log). Every subcommand then reads both, rows ordered by id, so a loss moved to the archive still blocks a
+repeat and an owed row stays matched to its ported marks. A named archive that cannot be read is an error (exit 2), never a skip.
+--ledger may also be given more than once. An id found in two files is searched with both rows' text (the log's own check should
+refuse the duplicate).
+
 Header contract (lines of the leading comment block, after a shebang):
   # prior: E175, E305 [free text, optionally (searched: term, term)]    exactly one prior line, in one of these two forms
   # prior: none (searched: term1, term2)                              (search terms are required with none)
@@ -37,7 +43,7 @@ Subcommands and verdict lines (exit 0 ok, 1 refused / outside / owed, 2 usage or
                             number; default the header's result-file. OUTSIDE: debug the measurement before believing it.
   owed                      OWED: N                                   kept wins with targets no later row marked ported / dropped
 --grandfather N: steps whose name carries a number <= N (first digit run of the basename) pass with a note (written before the check).
-usage: ledger_tool.py [--ledger LOG.md] [--id REGEX] [--result-from K] {preflight,probe-card check,verdict,owed} ..."""
+usage: ledger_tool.py [--ledger LOG.md [--ledger ARCHIVE.md]] [--id REGEX] [--result-from K] {preflight,probe-card check,verdict,owed} ..."""
 import argparse
 import os
 import re
@@ -56,22 +62,45 @@ KILL = re.compile(r"^#\s*kill:\s*\S")
 BUDGET = re.compile(r"^#\s*budget:\s*(" + NUM + r")\s*(?:min|minutes)?(?:\s*\(.*\))?\s*$")
 TARGET = re.compile(r"^[\w.:+/-]+$")
 END = r"(?=[;|()`]|\.(?:\s|$)|$)"
+ARCHIVE = re.compile(r"^Archive:\s*(\S+)\s*$")
 
 
 class Log:
-    """the experiment log: rows in file order, id -> (row text, result / decision text with negated loss words removed, what)"""
+    """the experiment log: rows in file order (by id when several files are read), id -> (row text, result / decision text with
+    negated loss words removed, what). path: a file or a list of files; a file's `Archive: PATH` line adds that file."""
 
     def __init__(self, path, id_re=r"[A-Z]+\d+", result_from=-2, what_cell=None):
-        self.path, self.id_re = path, id_re
-        self.rows, self.order = {}, []
+        paths = [path] if isinstance(path, str) else list(path)
+        self.id_re, self.rows, self.order, self.dupes = id_re, {}, [], []
         row = re.compile(r"^\|\s*(" + id_re + r")\s*\|")
-        for line in open(path, encoding="utf-8"):
-            m = row.match(line)
-            if m:
-                cells = [c.strip() for c in line.strip().strip("|").split("|")]
-                what = cells[what_cell] if what_cell is not None and what_cell < len(cells) else " ".join(cells[1:result_from])
-                self.rows[m.group(1)] = (line, NEGATED.sub("", " ".join(cells[result_from:])), what)
-                self.order.append(m.group(1))
+        self.paths, seen, named = [], set(), set()
+        for p in paths:   # grows while read: a log's Archive line appends its archive
+            if os.path.realpath(p) in seen:
+                continue
+            seen.add(os.path.realpath(p))
+            self.paths.append(p)
+            for line in open(p, encoding="utf-8"):
+                a = ARCHIVE.match(line)
+                if a and p not in named:   # one level: an archive's own Archive line is not followed
+                    named.add(os.path.join(os.path.dirname(p), a.group(1)))
+                    paths.append(os.path.join(os.path.dirname(p), a.group(1)))
+                m = row.match(line)
+                if m:
+                    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                    what = cells[what_cell] if what_cell is not None and what_cell < len(cells) else " ".join(cells[1:result_from])
+                    entry = (line, NEGATED.sub("", " ".join(cells[result_from:])), what)
+                    i = m.group(1)
+                    if i in self.rows:
+                        self.dupes.append(i)
+                        old = self.rows[i]
+                        entry = (old[0] + line, old[1] + " " + entry[1], old[2])
+                    else:
+                        self.order.append(i)
+                    self.rows[i] = entry
+        self.path = self.paths[0]
+        self.name = " / ".join(os.path.basename(p) for p in self.paths)
+        if len(self.paths) > 1:
+            self.order.sort(key=idkey)
 
 
 def idkey(i):
@@ -140,7 +169,7 @@ def preflight(step, log, exclude=frozenset(), exclude_note=None, grandfather=Non
     else:
         return [f"{name}: '# prior:' line not in a known form: {pl[0]!r}"], notes
     for e in sorted(cited - set(rows), key=idkey):
-        probs.append(f"{name}: prior cites {e}, which is not in {os.path.basename(log.path)}")
+        probs.append(f"{name}: prior cites {e}, which is not in {log.name}")
     answered = set()
     for l in hd:
         if re.match(r"^#\s*changed:", l):
@@ -274,7 +303,8 @@ def owed(log):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--ledger", default="LEDGER.md", help="the experiment log (markdown table)")
+    ap.add_argument("--ledger", action="append", help="the experiment log (markdown table; default LEDGER.md); repeat to add "
+                    "an archive (a log's own `Archive: PATH` line adds it too)")
     ap.add_argument("--id", default=r"[A-Z]+\d+", help="row id regex (default [A-Z]+\\d+)")
     ap.add_argument("--result-from", type=int, default=-2, help="first result / decision cell (default -2: the last two)")
     ap.add_argument("--what-cell", type=int, help="the cell quoted in refusals (default: the cells before the result)")
@@ -315,7 +345,7 @@ def main(argv=None):
             for d in detail:
                 print(d)
             return rc
-        log = Log(a.ledger, a.id, a.result_from, a.what_cell)
+        log = Log(a.ledger or ["LEDGER.md"], a.id, a.result_from, a.what_cell)
         if a.cmd == "preflight":
             ex = switches_of_file(a.exclude_switches_from) if a.exclude_switches_from else set()
             probs, notes = preflight(a.step, log, ex, None, a.grandfather, a.switch_var)

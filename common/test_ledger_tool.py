@@ -130,6 +130,42 @@ def main():
         bad = w("LOG4.md", LOG + "| E19 | 11-25 | x | y | z | kept | owed: the inkling kit |\n")
         rc, out = cli("--ledger", bad, "owed")
         case("an owed list with spaces in a target: exit 2", rc == 2 and "not in a known form" in out)
+
+        # archive. Recurrence: a log trimmed to its active rows (closed rows moved to an archive file) would let a refuted lever
+        # be re-queued as new, and would report a ported win as still owed once the owed row and its port sat in different files.
+        rows = LOG.split("\n")
+        head, body = rows[:4], [r for r in rows[4:] if r]
+        moved = [r for r in body if r.startswith(("| E10 ", "| E13 ", "| E18 "))]
+        kept = [r for r in body if r not in moved]
+        hist = w("HIST.md", "# archive\n\n" + "\n".join(head[2:] + moved) + "\n")
+        active = w("ACTIVE.md", "\n".join(head[:2] + ["Archive: HIST.md", ""] + head[2:] + kept) + "\n")
+        alog = lt.Log(active)
+        pr, _ = lt.preflight(reopen, alog)
+        case(f"a loss row moved to the archive still refuses the repeat ({pr})", len(pr) == 1 and "E10 (no gain, refuted)" in pr[0])
+        bare = w("BARE.md", open(active).read().replace("Archive: HIST.md\n", ""))
+        case("without the Archive line the moved row is not seen (the line is what carries it)",
+             not lt.preflight(reopen, lt.Log(bare))[0])
+        rc, out = cli("--ledger", bare, "--ledger", hist, "preflight", reopen)
+        case(f"--ledger given twice reads both files (rc {rc})", rc == 1 and "E10" in out)
+        rc, out = cli("--ledger", active, "preflight", cited)
+        case(f"a prior citing a moved row is satisfied (rc {rc})", rc == 0)
+        gone = w("GONE.md", open(active).read().replace("Archive: HIST.md", "Archive: NOPE.md"))
+        rc, out = cli("--ledger", gone, "preflight", reopen)
+        case(f"a named archive that cannot be read: exit 2, never a skip ({out.strip()[:60]})", rc == 2)
+        rc, out = cli("--ledger", active, "owed")
+        case(f"owed across files: E13 (archived) keeps q6_k after E15 (active) ported iq4_xs; OWED: 2 ({out.split(chr(10))[:3]})",
+             rc == 1 and "E13 -> q6_k:" in out and "OWED: 2" in out)
+        a2 = w("ACTIVE2.md", open(active).read() + "| E17 | 11-25 | matvec | MV_PF on q6_k | bench | tie | kept; ported: E13 q6_k |\n")
+        h2 = w("HIST.md", open(hist).read() + "| E18 | 11-25 | port | 0.3.0 | bench | exact | ported: E16 sdk-0.3.0; dropped: E16 inkling (x) |\n")
+        rc, out = cli("--ledger", a2, "owed")
+        case(f"a port archived while its owed row stays active still clears it (ids, not files, set the order): OWED: 0 ({out.strip()})",
+             rc == 0 and "OWED: 0" in out)
+        dup = w("DUP.md", open(bare).read().replace("| E11 | 11-21 | gemm | SW_A=1 on the candidate | bench | exact; not slower (paired 0.99) | kept |",
+                                                   "| E11 | 11-21 | gemm | SW_A=1 on the candidate | bench | exact; not slower (paired 0.99) | kept |\n"
+                                                   "| E10 | 11-21 | gemm | tile order | bench | exact | kept |"))
+        dl = lt.Log([hist, dup])   # the refuted copy read first: a later clean copy must not hide it
+        case(f"an id in two files: both rows are searched (the refuted copy still refuses) ({dl.dupes})",
+             dl.dupes == ["E10"] and len(lt.preflight(reopen, dl)[0]) == 1)
     print(f"{len(fails)} failed" if fails else "OK")
     sys.exit(1 if fails else 0)
 

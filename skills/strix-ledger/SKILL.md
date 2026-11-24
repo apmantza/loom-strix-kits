@@ -22,6 +22,12 @@ result and decision (`--result-from K`, default the last two). Losses are recogn
 `not slower` are removed first; `tie` and `held` are not losses). Write the loss word when a lever loses; a row that loses in
 other words is invisible to the check.
 
+A log kept to active work can move closed rows to an archive file and name it on a line of its own in the log, `Archive:
+HISTORY.md` (relative to the log). Every subcommand then reads both, rows ordered by id: a loss moved to the archive still blocks
+a repeat, and an owed row is still matched to its ported marks across files. A named archive that cannot be read is an error
+(exit 2), never a skip. `--ledger` can also be repeated. Keep ids unique across the two files (the tool searches both copies of a
+duplicate, but the project's own check should refuse it).
+
 ## The step header (leading comment block)
 ```
 # prior: E175, E305 (searched: tile order, DRAM read bytes)   exactly one; or: # prior: none (searched: term1, term2)
