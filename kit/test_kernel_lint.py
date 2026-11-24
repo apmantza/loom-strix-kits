@@ -38,7 +38,13 @@
   - selects behind a branch read as every-iteration cost (E334: vsplit's masked path, 384 of 496 cndmask, runs only on edge
     blocks): loop_census.guarded reports the region a forward branch can skip, not the straight path or an early exit;
   - the outer shell of a nested loop taken as the hot loop (E237: the 16-token swiglu matvecs were flagged `select` for
-    their outer loop's selects while the dot4s sat in the inner loop): the inner loop must be chosen, nothing flagged.
+    their outer loop's selects while the dot4s sat in the inner loop): the inner loop must be chosen, nothing flagged;
+  - an LDS bank conflict in the hot loop not noted `ldsbank` (E424 / E435 / E456: flash2's SX11 exchange, 8.2 % measured), or an
+    epilogue conflict noted (E249: the f16 GEMMs' once-per-tile store, 0.2 % measured): a 2-way store inside the loop gets the
+    note, the same store after the loop does not, nor 1 % of the loop's rounds, nor rows that cannot be matched to the binary;
+  - an attention kernel whose key-valid bit masks only the score not noted `maskedv` (E441 / E444: g_attention_split read V of
+    unwritten keys, a NaN reached the output): the score-only mask fires, and so does zeroing only p; V's scale selected to 0
+    (KV8_SPLIT_VZERO), a clamped key (g_dfl_ctx_split), no softmax (g_dfl_topk) or a -1.0 fill do not.
 usage: python3 kit/test_kernel_lint.py   (needs loom-compile: VENV from the environment or the machine env file)"""
 import os
 import subprocess
@@ -223,12 +229,59 @@ def main():
     s2 = kl.launch_sites([prog])
     ok((s2["g_k1"], s2["g_k2"], s2["g_k3"], s2.get("g_k4", 0)) == (2, 1, 1, 0),
        f"launch sites: selectors 2, grid launch 1, gridless launch 1, none 0 ({dict(s2)})")
+    # maskedv (E444): the key-valid bit masks only the score while V is read unconditionally (p = +0 times a NaN V is NaN)
+    def att(vdef, extra=""):
+        return ('kernel.def export("g_att") @g_att(%tokens: index) {\n} launch(%q: buffer) {\n'
+                "  %neg_big = scalar.constant -3.0e38 : f32\n  %zero_f = scalar.constant 0.0 : f32\n"
+                "  %okl0 = index.cmp uge, %key0, %lo : index\n  %okh0 = index.cmp ult, %key0, %hi : index\n"
+                "  %ok0 = scalar.andi %okl0, %okh0 : i1\n  %vs0 = view.load %vsv[%kv] : view<4xf32> -> f32\n"
+                f"  {vdef}\n  %v0 = scalar.mulf %vq0, %vsz0 : f32\n  %sr0 = scalar.mulf %qv, %k0 : f32\n"
+                "  %s0 = scf.select %ok0, %sr0, %neg_big : f32\n  %d0 = scalar.subf %s0, %m : f32\n  %p0 = scalar.expf<afn> %d0 : f32\n"
+                f"{extra}  %a0 = scalar.fmaf %p0, %v0, %acc : f32\n}}\nfunc.def @g_after() {{\n}}\n")
+    plain = "%vsz0 = scalar.maxnumf %vs0, %vs0 : f32"
+    kt = kl.kernel_texts([att(plain)])
+    ok(list(kt) == ["g_att"] and "func.def" not in kt["g_att"], f"kernel_texts: one kernel, cut at the next definition ({list(kt)})")
+    ok(kl.masked_v(att(plain)) == ["%ok0"], f"maskedv: score masked, V scale used unconditionally fires (E444) ({kl.masked_v(att(plain))})")
+    pz = "  %pw0 = scf.select %ok0, %p0, %zero_f : f32\n"
+    ok(kl.masked_v(att(plain, pz)) == ["%ok0"], "maskedv: zeroing p is not a guard (p = +0 times NaN is NaN, E441): still fires")
+    ok(kl.masked_v(att("%vsz0 = scf.select %ok0, %vs0, %zero_f : f32")) is None,
+       "maskedv: the V scale selected to 0 under the bit (q179's KV8_SPLIT_VZERO) does not fire")
+    ok(kl.masked_v(att(plain, "  %kc0 = index.min %key0, %last : index\n")) is None,
+       "maskedv: the compared key clamped (g_dfl_ctx_split's index.min) does not fire")
+    ok(kl.masked_v(att(plain).replace("scalar.expf<afn> %d0", "scalar.addf %d0, %d0")) is None,
+       "maskedv: a masked score with no softmax (a top-k logit mask, g_dfl_topk) does not fire")
+    vec = att(plain).replace("  %s0 = scf.select %ok0, %sr0, %neg_big : f32\n",
+                             "  %neg_v = vector.splat %neg_big : vector<8xf32>\n  %s0 = vector.select %ok0, %sr0, %neg_v : vector<8xf32>\n")
+    ok(kl.masked_v(vec) == ["%ok0"], "maskedv: a vector.select against a splat of the fill fires too (vsplit's form)")
+    ok(kl.masked_v(att(plain).replace("-3.0e38", "-1.0")) is None, "maskedv: a select against -1.0 is not a score mask")
     import json, tempfile as tf
     with tf.TemporaryDirectory() as t:
         js = os.path.join(t, "k.json")
         json.dump({"source_low": {"memory": {"bank_service": {"structural": {"conflicted_packet_count": 4, "extra_round_count": 48}}}}}, open(js, "w"))
         ok(kl.bank(js) == (4, 48), f"bank: conflicted packets and extra rounds from the report ({kl.bank(js)})")
         ok(kl.bank(os.path.join(t, "none.json")) == (None, None), "bank: no report, no figure")
+        # ldsbank (E424 / E435 / E456): conflict rounds of the hot loop's LDS packets, placed by matching the report's per-packet rows
+        # to the binary's ds_ instructions; an epilogue conflict (E249: the f16 GEMMs' once-per-tile store, 0.2 % measured) is not
+        bl = ["s_mov_b32 s0, 0", "ds_store_b128 v1, v[2:5]", "s_waitcnt lgkmcnt(0)", "ds_load_b128 v[6:9], v1", wm(0), "s_add_u32 s0, s0, 1"]
+        bl.append(back(len(bl), 1))
+        bl += ["ds_store_b128 v1, v[2:5] offset:16", "s_endpgm"]
+        def lrow(pk, req, ext):
+            return {"memory_space": "workgroup", "packet": "amdgpu." + pk,
+                    "bank_service": {"proof": "exact", "required_rounds": req, "extra_rounds": ext}}
+        def bank_note(rows_):
+            jb = os.path.join(t, "b.json")
+            json.dump({"source_low": {"memory_rows": [{"memory_space": "global", "packet": "amdgpu.global_load_b128"}] + rows_}}, open(jb, "w"))
+            r_ = kl.lint_listing("banks", *listing(bl))
+            kl.ldsbank(r_, jb, bl)
+            return r_["bank_loop"], "ldsbank" in r_.get("notes", [])
+        got = bank_note([lrow("ds_write_b128", 8, 4), lrow("ds_read_b128", 4, 0), lrow("ds_write_b128", 4, 0)])
+        ok(got == ((4, 12), True), f"ldsbank: a 2-way store in the hot loop (4 of 12 rounds) gets the note ({got})")
+        got = bank_note([lrow("ds_write_b128", 4, 0), lrow("ds_read_b128", 4, 0), lrow("ds_write_b128", 8, 4)])
+        ok(got == ((0, 8), False), f"ldsbank: the same conflict in the epilogue, after the loop, does not ({got})")
+        got = bank_note([lrow("ds_write_b128", 8, 4), lrow("ds_read_b128", 400, 0), lrow("ds_write_b128", 4, 0)])
+        ok(got == ((4, 408), False), f"ldsbank: 4 conflict rounds of 408 (1.0 %, under LDSBANK) do not ({got})")
+        got = bank_note([lrow("ds_write_b128", 8, 4), lrow("ds_read_b128", 4, 0), lrow("ds_write_b128", 4, 0), lrow("ds_write_b128", 4, 0)])
+        ok(got == (None, False), f"ldsbank: rows that do not match the binary's instructions place nothing ({got})")
         run = os.path.join(t, "run"); os.makedirs(run)
         with open(os.path.join(run, "events.jsonl"), "w") as f:
             for k, ns in (("g_a", 2_000_000), ("g_a", 1_000_000), ("g_b", 500_000)):

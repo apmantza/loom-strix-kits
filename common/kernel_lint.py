@@ -35,6 +35,26 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   [outlier] a NOTE, not a flag (E251: 0 of 2 confirmed on llama.cpp, where one template spans formats of different cost):
             non-MMA instructions per MMA (or dot) > OUTLIER x the median of its peers (same family, place, MMA kind and MMA
             count, >= 3 kernels): a kernel doing much more per multiply than its siblings (E233: q6_k's matvec 616 vs q5_k's 261).
+  [ldsbank] a NOTE until a blind sample confirms it: Loom's gfx1151 bank model puts >= LDSBANK % of the hot loop's modelled LDS
+            rounds into bank conflicts. The report's per-packet rows (source_low.memory_rows, one per static LDS instruction, in
+            program order) are matched to the binary's ds_ instructions of the same type in order, so only packets inside the hot
+            loop count (E249: the f16 GEMMs' 48 extra rounds sit in the once-per-tile epilogue store; rocprof 0.06-0.20 %, E435). A
+            type whose row and instruction counts differ is not placed; a conflicted row in one leaves the kernel without a figure.
+            Calibration (model vs rocprof SQC_LDS_BANK_CONFLICT / SQC_LDS_IDX_ACTIVE): flash2_f16o 32 of 320 rounds (10.0 %) vs
+            8.18 / 8.28 % measured, vsplit 32 of 448 (7.1 %) vs 7.96 % (E424 / E435 / E456: SX11's S-partial exchange, 2-way);
+            FLASH2_SXH's 'half' layout 0 of 288 / 0 of 416 vs 0.00 % (E477); f16 GEMM 0 of 304 vs 0.20 %; matvecs 0 vs 0.00 %.
+            Fire 11-25 (--package): pkg-e379 g_attention_flash2, g_attention_flash2_f16o (32 of 320), g_attention_vsplit (32 of
+            448), nothing else; pkg-e465 (FLASH2_SXH) none; the 14 m256 GEMMs carry 48 whole-kernel extra rounds and 0 of 304 in
+            the loop. A kernel without an MMA loop gets no figure (the vision v_attn_72x16: 72 of 144 whole-kernel, unplaced).
+            --package compiles the details report (per-packet rows) only for kernels whose summary shows a conflicted packet.
+ (with --package / --program: the kernel's own program text, not the binary, not the func.defs it calls): a
+            key-valid bit masks only the score while V is read unconditionally: a select of the score against a float fill
+            <= MASK_NEG that feeds a softmax exp, with no select of a value outside the score chain against 0.0 and no index.min
+            of a compared key (E441 / E444: g_attention_split multiplied the V of keys past the block's last live one by p = +0, so
+            a NaN in unwritten KV reached the output; zeroing p is no guard, 0 x NaN = NaN). Fire 11-25: pkg-e379 / pkg-e465
+            g_attention_split, g16_attention_split_listed (and the _rdna4 twin), nothing else; KV8_SPLIT_VZERO (pkg-q179) clears
+            all three. Quiet: flash2 / flash2_partial / vsplit (K and V zeroed under the bit), g_dfl_ctx_split (key clamped),
+            g_dfl_topk (a logit mask, no softmax). The stale_kv kernel tests are the guard; this points at a kernel to read.
   regress:  (with --baseline) worse than the same kernel in another build: a new spill, the prefetch now drained, fewer
             waves per SIMD, or the hot loop / its longest move run >= 10 % longer (E226: Loom 0.3.0's vmcnt(0) + 32-move shift;
             E230: a rewrite's spill; E236: a variant's residency drop).
@@ -329,7 +349,47 @@ def lint(path):
     ins, addr = disasm(path)
     r = lint_listing(os.path.basename(path)[:-6], ins, addr, residency(path[:-6] + ".json"))
     r["bank_conf"], r["bank_extra"] = bank(path[:-6] + ".json")
+    ldsbank(r, path[:-6] + ".json", ins)
     return r
+
+
+LDSBANK = 2.0   # % of the hot loop's modelled LDS rounds that are conflict rounds (11-25: flash2 10.0 / vsplit 7.1 fire, SXH and GEMMs 0)
+
+
+def loop_banks(js, ins, t, e):
+    """(extra, required) LDS bank-service rounds of the packets in ins[t..e] by Loom's gfx1151 bank model, or None: the report's
+    per-packet rows (source_low.memory_rows, one per static LDS instruction, in program order) matched to the binary's ds_
+    instructions of the same packet type in order. A type whose row and instruction counts differ is not placed; None when such a
+    type holds a conflicted row (where it sits is unknown) or the report has no rows. Rows the model could not prove count nowhere."""
+    if not os.path.exists(js):
+        return None
+    rows = [x for x in (json.load(open(js)).get("source_low") or {}).get("memory_rows") or [] if x.get("memory_space") == "workgroup"]
+    if not rows:
+        return None
+    by, pos = collections.defaultdict(list), collections.defaultdict(list)
+    for x in rows:
+        by[x["packet"].split(".", 1)[-1].replace("ds_write", "ds_store").replace("ds_read", "ds_load")].append(x)
+    for j, x in enumerate(ins):
+        pos[x.split(" ", 1)[0]].append(j)
+    ext = req = 0
+    for op, rs in by.items():
+        if len(rs) != len(pos[op]):
+            if any((x.get("bank_service") or {}).get("extra_rounds") for x in rs):
+                return None
+            continue
+        for x, j in zip(rs, pos[op]):
+            b = x.get("bank_service") or {}
+            if t <= j <= e and b.get("proof") == "exact":
+                ext += b.get("extra_rounds") or 0
+                req += b.get("required_rounds") or 0
+    return ext, req
+
+
+def ldsbank(r, js, ins):
+    """note `ldsbank` when the hot loop's modelled conflict rounds are >= LDSBANK % of its modelled LDS rounds (E424 / E435 / E456)"""
+    r["bank_loop"] = loop_banks(js, ins, *r["hot_range"]) if r.get("hot_range") else None
+    if r["bank_loop"] and r["bank_loop"][1] and 100 * r["bank_loop"][0] >= LDSBANK * r["bank_loop"][1]:
+        r.setdefault("notes", []).append("ldsbank")
 
 
 def lint_listing(name, ins, addr, res=(None, None, None)):
@@ -345,6 +405,7 @@ def lint_listing(name, ins, addr, res=(None, None, None)):
         b = [ins[j] for j in common_path(ins, L, t, e)]              # the hot loop's common path
         full = ins[t:e + 1]
         r["where"] = "loop"
+        r["hot_range"] = (t, e)
     n = lambda *p: sum(1 for x in b if x.startswith(p))
     mm = n("v_wmma"); dot = n("v_dot4", "v_dot2", "v_dot8")
     r.update(loop=len(full), common=len(b), wmma=mm, dot=dot, moves=sum(moves(x) for x in b), run=longest_move_run(b),
@@ -459,8 +520,74 @@ def launch_sites(texts):
     return sites
 
 
+MASK_NEG = -1e4      # a score mask's fill: a float constant at or below this (live: -3.0e38)
+
+
+def kernel_texts(texts):
+    """kernel -> its text in a package's program texts: from its `kernel.def` line to the next top-level definition"""
+    out = {}
+    for t in texts:
+        starts = [m.start() for m in re.finditer(r"(?m)^[a-z]\w*\.def\b", t)] + [len(t)]
+        for a, b in zip(starts, starts[1:]):
+            m = re.match(r'kernel\.def (?:target\(@\w+\) )?export\("(\w+)"\)', t[a:b])
+            if m:
+                out[m.group(1)] = t[a:b]
+    return out
+
+
+def masked_v(text):
+    """the E444 shape in one kernel's Loom text, or None: a key-valid bit masks the score (a select whose other side is a float
+    constant <= MASK_NEG) while nothing zeroes a value outside the score chain (no select of a non-score value against a 0.0
+    constant) and the compared key is never clamped (no index.min of a compare operand: the clamped-key form reads a live key).
+    Zeroing p is not a guard: p = +0 times a NaN V is NaN (E441). Returns the score-mask conditions"""
+    defs, ops = {}, []
+    for line in text.split("\n"):
+        m = re.match(r"\s*(%\w+(?:\s*,\s*%\w+)*)\s*=\s*([\w.]+)(?:<[^>]*>)?\s*(.*)", line)
+        if m:
+            names = re.findall(r"%\w+", m.group(1))
+            ops.append((names, m.group(2), m.group(3)))
+            for n in names:
+                defs[n] = (m.group(2), m.group(3))
+    def const(n):
+        op, rest = defs.get(n, ("", ""))
+        if op == "vector.splat":
+            s = re.match(r"(%\w+)", rest)
+            return const(s.group(1)) if s else None
+        v = re.match(r"(-?[\d.]+(?:e[-+]?\d+)?)\s*:\s*(\S+)", rest) if op in ("scalar.constant", "vector.splatf") else None
+        return float(v.group(1)) if v and re.search(r"\bf\d+|xf\d+", v.group(2)) else None
+    sel = [(names, *re.findall(r"%\w+", rest)[:3]) for names, op, rest in ops if op in ("scf.select", "vector.select")]
+    score = [s for s in sel if len(s) == 4 and (const(s[3]) or 0.0) <= MASK_NEG]
+    if not score:
+        return None
+    taint = {n for s in score for n in s[0]}                     # the score chain: masked scores and everything computed from them
+    soft = False
+    for names, op, rest in ops:
+        if taint & set(re.findall(r"%\w+", rest)):
+            taint.update(names)
+            soft |= bool(re.search(r"\.exp2?f$", op))
+    if not soft:
+        return None                                              # no softmax on the masked score: not attention (a top-k's logit mask)
+    if any(len(s) == 4 and const(s[3]) == 0.0 and s[2] not in taint for s in sel):
+        return None                                              # a non-score value zeroed under a bit (E444's fix: the V scale)
+    conds, seen, keys = [s[1] for s in score], set(), set()
+    while conds:
+        c = conds.pop()
+        if c in seen:
+            continue
+        seen.add(c)
+        op, rest = defs.get(c, ("", ""))
+        if re.match(r"(?:scalar|vector)\.(?:andi|ori)$", op):
+            conds += re.findall(r"%\w+", rest)[:2]
+        elif op.endswith(".cmp"):
+            keys.update(re.findall(r"%\w+", rest)[:2])
+    if any(op == "index.min" and keys & set(re.findall(r"%\w+", rest)[:2]) for _, op, rest in ops):
+        return None                                              # the compared key clamped: the load reads a live key
+    return sorted({s[1] for s in score})
+
+
 def compile_programs(progs, out, jobs, lc=None, roots=None):
-    """every gfx11 kernel root (matching ROOTS, a regex) of the program files compiled into OUT (code object + summary report)
+    """every gfx11 kernel root (matching ROOTS, a regex) of the program files compiled into OUT (code object + summary report;
+    the details report for a kernel whose bank model has conflicted packets)
     with loom-compile LC (default: the machine's); returns the program texts and the roots that failed to compile standalone
     (named, never hidden)"""
     lc = lc or loom_compile()
@@ -474,8 +601,12 @@ def compile_programs(progs, out, jobs, lc=None, roots=None):
                 work.append((prog, k))
     def one(pk):
         prog, k = pk
-        r = subprocess.run([lc, prog, "--target=amdgpu:gfx1151", f"--root={k}", f"--output={out}/{k}.hsaco",
-                            "--compile-report=summary", f"--compile-report-output={out}/{k}.json"], capture_output=True, text=True)
+        r = None
+        for rep in ("summary", "details"):            # details (per-packet rows, ~10x larger) only where the bank model conflicts: ldsbank
+            r = subprocess.run([lc, prog, "--target=amdgpu:gfx1151", f"--root={k}", f"--output={out}/{k}.hsaco",
+                                f"--compile-report={rep}", f"--compile-report-output={out}/{k}.json"], capture_output=True, text=True)
+            if r.returncode or not bank(f"{out}/{k}.json")[0]:
+                break
         return k, r.returncode, r.stderr
     failed = []
     with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
@@ -553,7 +684,7 @@ def main():
     ap.add_argument("--flagged", action="store_true", help="print flagged kernels only")
     ap.add_argument("--strict", action="store_true", help="exit 1 when any kernel is flagged")
     a = ap.parse_args()
-    sites, failed = None, []
+    sites, failed, texts = None, [], []
     progs = sorted(glob.glob(os.path.join(a.package, "program", "*.loom"))) if a.package else []
     progs += a.program
     if progs:
@@ -573,6 +704,10 @@ def main():
         rows = [r for rs in ex.map(lint_file, files) for r in rs]
     outl = outliers(rows)
     tiny(rows, stats)
+    mv = {k: c for k, t in kernel_texts(texts).items() if (a.roots is None or re.search(a.roots, k)) for c in [masked_v(t)] if c}
+    for r in rows:
+        if r["kernel"] in mv:
+            r.setdefault("notes", []).append("maskedv")         # E444: V read unconditionally under a score-only mask
     if a.baseline:
         for r in rows:
             b = os.path.join(a.baseline, r["kernel"] + ".hsaco")
@@ -593,6 +728,14 @@ def main():
               f"{' '.join(r['flags'])}{('  [' + ' '.join(r['notes']) + ']') if r.get('notes') else ''}")
     for k, (v, med, n) in sorted(outl.items()):
         print(f"outlier {k}: {v} non-MMA instructions per MMA vs a median of {med} over {n} peers")
+    for r in rows:
+        if "ldsbank" in r.get("notes", []):
+            x, q = r["bank_loop"]
+            print(f"ldsbank {r['kernel']}: {x} of {q} modelled LDS rounds in the hot loop are bank-conflict rounds ({100 * x / q:.1f} %; "
+                  f"read the report's bank_service_groups for the access)")
+    for k, c in sorted(mv.items()):
+        print(f"maskedv {k}: {len(c)} key-valid bits ({' '.join(c[:3])}{' ...' if len(c) > 3 else ''}) mask only the score: no value "
+              f"outside the score chain is zeroed and no compared key is clamped (E444: V of a masked key times p = +0)")
     if sites is not None:
         unl = sorted(r["kernel"] for r in rows if not sites.get(r["kernel"]))
         print(f"not launched in the package ({len(unl)}): {' '.join(unl)}")
