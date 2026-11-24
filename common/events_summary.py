@@ -6,7 +6,8 @@ Each RUN is a directory holding events.jsonl (iree-profile dispatch --dispatch_e
 size). Dispatches go to the first lane whose regex matches the kernel name (MODEL.json "lanes"); verify steps are the
 distinct submissions that ran the verify-attention lane. Several RUNs print side by side (an ABBA's four runs).
 
-usage: events_summary.py MODEL.json RUN [RUN ...] [--top 12] [--split KERNEL[:CUT_MS]]
+usage: events_summary.py MODEL.json RUN [RUN ...] [--top 12] [--split KERNEL[:CUT_MS]] [--device DEV.json [--profile P]]
+  --device: floors at a device file's power profile (common/devices/<gfx>.json; ceiling.py), not MODEL.json's hardware.
   --split prints a kernel's dispatch-time clusters (E143: vsplit's aligned 1.62 ms vs straddling 3.01 ms) per run: below
   and above CUT_MS (default: midway between the run's 10th and 90th percentile), count and median each.
 """
@@ -19,7 +20,7 @@ import statistics as st
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ceiling import floor  # noqa: E402
+from ceiling import floor, hardware  # noqa: E402
 
 
 def load(run):
@@ -117,8 +118,11 @@ def main():
     ap.add_argument("runs", nargs="+")
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--split", action="append", default=[])
+    ap.add_argument("--device", help="device file (common/devices/<gfx>.json): floors at its profile, not MODEL.json's hardware")
+    ap.add_argument("--profile", help="the device file's profile (default: its default_profile)")
     a = ap.parse_args()
     d = json.load(open(a.model))
+    d["hardware"] = hardware(d, a.device, a.profile)   # MODEL.json's block unless --device
     res = []
     for run in a.runs:
         ev, prompt = load(run)

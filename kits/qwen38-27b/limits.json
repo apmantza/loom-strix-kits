@@ -1,0 +1,138 @@
+{
+ "_doc": "Worked example for common/amdahl.py: the HRX-like limits table (LEDGER 'Standing goal', refreshed 11-23, 'Now (e249)' column) with the switches live since (FLASH2_HEADPACK: verify attention 19.6, E350, live in pkg-e379, E390), one lever per part taking it to its floor at the 85 W cap (common/ceiling.py kits/qwen38-27b/lanes.json --context 81430 --prompt 81430 --device common/devices/gfx1151.json: 240 GB/s, 43.8 TFLOP/s, E369, E380). Parts without a ceiling.py floor are taken to the table's floor (prefill GDN ~3.8 s exact form, E186) or to 0 (fixed costs). Each part is its own overlap group: the parts are disjoint dispatch sets (events_summary lanes), so their savings add. 81,430-token prompt; decode per verify step at ~3.25 tokens per step (agent bench).",
+ "_discrepancy": "E369 states the capped decode limit as ~92-95 ms/step: it re-floored only the matvecs (69-73 ms) and kept 228 GB/s for attention, drafter and GDN; at E380's 240 GB/s on every DRAM-bound lane the sum is 90.1. Prefill reproduces E369 (~197 -> ~128-132 s).",
+ "phases": [
+  {
+   "phase": "decode",
+   "unit": "ms/step",
+   "wall": 115.1,
+   "screen_pct": 1.0,
+   "_src_wall": "sum of the lanes below (events_summary covers every dispatch: the catch-all lane included); E369: ~123 ms with verify attention at 27.4, 19.6 with HEADPACK",
+   "_src_screen": "A/A noise floor of the seeded agent bench, decode ~1 % (E374)",
+   "candidates": [
+    {
+     "name": "target weight matvecs to floor",
+     "target": 79.4,
+     "to": 69.08,
+     "overlap_group": "matvecs",
+     "src": "E301 (79.4); floor 16.58 GB at 240 GB/s (E217, E380)"
+    },
+    {
+     "name": "verify attention to floor",
+     "target": 19.6,
+     "to": 11.47,
+     "overlap_group": "verify attention",
+     "src": "E350 (HEADPACK 19.54-19.72); KV8 bytes at 240 GB/s"
+    },
+    {
+     "name": "drafter to floor",
+     "target": 10.5,
+     "to": 8.23,
+     "overlap_group": "drafter",
+     "src": "E367 (10.49); weights + head + warm at 240 GB/s"
+    },
+    {
+     "name": "GDN to floor",
+     "target": 3.6,
+     "to": 1.31,
+     "overlap_group": "gdn",
+     "src": "E185 (3.58); state read + write at 240 GB/s"
+    },
+    {
+     "name": "other to 0",
+     "target": 2.0,
+     "to": 0,
+     "overlap_group": "other",
+     "src": "limits table (small launch-bound kernels, E148; launch gaps 0.87 ms, E328)"
+    }
+   ],
+   "expect": {
+    "wall": 115.1,
+    "after": 90.1,
+    "tolerance_pct": 1,
+    "_src": "wall: E369 with HEADPACK's 19.6; after: the floors at 240 GB/s on every lane (see _discrepancy)"
+   }
+  },
+  {
+   "phase": "prefill",
+   "unit": "s/prompt",
+   "wall": 196.75,
+   "screen_pct": 0.2,
+   "_src_wall": "sum of the lanes below; E369: ~197 s",
+   "_src_screen": "A/A noise floor, prefill ~0.2 % (E374)",
+   "candidates": [
+    {
+     "name": "GEMMs to floor",
+     "target": 111.8,
+     "to": 90.49,
+     "overlap_group": "gemm",
+     "src": "E301 (111.77); 2 x 24.35e9 params x 81,430 at 43.8 TFLOP/s (E369)"
+    },
+    {
+     "name": "flash2 attention to floor",
+     "target": 60.2,
+     "to": 29.74,
+     "overlap_group": "attention",
+     "src": "E301 (60.2); causal QK + PV FLOPs at 43.8 TFLOP/s"
+    },
+    {
+     "name": "dequant to floor",
+     "target": 5.8,
+     "to": 5.35,
+     "overlap_group": "dequant",
+     "src": "E301 (5.82); 20 chunks x (15.54 GB + 2 B x params) at 240 GB/s"
+    },
+    {
+     "name": "GDN to exact-form floor",
+     "target": 9.5,
+     "to": 3.8,
+     "overlap_group": "gdn",
+     "src": "E301 (9.45); exact-form floor ~3.8 s (E186)"
+    },
+    {
+     "name": "drafter warm to 0",
+     "target": 1.25,
+     "to": 0,
+     "overlap_group": "drafter warm",
+     "src": "E364 (1.25)"
+    },
+    {
+     "name": "other to 0",
+     "target": 8.2,
+     "to": 0,
+     "overlap_group": "other",
+     "src": "limits table (8.2 with F16O11, E329); EPI_FUSE 5.47 (E360) and F16O_O (E378) not yet in this table's measured column"
+    }
+   ],
+   "expect": {
+    "wall": 197,
+    "after": 130,
+    "tolerance_pct": 1.6,
+    "_src": "E369: ~197 s now, ~128-132 s at the cap"
+   }
+  }
+ ],
+ "cells": [
+  {
+   "cell": "decode, seeded agent bench (pkg-e379)",
+   "kind": "decode",
+   "tokens_per_s": 27.31,
+   "tokens_per_step": 3.25,
+   "min_bytes_per_step": 21620000000.0,
+   "measured_bytes_per_step": null,
+   "busy_share": 0.997,
+   "published_tokens_per_step": 4.1,
+   "_src": "27.31 tok/s and 3.25 tokens/step: E381 (seeded agent bench, wall clock); minimum bytes per step at 81,430 positions: 16.58 GB target weights + 1.98 GB drafter (weights, head copy, warm, window K/V) + 2.75 GB KV8 + 0.31 GB GDN state read and written (ceiling.py's decode floors x 240 GB/s); the bench's turns span 34k-108k context (max_ctx 107,794), so the 81k bytes are an approximation; busy 0.997: iree-profile explain active_over_visible on a profiled served run (E354); measured bytes per step: unknown (no served memory counters at 0.2.0, E372); published 4.1: the low end of DFlash2's published 4.1-5.5 tokens/step (E181), on other content (E188)"
+  },
+  {
+   "cell": "prefill, 81,430-token profile (pkg-e249 lanes)",
+   "kind": "prefill",
+   "tokens_per_s": 413.9,
+   "active_params": 24352522240.0,
+   "extra_flops": 1303700000000000.0,
+   "prompt_tokens": 81430,
+   "busy_share": 0.997,
+   "_src": "81,430 tokens / 196.75 s device time (the prefill phase above, E301 + E329); active params: lanes.json linear_params (dense: every parameter but the head); extra_flops: causal attention QK + PV over 16 attention layers (ceiling.py prefill_attn); busy: E354"
+  }
+ ]
+}

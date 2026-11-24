@@ -5,10 +5,36 @@ A floor is what the lane would cost at the hardware limit: decode lanes are DRAM
 practical bandwidth), prefill lanes compute-bound (useful FLOPs / f16 WMMA peak). Lanes without a floor (drafter, dequant,
 GDN, producers) are fixed costs: judge them against zero. Floors are per verify step (decode, ms) or per prompt (prefill, s).
 
-usage: ceiling.py MODEL.json [--context 81432] [--prompt 81432]
+The hardware block comes from MODEL.json unless --device names a device file (common/devices/<gfx>.json): its profile
+(--profile, default the file's default_profile) replaces it, so the floors are the ones the machine reaches at that power
+setting (on gfx1151 the 85 W cap: ~2.14 GHz, 43.8 TFLOP/s, 240 GB/s). --clock-ghz re-derives the WMMA peak for another clock.
+
+usage: ceiling.py MODEL.json [--context 81432] [--prompt 81432] [--device common/devices/gfx1151.json [--profile cap85w]]
+                  [--clock-ghz 2.14]
 """
 import argparse
 import json
+
+
+def hardware(d, device=None, profile=None, clock_ghz=None):
+    """The hardware block floors use: MODEL.json's, or a device file's profile; clock_ghz re-derives the WMMA peak."""
+    if device is None:
+        if profile or clock_ghz:
+            raise SystemExit("ceiling.py: --profile / --clock-ghz need --device (the clock-to-peak constants live there)")
+        return d["hardware"]
+    dev = json.load(open(device)) if isinstance(device, str) else device
+    name = profile or dev.get("default_profile")
+    if name not in dev.get("profiles", {}):
+        raise SystemExit(f"ceiling.py: device has no profile {name!r} (has: {', '.join(dev.get('profiles', {}))})")
+    hw = dict(dev["profiles"][name], name=f"{dev['name']} [{name}]")
+    if clock_ghz:
+        hw["clock_ghz"] = clock_ghz
+        hw.pop("wmma_f16_tflops", None)
+    if "wmma_f16_tflops" not in hw:
+        if "clock_ghz" not in hw:
+            raise SystemExit(f"ceiling.py: profile {name!r} gives neither wmma_f16_tflops nor clock_ghz")
+        hw["wmma_f16_tflops"] = round(dev["simds"] * dev["wmma_flop"] / dev["wmma_cycles"] * hw["clock_ghz"] * 1e9 / 1e12, 2)
+    return hw
 
 
 def floor(kind, m, hw, context=0, prompt=0):
@@ -54,10 +80,14 @@ def main():
     ap.add_argument("model")
     ap.add_argument("--context", type=int, default=81432, help="positions a verify step attends (decode floors)")
     ap.add_argument("--prompt", type=int, default=81432, help="prompt tokens (prefill floors)")
+    ap.add_argument("--device", help="device file (common/devices/<gfx>.json): its profile replaces MODEL.json's hardware")
+    ap.add_argument("--profile", help="the device file's profile (default: its default_profile)")
+    ap.add_argument("--clock-ghz", type=float, help="shader clock for the WMMA peak (needs --device)")
     a = ap.parse_args()
     d = json.load(open(a.model))
-    m, hw = d["model"], d["hardware"]
-    print(f"{m['name']} on {hw['name']}: {hw['bw_practical_gbs']} GB/s practical, {hw['wmma_f16_tflops']} TFLOP/s f16 WMMA")
+    m, hw = d["model"], hardware(d, a.device, a.profile, a.clock_ghz)
+    print(f"{m['name']} on {hw['name']}: {hw['bw_practical_gbs']} GB/s practical, {hw['wmma_f16_tflops']} TFLOP/s f16 WMMA"
+          + (f" (clock {hw['clock_ghz']} GHz" + (f", {hw['power_w']} W cap)" if hw.get("power_w") else ")") if hw.get("clock_ghz") else ""))
     for ln in d["lanes"]:
         try:
             f = floor(ln["floor"], m, hw, a.context, a.prompt)

@@ -1,0 +1,15 @@
+{
+ "_doc": "Worked example for common/draft_depth.py: Qwen3.8-27B + DFlash2 (block drafter, depth 7 live) at 81,430 tokens of context on pkg-e379. Verify lanes are the served per-step times at width 8 (d7: 7 drafts + 1) from the HRX-like limits table; their scaling to other widths is a MODEL to be measured (served events at depths 1-7: common/events_ab.sh with the package's draft_depth set, events_summary.py per lane). Acceptance: the agent bench's served tokens per step (common/agent_ab.sh), or pass --replay with the bench's h*-PKG.jsonl and --replay-depth 7.",
+ "acceptance": {"served": [{"depth": 7, "tokens_per_step": 3.25, "src": "seeded agent bench, pkg-e379 and pkg-e317 (E381)"}]},
+ "drafter": {"kind": "block", "ms": 10.49, "max_depth": 7, "warm_ms": 0,
+  "_src": "E367: the drafter lane 10.49 ms/step (propose pass: proposal head 3.39 ms, q4_k / q6_k matvecs, window attention 1.03 ms; and the per-step warm pass): DFlash2 proposes the whole block in one pass, so the cost is taken flat in depth up to the block (8-token kernels, t8); the warm pass's share is not split out here (unknown)"},
+ "verify": {"lanes": [
+  {"name": "target weight matvecs", "ms": 79.4, "width": 8, "scaling": "tile", "tile": 8, "_src": "E301; 8-token matvec kernels read the weights once for up to 8 rows (assumed flat down to 1 row: the plain decode path's own time is unmeasured here)"},
+  {"name": "verify attention", "ms": 19.6, "width": 8, "scaling": "per_row", "_src": "E350 (HEADPACK); issue-bound (E168), so per row is the assumption: unmeasured at other widths"},
+  {"name": "GDN recurrence", "ms": 1.58, "width": 8, "scaling": "per_row", "_src": "E185: 8 sequential token steps per verify step"},
+  {"name": "GDN fold and small kernels", "ms": 2.02, "width": 8, "scaling": "flat", "_src": "E185: fold 1.29 ms (one state pass) + small kernels"},
+  {"name": "other", "ms": 2.0, "width": 8, "scaling": "flat", "_src": "limits table (launch-bound small kernels, E148)"}
+ ]},
+ "fixed_ms": 0,
+ "expect": {"depth": 7, "tokens_per_step": 3.25, "tolerance_pct": 1, "_src": "E381"}
+}

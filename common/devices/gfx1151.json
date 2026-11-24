@@ -1,0 +1,23 @@
+{
+ "_doc": "Device limits for common/ceiling.py --device (and events_summary.py --device): one file per GPU target, one profile per power setting. A profile replaces the kit lanes.json's 'hardware' block, so a lane's floor is the one this machine can reach at that setting. wmma_f16_tflops is derived from the clock when a profile gives clock_ghz and no TFLOP/s: simds x wmma_flop / wmma_cycles x clock. Every number names its source (HRX-like LEDGER rows).",
+ "name": "Strix Halo, Radeon 8060S, gfx1151 (40 CUs, 80 SIMDs, LPDDR5X unified)",
+ "simds": 80,
+ "wmma_flop": 8192,
+ "wmma_cycles": 32,
+ "_src_wmma": "f16 WMMA 16x16x16: 8,192 FLOP per instruction, 32 cycles per SIMD (E369)",
+ "default_profile": "cap85w",
+ "profiles": {
+  "cap85w": {
+   "power_w": 85,
+   "clock_ghz": 2.14,
+   "clock_ghz_served": [2.13, 2.19],
+   "bw_practical_gbs": 240,
+   "_src": "the default 85 W PPT cap: served prefill and decode both run pinned at 84-85 W, clock median 2.12-2.19 GHz (E356, E358, E373); 2.14 GHz -> 43.8 TFLOP/s (E369); pure reads 239.8 GB/s cool and 239.6 hot after a 10-minute 85 W soak (E380: bandwidth does not drop with heat)"
+  },
+  "nominal": {
+   "bw_practical_gbs": 228,
+   "wmma_f16_tflops": 45,
+   "_src": "the figures the kit lanes.json files carry: 228 GB/s reached by decode matvecs (E50), ~45 TFLOP/s clock-adjusted (E61); they assume a clock the chip does not hold inside 85 W (E358)"
+  }
+ }
+}

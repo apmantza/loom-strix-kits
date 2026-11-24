@@ -18,6 +18,7 @@ usage: replay.py SESSION URL MODEL [--kind loom|llama|generic] [--mode fixed|own
                  [--exact-length] [--effort LEVEL] [--label X] [--log FILE]
 """
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -117,7 +118,7 @@ def run(k, own):
         if a.seed is not None:
             body["seed"] = a.seed * 100000 + k
     dc0 = server_draft_counters(a.url) if a.kind == "loom" else {}   # per-turn draft acceptance (E99: same text, different speed)
-    t0 = time.perf_counter()
+    t0, t0_epoch = time.perf_counter(), time.time()   # epoch stamps: concurrent streams share one timeline (concurrency_audit.py)
     first, usage, timings = None, {}, None
     content, reasoning, calls = [], [], {}
     with requests.post(URL + "/v1/chat/completions", json=body, stream=True, timeout=7200) as r:
@@ -162,7 +163,12 @@ def run(k, own):
            "rec_out": t["rec_out"], "gen_s": round(gen, 2), "decode_tps": round((out - 1) / gen, 1) if gen > 0 and out > 1 else None,
            "wall": round(end - t0, 2), "rec_wall": t["rec_wall_s"], "cap": cap,
            "loop": round(checks.loop_share("".join(reasoning) + "".join(content)), 3),   # >= 0.5 over >= 64 words: a degenerate repeat, not speed
-           "tools": [{"name": c["name"], "json": _parses(c["args"])} for _, c in sorted(calls.items())]}   # tool calls made, args valid JSON
+           "tools": [{"name": c["name"], "json": _parses(c["args"])} for _, c in sorted(calls.items())],   # tool calls made, args valid JSON
+           # send / first token / end on the epoch clock, and a hash of the reply (reasoning, text, calls): the phase split and
+           # the solo-vs-concurrent exactness check of common/concurrency_audit.py (call ids left out: server-made)
+           "t_send": round(t0_epoch, 3), "t_first": round(t0_epoch + ((first or end) - t0), 3), "t_end": round(t0_epoch + (end - t0), 3),
+           "out_sha": hashlib.sha256(json.dumps([reply.get("reasoning_content"), reply["content"],
+                                            [(tc["function"]["name"], tc["function"]["arguments"]) for tc in reply.get("tool_calls") or []]]).encode()).hexdigest()[:16]}
     if dc0:
         dc1 = server_draft_counters(a.url)
         row["draft_acc"] = acceptance_between(dc0, dc1)
