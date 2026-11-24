@@ -9,6 +9,6 @@ set -u -o pipefail
 if [ "${2:-}" = --restore ]; then lsk_restore && echo "restored $(date +%T)"; exit; fi
 p=$(lsk_pkg "${2:?package dir}")
 lsk_stop || exit 1
-bash "$LSK/common/wait_quiet.sh" | tail -1
+bash "$LSK/common/wait_quiet.sh" | tail -1; [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "serve_as: not quiet / memory not admitted (wait_quiet above); not serving"; exit 1; }
 lsk_serve_bg bench "$p"
 echo "serving $p ($KIT_SERVE_ARGS) $(date +%T)"
