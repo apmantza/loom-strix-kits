@@ -124,5 +124,30 @@ rc, out = run("watch", str(child.pid), "--root", r, "--every", "0.1", env={"LSK_
 child.wait(timeout=10)
 case("watch: the floor is configurable (10 < 12 trips)", rc == 3, out)
 
+# frag: free large physical blocks before a server starts (HRX-like E468 / E471: the same package's decode matvecs read 79.2 ms / step
+# with ~21-30k free order-10 blocks and 95.5 with ~900 after a day of server restarts; nothing in a bench recorded it, so two hours
+# of decode verdicts (q166, q179, q187) were judged without it)
+r = fake()
+open(f"{r}/proc/buddyinfo", "w").write(
+    "Node 0, zone      DMA      0      0      0      0      0      0      0      0      1      1      2 \n"
+    "Node 0, zone    DMA32     11     11     11     10     11     11      9      7      8     11    395 \n"
+    "Node 0, zone   Normal    912   1810   1463   1721   1144    457    272    173     72     26  21579 \n")
+open(f"{r}/proc/vmstat", "w").write("nr_free_pages 1\ncompact_stall 5\ncompact_fail 3\ncompact_success 2\n")
+rc, out = run("frag", "--root", r)
+case("frag: order 10 / order 9 summed over every zone (2 + 395 + 21579; 1 + 11 + 26)",
+     rc == 0 and "order10 21976 " in out and "order9 38 " in out, out)
+case("frag: order-10 GiB at 4 KiB pages (21976 x 4 MiB = 85.84 GiB)", "order10_gib 85.84 " in out, out)
+case("frag: compaction counters from vmstat", "compact_stall 5 compact_fail 3 compact_success 2" in out, out)
+r = fake()
+rc, out = run("frag", "--root", r)
+case("frag: no buddyinfo reads 'unknown', never a number (an absent reading must not look like a fragmented or a clean machine)",
+     rc == 0 and out.startswith("memfrag unknown") and "order10 " not in out, out)
+
+r = fake()
+open(f"{r}/proc/buddyinfo", "w").write("")
+rc, out = run("frag", "--root", r)
+case("frag: an empty buddyinfo reads 'unknown', not order10 0 (zero would read as a fully fragmented machine)",
+     rc == 0 and out.startswith("memfrag unknown") and "order10 " not in out, out)
+
 print(f"{len(ran) - len(fails)}/{len(ran)} passed")
 sys.exit(1 if fails else 0)

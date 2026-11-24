@@ -27,6 +27,7 @@ for p in "$@"; do
   lsk_stop || exit 1
   python3 "$H/env_block.py" --kit "$LSK" "${eb[@]}" > "$d/env.txt" 2> "$d/env.err"
   bash "$H/wait_quiet.sh" | tail -1 || die "events_ab STOP: machine not quiet before run $n"
+  python3 "$H/mem_admit.py" frag > "$d/mem.txt" 2>&1   # free large blocks before the server allocates (E471); measured, not judged
   lsk_serve_bg prof "$p" --device_profiling_mode=dispatch-events,executable-metadata --device_profiling_flush_interval_ms=5 \
     --device_profiling_output="$d/run.ireeprof"
   "$PYTHON" "$H/profile_req.py" "http://127.0.0.1:$PORT" "$KIT_MODEL_ID" "$L" > "$d/run.req.json" 2> "$d/run.req.err" || die "events_ab STOP: request $p"
@@ -43,7 +44,8 @@ envok=0   # no pipe around the block: envok must survive it
     python3 "$H/env_block.py" --diff "${runs[0]}/env.txt" "$d/env.txt" > "$d/env.diff" 2>&1 && continue
     envok=1; echo "environment changed before $(basename "$d") (or not comparable):"; sed 's/^/  /' "$d/env.diff"
   done
-  [ $envok = 0 ] || echo "EVENTS: UNTRUSTED (the environment differs between runs)"; } > "$OUT/env.md"
+  [ $envok = 0 ] || echo "EVENTS: UNTRUSTED (the environment differs between runs)"
+  for d in "${runs[@]}"; do echo "memory before $(basename "$d"): $(cat "$d/mem.txt" 2>/dev/null || echo 'memfrag unknown (no mem.txt)')"; done; } > "$OUT/env.md"
 tee -a "$OUT/summary.md" < "$OUT/env.md"
 echo "EVENTS_AB_DONE $(date +%T)"
 [ $envok = 0 ] || exit 2

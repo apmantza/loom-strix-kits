@@ -50,6 +50,9 @@ run() {   # half, package, first turn
   python3 "$H/env_block.py" --kit "$LSK" --pkg "$A" --pkg "$B" > "$OUT/$tag.env.txt" 2> "$OUT/$tag.env.err"
   [ -f "$OUT/env.txt" ] || cp "$OUT/$tag.env.txt" "$OUT/env.txt"
   python3 "$H/env_block.py" --diff "$OUT/env.txt" "$OUT/$tag.env.txt" > "$OUT/$tag.env.diff" 2>&1; echo "exit $?" >> "$OUT/$tag.env.diff"
+  # free large physical blocks before this half's server allocates (E471: one package's decode matvecs read 79.2 vs 95.5 ms / step on
+  # fresh vs fragmented memory); measured beside the verdict, not judged
+  echo "  memory $tag: $(python3 "$H/mem_admit.py" frag 2>&1)" > "$OUT/$tag.mem.txt"
   "${SERVE[@]}" "$2" || { echo "agent_ab STOP: serve $2"; exit 2; }
   spid=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)   # its CPU is not contamination
   python3 "$H/gpu_telemetry.py" record "$OUT/$tag.tel.tsv" --pid "${spid:-none}" & TEL=$!
@@ -140,7 +143,7 @@ print("loop flags (8-gram repeat share >= 0.5): " + ", ".join(f"{p} {len(v)} tur
 tags = [f"h1-{a}", f"h1-{b}", f"h2-{b}", f"h2-{a}"]
 untrusted = []
 for tag in tags:
-    for ext in ("start.txt", "tel.txt"):
+    for ext in ("start.txt", "tel.txt", "mem.txt"):
         p = f"{out}/{tag}.{ext}"
         txt = open(p).read().rstrip("\n") if os.path.exists(p) else f"  {tag}: no {ext}"
         print(txt)

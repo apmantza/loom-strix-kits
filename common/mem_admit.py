@@ -10,10 +10,16 @@ admit     = no model resident on the GPU, and room >= need + reserve
   reserve = LSK_MEM_RESERVE_GIB, else max(8 GiB, 8 % of MemTotal) (Strata's desktop reserve)
 resident  = any process holding >= LSK_RESIDENT_GIB (default 1) GiB of GPU memory (drm fdinfo, common/checks.py drm_memory),
             paused or not; or GTT used that no readable process accounts for (another user's process): fails closed
+frag      = free large physical blocks, a measured state printed beside a run (not an admission rule, not in env_block: it differs
+            on every start): free order-10 (4 MiB) and order-9 (2 MiB) blocks summed over all zones of /proc/buddyinfo, and
+            /proc/vmstat's compaction counters. HRX-like E468 / E471: one package's decode matvecs read 79.2 ms / step with ~21-30k
+            free order-10 blocks and 95.5 with ~900 after a day of server restarts (GTT comes from system RAM through TTM)
 watch     = sample usable and GTT used every --every s (default 0.5); when usable < floor (LSK_MEM_FLOOR_GIB, default 3 GiB)
             kill the watched PID and its descendants (TERM, then KILL after 3 s), print why, exit 3; exit 0 when PID ends
 
 usage: mem_admit.py admit [--need GIB]                       exit 0 admits, 1 refuses; one line either way
+       mem_admit.py frag                                     one line 'memfrag order10 N order10_gib G order9 N compact_stall ...'
+                                                             or 'memfrag unknown (why)'; exit 0 either way (an observation)
        mem_admit.py watch PID [--floor GIB] [--log TSV] [--every S]
                                                              TSV: t usable_gib gtt_used_gib (keep it outside /tmp)
        --root DIR (or LSK_MEM_ROOT): read DIR/proc/meminfo, DIR/proc/PID/fdinfo and DIR/sys/class/drm instead (tests).
@@ -160,6 +166,24 @@ def watch(root, pid, floor, log, every):
     return 0
 
 
+def frag(root):
+    """one line: free order-10 / order-9 blocks over all zones (4 KiB pages assumed: x86-64), order-10 GiB, compaction counters"""
+    try:
+        rows = [l.split() for l in open(f"{root}/proc/buddyinfo") if l.startswith("Node")]
+        counts = [list(map(int, r[4:])) for r in rows]
+        if not counts or any(len(c) < 11 for c in counts):
+            return "memfrag unknown (buddyinfo has no 11-order zone rows)"
+    except (OSError, ValueError) as e:
+        return f"memfrag unknown ({e.__class__.__name__}: buddyinfo)"
+    o10, o9 = sum(c[10] for c in counts), sum(c[9] for c in counts)
+    try:
+        vm = dict(l.split() for l in open(f"{root}/proc/vmstat"))
+        comp = " ".join(f"{k} {vm.get(k, 'unknown')}" for k in ("compact_stall", "compact_fail", "compact_success"))
+    except (OSError, ValueError):
+        comp = "compact unknown"
+    return f"memfrag order10 {o10} order10_gib {o10 * 4 / 1024:.2f} order9 {o9} {comp}"
+
+
 def opt(args, name, default):
     if name in args:
         i = args.index(name)
@@ -176,6 +200,9 @@ def main(argv):
         ok, line = admit(root, float(opt(args, "--need", os.environ.get("LSK_MEM_NEED_GIB") or "0")))
         print(line)
         return 0 if ok else 1
+    if args == ["frag"]:
+        print(frag(root))
+        return 0
     if args[:1] == ["watch"]:
         floor = float(opt(args, "--floor", os.environ.get("LSK_MEM_FLOOR_GIB", "3")))
         log, every = opt(args, "--log", None), float(opt(args, "--every", "0.5"))
