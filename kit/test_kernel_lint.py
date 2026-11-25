@@ -172,6 +172,9 @@ def livereg():
     ok("error" in y, f"livereg: a row missing (the last) gives no figure ({y})")
     z = kl.live(rows[:5] + [(rows[5][0], "v_nop")] + rows[6:], ins, addr, 168)
     ok("error" in z, f"livereg: a row that is not our instruction gives no figure ({z})")
+    d = kl.live([(3, "v_add_f32 v1, v2, v3 row_shr:1 row_mask:0xf"), (2, "v_max_f32 v1, v2, v3")],
+                ["v_add_f32_dpp v1, v2, v3 row_shr:1 row_mask:0xf", "v_max_f32_e64_dpp v1, v2, v3"], [0, 8], None)
+    ok(d == {"peak": 3}, f"livereg: RGA writes v_add_f32 where we decode v_add_f32_dpp / _e64_dpp: the same instruction ({d})")
     ok(kl.live_text({"live": {"error": "rga: x"}}) == "unknown" and kl.live_text({}) == "-" and
        kl.live_text({"live": x}) == "229/159/766", f"livereg: the live column ({kl.live_text({'live': x})})")
     ok(kl.rga_live("/nonexistent.hsaco", "") == {"error": "rga: not found (--rga, or RGA in the environment / machine env file)"},

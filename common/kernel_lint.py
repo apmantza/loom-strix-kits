@@ -458,12 +458,13 @@ def live(rows, ins, addr, budget):
     """live-register figures of one kernel from RGA's rows matched to our listing (E527 / E531 / E533): {peak, loop_peak, at (offset
     in the hot loop, mnemonic), floor (the loop's minimum: the carried values no schedule frees), over (loop instructions with more
     live VGPRs than BUDGET, the next reachable tier's), loop}; {error} when the rows are not our instructions one for one (fail closed)"""
-    mn = lambda x: re.sub(r"_e(?:32|64)$", "", x.split()[0]) if x.split() else ""
+    mn = lambda x: re.sub(r"(?:_e32|_e64|_dpp|_sdwa)+$", "", x.split()[0]) if x.split() else ""   # RGA drops encoding suffixes
     if len(rows) != len(ins):
         return {"error": f"rga: {len(rows)} rows for {len(ins)} instructions"}
     j = next((j for j, (x, (_, y)) in enumerate(zip(ins, rows)) if mn(x) != mn(y)), None)
     if j is not None:
-        return {"error": f"rga: instruction {j} is {rows[j][1].split()[0]!r}, ours {ins[j].split()[0]!r}"}
+        what = "cannot decode" if rows[j][1].startswith("<unknown>") else f"has {rows[j][1].split()[0]!r} for"
+        return {"error": f"rga {what} instruction {j}, {ins[j].split()[0]!r}"}
     out = {"peak": max((n for n, _ in rows), default=0)}
     h = hot(ins, addr)
     if h:
