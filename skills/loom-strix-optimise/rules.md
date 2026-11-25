@@ -126,7 +126,9 @@ all of them every time: llama.cpp HIP and Vulkan, Strata (github.com/Niko1221/St
 (github.com/hyukudan/strix-halo-engine-lab, Strix-specific), strix-llama.cpp (github.com/halo-box/strix-llama.cpp, MIT,
 Strix-specific llama.cpp fork with measured gfx1151 findings), TensorFold (github.com/ashhart/TensorFold, Apache-2.0: CUDA, Metal
 and a HIP backend with kernel cost tables measured on gfx1151 (zig/src/hip/tuning/gfx1151.zon); GDN, attention and drafter paths for a
-Qwen3.8 hybrid), vLLM and SGLang, and loom-fun/loom-skills' knowledge base.
+Qwen3.8 hybrid), Unsloth (github.com/unslothai/unsloth: the library is Apache-2.0, its Studio is AGPL-3.0, so ideas only from studio/;
+Studio serves GGUFs through llama.cpp with per-model launch tuning, e.g. micro-batch and MoE expert placement for Inkling 2), vLLM and
+SGLang, and loom-fun/loom-skills' knowledge base.
 Read a closed-licence engine for technique notes only, never derived code. Give each surveyor the measured diagnosis
 (ablation numbers, register/LDS budget) and ask for file:line evidence plus any measured numbers; spot-check the key
 claims yourself before relying on them. Record the table in the design note. Surveys have repeatedly found the decisive
