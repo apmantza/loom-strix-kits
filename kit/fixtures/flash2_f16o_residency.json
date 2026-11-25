@@ -1,6 +1,7 @@
 {
  "kind": "loom.compile_report",
  "schema_version": 0,
+ "target_key": "gfx1151",
  "residency_constraints": {
   "count": 4,
   "rows": [

@@ -45,14 +45,11 @@
   - an attention kernel whose key-valid bit masks only the score not noted `maskedv` (E441 / E444: g_attention_split read V of
     unwritten keys, a NaN reached the output): the score-only mask fires, and so does zeroing only p; V's scale selected to 0
     (KV8_SPLIT_VZERO), a clamped key (g_dfl_ctx_split), no softmax (g_dfl_topk) or a -1.0 fill do not;
-  - a residency tier the hardware cannot reach reported (HRX-like E533: Loom 0.2.0 rounds LDS and slots to whole workgroups, not
-    VGPRs; flash2's 384-lane workgroup = 3 waves per SIMD reported next tier 7 at -21 VGPRs): flash2's rows give 6 waves and next
-    9 at -69 VGPRs and -18,944 B LDS together; a 128-lane kernel (1 wave per SIMD) keeps Loom's own figure; 5-wave
-    workgroups count the busiest SIMD; LDS counts in granules; a 17-wave matvec at
-    the slot limit has no next tier, nor a kernel at a lower slot tier; an unknown resource row gives no figure (fail closed);
-  - Loom's own static advice (loom-compile-report suggest, user 11-25) dropped or turned into flags: each finding kind is one
-    loom:<id> note; the expansions every kernel has (256 of 259 on live) are one line, not a note; a residency cliff the 'next'
-    column already shows is silent, one whole workgroups cannot reach is a line; a failed run is printed;
+  - two occupancy figures for one kernel (review r1 F1: lint_counters (a) printed 11.25, (d2) 'unverified'), a residency tier the
+    hardware cannot reach (HRX-like E533: flash2 reported next tier 7; reachable is 9), a fraction shown as a figure (F3), or a
+    next tier the cut does not land on (F2: g_dfl_ctx_split's -3 VGPRs reaches 12, not 11): occupancy() is the one seam; flash2's
+    report gives 6 -> 9 at -72 VGPRs and -18,944 B together; a 160-lane matvec gives an integer tier marked bound; g_dfl_ctx_split
+    and g_head_mv_t8_q8 (live rows) name the tier reached; a real compile's report is verified through the device file;
   - live registers read by hand from RGA's .live files (E527 / E531; E533: flash2's loop never drops below 159 live VGPRs, so 168
     needs a new organisation): flash2_f16o's RGA output gives peak 229, loop floor 159, 766 loop instructions over 168; a row
     missing or not ours, or RGA absent, gives no number.
@@ -88,70 +85,63 @@ def compile_lint(lc, t, name, text, root):
     return kl.lint(out)
 
 
-def rep(flat, vgpr, lds, slots, extra=()):
-    """a compile report's residency fields (Loom 0.2.0 gfx1151 rows: VGPR pool 1536 in granules of 24 per SIMD, LDS 131072 per
+def occ(wg, vgpr, vtier, lds, ltier, slots, cur, cap=16, extra=()):
+    """occupancy() inputs as a Loom 0.2.0 gfx1151 report carries them (VGPR pool 1536 in granules of 24 per SIMD, LDS 131072 per
     WGP in granules of 1024, the slot row's tier)"""
-    up = lambda x, g: -(-x // g) * g
-    rows = [{"name": "amdgpu.sgpr", "kind": "unconstrained_resource", "allocation_scope": "subgroup", "pool_units": 2048,
-             "allocation_granularity": 128, "units": 78, "rounded_units": 128, "independent_tier": 16},
-            {"name": "amdgpu.vgpr", "kind": "pooled_resource", "allocation_scope": "subgroup", "pool_units": 1536,
-             "allocation_granularity": 24, "units": vgpr, "rounded_units": up(vgpr, 24)},
-            {"name": "amdgpu.lds", "kind": "pooled_resource", "allocation_scope": "workgroup", "pool_units": 131072,
-             "allocation_granularity": 1024, "units": lds, "rounded_units": up(lds, 1024)},
+    rows = [{"name": "amdgpu.sgpr", "kind": "unconstrained_resource", "allocation_scope": "subgroup", "independent_tier": 16},
+            {"name": "amdgpu.vgpr", "kind": "pooled_resource", "unit": "registers", "allocation_scope": "subgroup", "pool_units": 1536,
+             "allocation_granularity": 24, "units": vgpr, "independent_tier": vtier},
+            {"name": "amdgpu.lds", "kind": "pooled_resource", "unit": "bytes", "allocation_scope": "workgroup", "pool_units": 131072,
+             "allocation_granularity": 1024, "units": lds, "independent_tier": ltier},
             {"name": "amdgpu.workgroup_slots", "kind": "fixed_limit", "independent_tier": slots}] + list(extra)
-    return {"residency_constraints": {"rows": rows}, "workload": {"workgroup_size": {"flat": flat}},
-            "target_resources": {"subgroup_size": 32}}
+    return {"wg": wg, "wave": 32, "cap": cap, "tier": cur, "rows": rows, "target": "gfx1151"}
 
 
-def residency_tiers():
-    """whole-workgroup residency (E533) on report rows; flash2's are W/static-1125/barrier-lint/cmb2/all-codes/g_attention_flash2_f16o.json's"""
-    t = kl.tiers(rep(384, 237, 61952, 15))
-    ok(t == (6, 9, {"vgpr": 69, "lds": 18944}), f"residency: flash2 (384 lanes) 6 waves, next reachable 9 at -69 VGPRs and -18,944 B "
-       f"LDS together, not Loom's 7 at -21 ({t})")
-    t = kl.tiers(rep(128, 130, 0, 16))
-    ok(t == (10, 11, {"vgpr": 10}), f"residency: a 128-lane kernel (1 wave per SIMD) keeps Loom's figure, 10 waves and next 11 at -10 VGPRs ({t})")
-    t = kl.tiers(rep(160, 100, 0, 15))
-    ok(t == (11.25, 12.5, {"vgpr": 4}), f"residency: 5-wave workgroups fit while the busiest SIMD's waves fit, 9 x 5 / 4 = 11.25, "
-       f"next 12.5 needs 13 waves on one SIMD: -4 VGPRs ({t})")
-    t = kl.tiers(rep(384, 100, 43500, 15))
-    ok(t == (6, 9, {"lds": 492}), f"residency: LDS counted in its 1,024-B granules, 3 x 43,500 B would fit unrounded ({t})")
-    t = kl.tiers(rep(544, 40, 544, 13))
-    ok(t == (12.75, None, {}), f"residency: a 17-wave matvec at the slot limit, 3 workgroups = 12.75 waves, no next tier ({t})")
-    t = kl.tiers(rep(128, 24, 0, 8))
-    ok(t == (8, None, {}), f"residency: the slot row's tier bounds the workgroups whatever the VGPRs allow ({t})")
-    t = kl.tiers(rep(160, 237, 0, 15, [{"name": "amdgpu.agpr", "kind": "pooled_resource"}]))
-    ok(t == (None, None, None), f"residency: an unknown resource row gives no figure ({t})")
-    x = rep(384, 237, 61952, 15)
-    x["residency_constraints"]["rows"][2]["allocation_scope"] = "subgroup"
-    ok(kl.tiers(x) == (None, None, None), f"residency: LDS allocated per wave (a scope it does not model) gives no figure ({kl.tiers(x)})")
-    x["residency_constraints"]["rows"].pop(2)
-    ok(kl.tiers(x) == (None, None, None), f"residency: a report without the LDS row gives no figure ({kl.tiers(x)})")
-    x = kl.residency(os.path.join(HERE, "fixtures", "flash2_f16o_residency.json"))   # pkg-cmb2's flash2_f16o report, trimmed
-    ok(tuple(x) == (237, 6, 9, {"vgpr": 69, "lds": 18944}), f"residency: pkg-cmb2's flash2_f16o report through residency() ({x})")
-    ok(kl.next_text({"next_tier": 9, "to_next": {"vgpr": 69, "lds": 18944}}) == "9:v69+l18944" and
-       kl.next_text({"next_tier": None, "to_next": {}}) == "cap" and kl.next_text({"to_next": None}) == "-", "residency: the next column")
-
-
-def suggest_findings():
-    """loom-compile-report suggest findings as notes and lines (pure: findings in the shape suggest --format=json prints, live
-    pkg-e480's texts)"""
-    def f(i, action="", **ev):
-        return {"id": i, "confidence": "high", "entry": "k", "action": action, "evidence": ev}
-    ser = f("amdgpu.lds_ssa_use_serialization", "Repeated LDS or DS results are consumed after full counter drains.")
-    xp = [f("lowering.reduce_expansion", "WARNING: k scalar.xori: up to 9 Low operations per source operation."),
-          f("lowering.reduce_expansion", "WARNING: k vector.fptrunc: up to 57 Low operations per source operation"),
-          f("lowering.reduce_expansion", "WARNING: source_to_low: up to 129 Low operations per source operation. Capture")]
-    cliff = lambda nt: f("amdgpu.residency_cliff", **{"entries.rows[0].target_resources.residency.next_better_tier": nt})
-    r = {"kernel": "k", "next_tier": 9, "to_next": {"vgpr": 69, "lds": 18944}}
-    lines = kl.suggest_notes(r, [ser, ser] + xp + [cliff(7)])
-    ok(r.get("notes") == ["loom:lds_ssa_use_serialization"], f"suggest: a finding kind is one note, never a flag ({r.get('notes')})")
-    ok(lines == ["loom residency_cliff k: Loom's next tier 7 is not reachable in whole workgroups; next 9:v69+l18944 (E533)",
-                 "loom expand k: 3 source ops expand past 5 Low ops; worst source_to_low x129"],
-       f"suggest: expansions are one line (count, worst op), an unreachable cliff is a line, neither a note ({lines})")
-    r = {"kernel": "k", "next_tier": 9, "to_next": {"vgpr": 69}}
-    ok(kl.suggest_notes(r, [cliff(9)]) == [] and not r.get("notes"), "suggest: a cliff 'next' already shows: no line, no note")
-    r = {"kernel": "k"}
-    ok(kl.suggest_notes(r, {"error": "boom"}) == ["loom suggest k: failed: boom"], "suggest: a failed run is printed, never dropped")
+def occupancy_seam():
+    """kernel_lint.occupancy(), the one occupancy seam (review r1 F1-F3); live rows from pkg-e480's reports"""
+    o = kl.residency(os.path.join(HERE, "fixtures", "flash2_f16o_residency.json"))     # pkg-cmb2's flash2_f16o report, trimmed
+    ok(o[0] == 237 and o[1].get("tier") == 6 and o[1].get("exact") and o[1].get("next") == 9 and
+       o[1].get("needs") == [("vgpr", 237, "registers", 168, 69), ("lds", 61952, "bytes", 43008, 18944)],
+       f"occupancy: flash2_f16o (384 lanes) 6 -> 9 at -69 VGPRs and -18,944 B LDS together, not Loom's 7 at -21 ({o})")
+    o = kl.occupancy(occ(160, 114, 12, 2560, 16, 15, 12), 4)                   # g_mv_q5_k_k5120_t8_q8
+    ok(o.get("tier") == 12 and o.get("exact") is False and o.get("next") == 15 and o.get("needs") == [("vgpr", 114, "registers", 96, 18)],
+       f"occupancy: a 160-lane matvec (5 waves over 4 SIMDs) is verified at tier 12 = ceil(9 x 5 / 4), a bound, not 'unverified' "
+       f"or 11.25 ({o})")
+    ok(kl.tier_text(o) == "12 bound" and kl.next_text({"occ": o}) == "15 bound:v18", f"occupancy: printed '12 bound', never a "
+       f"fraction ({kl.tier_text(o)}, {kl.next_text({'occ': o})})")
+    o = kl.occupancy(occ(128, 123, 10, 0, 16, 16, 10), 4)                       # g_dfl_ctx_split
+    ok(o.get("tier") == 10 and o.get("exact") and o.get("next") == 12 and o.get("needs") == [("vgpr", 123, "registers", 120, 3)],
+       f"occupancy: g_dfl_ctx_split's -3 VGPRs (123 -> 120) lands on 12 waves, not 11 (review F2) ({o})")
+    o = kl.occupancy(occ(160, 114, 12, 10240, 15, 15, 12), 4)                   # g_head_mv_t8_q8
+    ok(o.get("tier") == 12 and o.get("next") == 15, f"occupancy: g_head_mv_t8_q8 12 -> 15 after -18 VGPRs (review F2: was 12.5) ({o})")
+    o = kl.occupancy(occ(384, 252, 5, 61952, 6, 15, 5), 4)                      # flash2_partial
+    ok(o.get("tier") == 3 and o.get("report_tier") == 5 and o.get("next") == 6, f"occupancy: flash2_partial is 3, Loom says 5 ({o})")
+    o = kl.occupancy(occ(544, 30, 16, 544, 16, 13, 13), 4)                      # g_mv_iq4_nl_k17408_q8_r8: 3 workgroups, the wave cap
+    ok(o.get("tier") == 13 and o.get("next") is None and not o.get("blocked") and kl.next_text({"occ": o}) == "best",
+       f"occupancy: a 17-wave matvec at 3 workgroups is at its best tier 13 ({o})")
+    o = kl.occupancy(occ(128, 24, 16, 0, 16, 8, 8), 4)
+    ok(o.get("tier") == 8 and o.get("next") is None and "workgroup_slots" in (o.get("blocked") or "") and
+       kl.next_text({"occ": o}) == "blocked", f"occupancy: a slot tier below the cap blocks the next tier, named ({o})")
+    o = kl.occupancy(occ(384, 100, 12, 43500, 6, 15, 6), 4)
+    ok(o.get("tier") == 6 and o.get("next") == 9 and o.get("needs") == [("lds", 43500, "bytes", 43008, 492)], f"occupancy: LDS counts in 1,024-B granules: 3 x 43,500 B would fit unrounded ({o})")
+    o = kl.occupancy(occ(160, 237, 6, 0, 16, 15, 6, extra=[{"name": "amdgpu.agpr", "kind": "pooled_resource", "allocation_scope": "wave"}]), 4)
+    ok("unverified" in o.get("why", ""), f"occupancy: an unknown resource row is unverified, never a figure ({o})")
+    o = kl.occupancy(occ(384, 240, 7, 61952, 6, 15, 6), 4)
+    ok("unverified" in o.get("why", ""), f"occupancy: a resource tier that recomputes differently is unverified ({o})")
+    o = kl.occupancy(occ(384, 240, 6, 61952, 6, 15, 7), 4)
+    ok("unverified" in o.get("why", "") and "says 7" in o["why"], f"occupancy: every row agrees but the report's current tier does not: "
+       f"unverified ({o})")
+    ok("unverified" in kl.occupancy(occ(384, 240, 6, 61952, 6, 15, 6), None).get("why", ""), "occupancy: no SIMD count: unverified")
+    o = kl.occupancy(occ(384, 240, 6, 61952, 6, 15, 6, extra=[{"name": "amdgpu.sgpr", "kind": "pooled_resource", "allocation_scope":
+                                                                 "subgroup", "pool_units": 800, "allocation_granularity": 16,
+                                                                 "units": 106, "independent_tier": 7}]), 4)
+    ok("unverified" in o.get("why", ""), f"occupancy: a pooled SGPR row (not one Loom 0.2.0 emits) is unverified, not modelled ({o})")
+    f2 = {"vgpr": 240, "occ": kl.occupancy(occ(384, 240, 6, 61952, 6, 15, 6), 4)}
+    ok(kl.live_budget(f2) == 168, f"livereg budget: flash2's next tier (9) allows 168 VGPRs, not today's 240 ({kl.live_budget(f2)})")
+    vs = {"vgpr": 256, "occ": kl.occupancy(occ(192, 256, 5, 49664, 3, 15, 3), 4)}          # g_attention_vsplit: LDS alone holds it
+    ok(kl.live_budget(vs) == 256, f"livereg budget: only LDS must move: today's VGPRs ({kl.live_budget(vs)})")
+    ok(kl.live_budget({"vgpr": 30, "occ": kl.occupancy(occ(544, 30, 16, 544, 16, 13, 13), 4)}) is None,
+       "livereg budget: none at the best tier")
 
 
 def livereg():
@@ -179,6 +169,19 @@ def livereg():
        kl.live_text({"live": x}) == "229/159/766", f"livereg: the live column ({kl.live_text({'live': x})})")
     ok(kl.rga_live("/nonexistent.hsaco", "") == {"error": "rga: not found (--rga, or RGA in the environment / machine env file)"},
        "livereg: no RGA is 'unknown (rga: not found)', never a number")
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:                 # RGA is another process: a stub stands in at that boundary only
+        live = open(os.path.join(HERE, "fixtures", "flash2_f16o_cmb2.live")).read()
+        open(os.path.join(t, "k.live.src"), "w").write(live)
+        for name, extra in (("one", ""), ("two", 'cp "$src" "$(dirname "$out")/k_1.live"\n')):
+            stub = os.path.join(t, name)
+            open(stub, "w").write(f'#!/bin/sh\nsrc={t}/k.live.src\nout=$6\ncp "$src" "$out"\n' + extra)
+            os.chmod(stub, 0o755)
+        got = kl.rga_live("x.hsaco", os.path.join(t, "one"))
+        ok(isinstance(got, list) and len(got) == 4692, f"livereg: one .live file from RGA is read ({type(got).__name__})")
+        got = kl.rga_live("x.hsaco", os.path.join(t, "two"))
+        ok(isinstance(got, dict) and "2 .live files" in got.get("error", ""), f"livereg: two .live files (a multi-kernel object) give "
+           f"no figure, never the first one's ({got if isinstance(got, dict) else len(got)})")
 
 
 def main():
@@ -205,6 +208,9 @@ def main():
         open(two, "w").write("target.decl @device\namdgpu.target<gfx11-generic> @rdna3\n\n" + qv + old + old.replace("g_deq16_iq4_nl", "g_deq16_iq4_nl2"))
         subprocess.run([lc, two, "--target=amdgpu:gfx1151", f"--output={t}/two.hsaco"], capture_output=True, text=True, check=True)
         rows = kl.lint_file(os.path.join(t, "two.hsaco"))
+        lr = kl.lint_file(os.path.join(t, "two.hsaco"), rga="")
+        ok(len(lr) == 2 and all(kl.live_text(x) == "unknown" and "multi-kernel" in x["live"]["error"] for x in lr),
+           f"livereg: a multi-kernel object is 'unknown (multi-kernel)' per row, never blank ({[x.get('live') for x in lr]})")
         ok(len(rows) == 2 and all(x["select"] == r["select"] and x["loop"] == r["loop"] and "select" in x["flags"] for x in rows),
            f"a two-kernel object gives two rows equal to the kernel alone ({[(x['kernel'], x['select'], x['loop']) for x in rows]} vs {r['select']}, {r['loop']})")
         r = compile_lint(lc, t, "iq4_new", qv + new, "g_deq16_iq4_nl")
@@ -216,11 +222,9 @@ def main():
         rp = subprocess.run([lc, os.path.join(t, "q6_old.loom"), "--target=amdgpu:gfx1151", "--root=t_g_q6_k_icodes",
                              f"--output={t}/q6r.hsaco", "--compile-report=summary", f"--compile-report-output={t}/q6r.json"],
                             capture_output=True, text=True)
-        found = kl.loom_suggest(f"{t}/q6r.json", os.path.join(os.path.dirname(lc), "loom-compile-report")) if not rp.returncode else None
-        ok(isinstance(found, list) and all("id" in x for x in found), f"suggest: Loom's suggest runs on a summary report and returns "
-           f"findings ({sorted({x['id'] for x in found}) if isinstance(found, list) else found})")
-        r = kl.lint(f"{t}/q6r.hsaco")
-        ok(r.get("report") == f"{t}/q6r.json", "suggest: lint() keeps the report beside the code object")
+        r = kl.lint(f"{t}/q6r.hsaco") if not rp.returncode else {}
+        ok(isinstance(r.get("waves"), int) and r.get("occ") and "why" not in r["occ"], f"occupancy: a real compile's summary report is "
+           f"verified through common/devices/<target_key>.json ({r.get('occ')})")
     # listings: addresses 4 bytes apart; s_branch's offset counts dwords from the next instruction
     def listing(body):
         return body, [4 * i for i in range(len(body))]
@@ -335,8 +339,7 @@ def main():
     ok(kl.regressions(dict(base, scratch=513, pf="drain"), base) == ["spill", "drain"], "regress: a new spill and a drained prefetch (E230)")
     ok(kl.regressions(dict(base, waves=10), base) == ["waves12->10"], "regress: fewer waves per SIMD (E236)")
     ok(kl.regressions(dict(base), base) == [], "regress: nothing when nothing changed")
-    residency_tiers()
-    suggest_findings()
+    occupancy_seam()
     livereg()
     prog = ("template.def<@sel1_g_k1> target(@rdna3) @sel1_g_k1_rdna3(%g0: index) {\n  kernel.launch @g_k1[%g0](%g0) : [index](index)\n}\n"
             "command.def public @c() {\n  template.apply<@sel1_g_k1>(%t) : (index)\n  template.apply<@sel1_g_k1>(%u) : (index)\n"

@@ -87,6 +87,8 @@ sys.path.insert(0, H)
 import ceiling  # noqa: E402
 import counter_saturation  # noqa: E402
 import events_summary  # noqa: E402
+import kernel_lint  # noqa: E402
+from kernel_lint import occ_inputs, occupancy  # noqa: E402,F401  (the one occupancy seam; lint_counters' tests call lc.occupancy)
 
 MEM_MIN = 25.0       # % of wave cycles on load counters (serial, scratch, reread)
 BW_MAX = 0.70        # serial: GB/s below this fraction of the device ceiling (else bandwidth-bound)
@@ -137,69 +139,16 @@ def report_limit(js):
             for r in (doc.get("residency_constraints") or {}).get("rows", []) if r.get("limiting")]
     lim = "+".join(x["name"] for x in lims) or (tr.get("limiting_resource") or "").split(".")[-1] or None
     res = tr.get("residency") or {}
-    occ = {"wg": ((doc.get("workload") or {}).get("workgroup_size") or {}).get("flat"), "wave": tr.get("subgroup_size"),
-           "cap": tr.get("max_subgroups_per_simd"), "tier": res.get("current_tier"),
-           "rows": (doc.get("residency_constraints") or {}).get("rows", [])}
-    return lim, res.get("current_tier"), ((tr.get("vector") or {}).get("final") or {}).get("register_count"), lims, occ
+    return lim, res.get("current_tier"), ((tr.get("vector") or {}).get("final") or {}).get("register_count"), lims, occ_inputs(doc)
 
 
-def occupancy(occ, simds):
-    """The next residency tier a workgroup can reach, and what each resource must drop to for it: {"tier", "next", "q" (waves per
-    SIMD per workgroup), "needs": [(resource, units, unit, max units, cut)]}; {"why": reason} when it cannot be verified; None at the
-    best reachable tier. Tiers move in whole workgroups: a workgroup of W lanes in waves of S spreads over the SIMDS of one occupancy
-    domain (Loom runs WGP mode: 4 SIMDs), q = W / S / SIMDS waves per SIMD, so tiers are multiples of q. Loom 0.2.0's report rounds
-    LDS and workgroup slots to whole workgroups but not VGPRs (HRX-like E533): its next_better_tier said 7 for flash2 (384 lanes, q = 3:
-    tiers 3 / 6 / 9) and 5 for the 256-lane GEMMs (q = 2), so neither it nor its reductions are used. Each pooled resource's tier is
-    recomputed (subgroup scope: pool / rounded units waves; workgroup scope: pool / rounded units workgroups x q) and must equal the
-    report's independent_tier, and their minimum (with fixed limits and the wave cap) rounded down to q must equal its current tier,
-    or the tier is 'unverified'"""
-    if not occ:
-        return {"why": "no compile report"}
-    wg, wave, cap, cur = occ.get("wg"), occ.get("wave"), occ.get("cap"), occ.get("tier")
-    if not simds or not all(isinstance(v, int) and v > 0 for v in (wg, wave, cap, cur)):
-        return {"why": "tier unverified: workgroup size, wave size, wave cap or current tier missing from the report, or the device "
-                       "file has no simds_per_occupancy_domain"}
-    if wg % (wave * simds):
-        return {"why": f"tier unverified: a {wg}-lane workgroup is {wg / wave:g} wave(s) over {simds} SIMDs, not whole waves per SIMD"}
-    q = wg // (wave * simds)
-    pooled, fixed = [], []
-    for r in occ["rows"]:
-        name, kind = r.get("name", "?").split(".")[-1], r.get("kind")
-        if kind == "unconstrained_resource":
-            continue
-        if kind == "fixed_limit":
-            fixed.append((name, r.get("independent_tier")))
-            continue
-        try:
-            pool, gran, units, scope = int(r["pool_units"]), int(r["allocation_granularity"]), int(r["units"]), r["allocation_scope"]
-        except (KeyError, TypeError, ValueError):
-            return {"why": f"tier unverified: {name} ({kind}) lacks pool, granularity, units or scope"}
-        if kind != "pooled_resource" or scope not in ("subgroup", "workgroup") or gran <= 0 or units < 0:
-            return {"why": f"tier unverified: {name}: kind {kind!r}, scope {scope!r}, granularity {gran}, units {units} not modelled"}
-        ru = -(-units // gran) * gran
-        # the report caps each tier at the wave cap; a resource the kernel does not use (0 B of LDS) never limits
-        got = cap if ru == 0 else min(cap, pool // ru if scope == "subgroup" else pool // ru * q)
-        if got != r.get("independent_tier"):
-            return {"why": f"tier unverified: {name} computes to tier {got}, the report says {r.get('independent_tier')}"}
-        pooled.append((name, units, r.get("unit") or "", pool, gran, scope, got))
-    if any(not isinstance(t, int) for _, t in fixed):
-        return {"why": "tier unverified: a fixed limit without a tier"}
-    raw = min([c for *_, c in pooled] + [t for _, t in fixed] + [cap])
-    tier = raw // q * q
-    if cur not in (tier, raw):   # raw: the report's own unrounded minimum (E533: flash2_partial, VGPR tier 5 at q = 3 is tier 3)
-        return {"why": f"tier unverified: computes to {tier} in whole workgroups ({raw} unrounded), the report says {cur}"}
-    nxt = tier + q
-    if nxt > cap:
-        return None
-    block = [f"{n} (tier {t})" for n, t in fixed if t < nxt]
-    if block:
-        return {"why": f"next tier {nxt} blocked by a fixed limit: {', '.join(block)}"}
-    needs = []
-    for name, units, unit, pool, gran, scope, got in pooled:
-        if got < nxt:
-            mx = (pool // nxt if scope == "subgroup" else pool // (nxt // q)) // gran * gran
-            needs.append((name, units, unit, mx, units - mx))
-    return {"tier": tier, "next": nxt, "q": q, "needs": needs, "report_tier": cur}
+def attach_reports(lint, codes, simds):
+    """each lint row's compile-report fields: limit, limits, occupancy inputs (_occ) and occupancy() with the --device file's SIMD
+    count (occ), which (a)'s tier column and (d2) both print (review r1 F1: they disagreed on g_mv_q5_k_k5120_t8_q8)"""
+    for k, r in lint.items():
+        r["_limit"], _, vg, r["_limits"], r["_occ"] = report_limit(os.path.join(codes, k + ".json"))
+        r["occ"] = occupancy(r["_occ"], simds)
+        r["vgpr"] = r.get("vgpr") if r.get("vgpr") is not None else vg
 
 
 def lint_codes(codes, package=None, events=None, jobs=4):
@@ -461,15 +410,17 @@ def counters_cell(workloads, kernel):
 def build(lint, srv, total, workloads, bw_ceiling):
     """sections (a)-(c) as lists of lines (pure: tested on fixtures; (d) is section_d)"""
     A = ["(a) per served kernel (key, phase): served device time, lint, compile report, counters",
-         f"{'kernel':40s} {'phase':7s} {'ms':>9s} {'share%':>6s} {'calls':>6s} {'shp':>3s} {'limit':>9s} {'tier':>4s} {'vgpr':>4s}  "
+         f"{'kernel':40s} {'phase':7s} {'ms':>9s} {'share%':>6s} {'calls':>6s} {'shp':>3s} {'limit':>9s} {'tier':>8s} {'vgpr':>4s}  "
          f"{'lint':28s} counters | saturation"]
     for (k, ph), r in sorted(srv.items(), key=lambda x: -x[1]["ms"]):
         lr = lint.get(k)
         ln = " ".join(lr.get("flags", [])) + (" [" + " ".join(lr["notes"]) + "]" if lr.get("notes") else "") if lr else "not linted"
-        lim, tier, vg = (lr.get("_limit"), lr.get("waves"), lr.get("vgpr")) if lr else (None, None, None)
+        lim, vg = (lr.get("_limit"), lr.get("vgpr")) if lr else (None, None)
+        o = lr.get("occ") if lr else None
+        tier = kernel_lint.tier_text(o) if o and "why" not in o else "?" if o else "-"   # kernel_lint's occupancy(), as (d2): '?' unverified
         cc, sat = counters_cell(workloads, k)
         A.append(f"{k:40s} {ph:7s} {r['ms']:9.1f} {100 * r['ms'] / total:6.2f} {r['calls']:6d} {len(r['shapes']):3d} "
-                 f"{lim or '-':>9s} {str(tier if tier is not None else '-'):>4s} {str(vg if vg is not None else '-'):>4s}  {ln or '-':28s} "
+                 f"{lim or '-':>9s} {tier:>8s} {str(vg if vg is not None else '-'):>4s}  {ln or '-':28s} "
                  f"{cc}" + (f" | {sat}" if sat else ""))
     share = collections.Counter()
     for (k, _), r in srv.items():
@@ -732,14 +683,16 @@ def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname, sim
             f"{'kernel':36s} {'ms':>9s} {'share%':>6s}  next reachable tier and what must move  | load waits"]
     for k in sorted(ms, key=lambda k: -ms[k]):
         lr = lint.get(k)
-        o = occupancy(lr.get("_occ"), simds) if lr else {"why": "not linted: no compile report"}
-        if o is None:
-            continue
+        o = (lr.get("occ") or occupancy(lr.get("_occ"), simds)) if lr else {"why": "not linted: no compile report"}
+        if "why" not in o and o["next"] is None and not o["blocked"]:
+            continue                                       # the best tier (wave cap)
         if "why" in o:
             txt = o["why"]
+        elif o["blocked"]:
+            txt = f"tier {kernel_lint.tier_text(o)}: {o['blocked']}"
         else:
-            txt = (f"tier {o['tier']}" + (f" (report: {o['report_tier']}, not whole workgroups, E533)" if o["report_tier"] != o["tier"] else "")
-                   + f" -> {o['next']} ({o['q']} waves/SIMD per workgroup): " +
+            txt = (f"tier {kernel_lint.tier_text(o)}" + (f" (report: {o['report_tier']}, not whole workgroups, E533)" if o["report_tier"] != o["tier"] else "")
+                   + f" -> {kernel_lint.tier_text(o, 'next')} ({o['q']} waves/SIMD per workgroup): " +
                    ", ".join(f"{n} {u} -> <= {mx} {unit} (-{cut})" for n, u, unit, mx, cut in o["needs"]) + f": needs all {len(o['needs'])}")
         out.append(f"{k:36s} {ms[k]:9.1f} {100 * ms[k] / total:6.2f}  {txt}  | {latency_wait(workloads, k)}")
     return out
@@ -780,10 +733,7 @@ def main():
     bw = ((dev.get("profiles") or {}).get(dev.get("default_profile")) or {}).get("bw_practical_gbs")
     srv, total, prompt, steps = served(a.events, a.lanes)
     lint = lint_codes(a.codes, a.package, a.events, a.jobs)
-    for k, r in lint.items():
-        r["_limit"], tier, vg, r["_limits"], r["_occ"] = report_limit(os.path.join(a.codes, k + ".json"))
-        r["waves"] = r.get("waves") if r.get("waves") is not None else tier
-        r["vgpr"] = r.get("vgpr") if r.get("vgpr") is not None else vg
+    attach_reports(lint, a.codes, dev.get("simds_per_occupancy_domain"))
     wl = load_workloads(a.counters, a.codes)
     ph = collections.Counter()
     for (_, p), r in srv.items():
