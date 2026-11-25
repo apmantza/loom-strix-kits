@@ -54,6 +54,48 @@ def sx11(text):
     return text
 
 
+def sxh(text):
+    """FLASH2_SXH=1 (after sx11; HRX-like E456 / E462): the SX11 exchange's bytes viewed [waves][2 key blocks][2 halves][32 lanes][4]
+    (elements 0-3 of every lane, then elements 4-7) instead of [waves][2][32 lanes][8]. With a 32-byte lane record each 128-bit access
+    (served 8 lanes per pass over 32 banks x 4 B) puts lanes l and l + 4 on the same banks, so every exchange access is 2-way conflicted
+    (q175: 8.18 % of flash2's LDS cycles, all of them here); a 16-byte pitch makes each access 512 contiguous bytes, conflict-free (q184:
+    0.00 %, outputs byte-identical). Each vector<8xf32> store becomes two vector.slice + two stores, each load two loads + vector.concat<0>;
+    lane l still reads its partner lane l's 8 values in order: exact, same bytes, constant offsets only. Fails closed: one %sx_view, and
+    as many stores as loads (2 or 4, sx11's counts), every one rewritten and none left on the 32-byte view."""
+    vw = re.compile(r"^(  %sx_view = buffer\.view %s_tile\[%origin\] : buffer -> view<(\d+)x2x32x8xf32>)$", re.M)
+    st = re.compile(r"^( *)vector\.store (%\w+), %sx_view\[%wave, (%c[01]), %lane, %c0\] : vector<8xf32>, view<(\d+)x2x32x8xf32>$", re.M)
+    ld = re.compile(r"^( *)(%\w+) = vector\.load %sx_view\[%partner_id, (%c[01]), %lane, %c0\] : view<(\d+)x2x32x8xf32> -> vector<8xf32>$", re.M)
+    views = vw.findall(text)
+    if len(views) != 1:
+        raise SystemExit(f"FLASH2_SXH: {len(views)} SX11 exchange views (%sx_view of [w]x2x32x8xf32) in the kernel (want 1; needs FLASH2_SX11=1)")
+    w = views[0][1]
+    vh = f"view<{w}x2x2x32x4xf32>"
+
+    def store(m):
+        i, v, b, ww = m.groups()
+        assert ww == w, f"FLASH2_SXH: store on view<{ww}x...> but %sx_view is view<{w}x...>"
+        return (f"{i}{v}_sxa = vector.slice {v}[0] : vector<8xf32> -> vector<4xf32>\n"
+                f"{i}{v}_sxb = vector.slice {v}[4] : vector<8xf32> -> vector<4xf32>\n"
+                f"{i}vector.store {v}_sxa, %sxh_view[%wave, {b}, %c0, %lane, %c0] : vector<4xf32>, {vh}\n"
+                f"{i}vector.store {v}_sxb, %sxh_view[%wave, {b}, %c1, %lane, %c0] : vector<4xf32>, {vh}")
+
+    def load(m):
+        i, v, b, ww = m.groups()
+        assert ww == w, f"FLASH2_SXH: load on view<{ww}x...> but %sx_view is view<{w}x...>"
+        return (f"{i}{v}_sxa = vector.load %sxh_view[%partner_id, {b}, %c0, %lane, %c0] : {vh} -> vector<4xf32>\n"
+                f"{i}{v}_sxb = vector.load %sxh_view[%partner_id, {b}, %c1, %lane, %c0] : {vh} -> vector<4xf32>\n"
+                f"{i}{v} = vector.concat<0> {v}_sxa, {v}_sxb : vector<4xf32>, vector<4xf32> -> vector<8xf32>")
+
+    text = vw.sub(lambda m: m.group(1) + f"\n  %sxh_view = buffer.view %s_tile[%origin] : buffer -> {vh}", text)
+    text, ns = st.subn(store, text)
+    text, nl = ld.subn(load, text)
+    left = text.count("%sx_view[")
+    if ns != nl or ns not in (2, 4) or left:
+        raise SystemExit(f"FLASH2_SXH: {ns} exchange stores / {nl} loads rewritten, {left} accesses left on %sx_view "
+                         "(want 2 / 2 (vsplit) or 4 / 4 (flash2), 0 left)")
+    return text
+
+
 def hot(lines, global_only):
     """The hot copy's lines (flash2_peel.py) with the trims; GLOBAL_ONLY: the masks go too."""
     out = []
