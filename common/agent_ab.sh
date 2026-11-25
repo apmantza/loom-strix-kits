@@ -42,13 +42,10 @@ REPLAY=${AB_REPLAY:-$H/agent_bench/replay.py}
 mkdir -p "$OUT"; rm -f "$OUT/summary.txt" "$OUT/env.txt"
 trap '"${SERVE[@]}" --restore' EXIT
 run() {   # half, package, first turn
-  local tag=$1-$(basename "$2") t0 tc TS=${T_START:-55} rc spid
+  local tag=$1-$(basename "$2") rc spid
   # no quiet-machine wait here: AB_SERVE stops the managed and the previous bench server first, then waits (fail closed)
-  "${STOP[@]}" >/dev/null 2>&1; t0=$(date +%s)
-  while :; do tc=$(python3 "$H/gpu_telemetry.py" temp) || { echo "agent_ab STOP: no GPU temperature for the start gate"; exit 2; }
-    [ "$tc" -le "$TS" ] && break
-    [ $(( $(date +%s) - t0 )) -ge ${COOL_MAX:-900} ] && { echo "agent_ab NOTE: $tag starts HOT ($tc C > $TS C after ${COOL_MAX:-900} s)"; break; }; sleep 10; done
-  echo "$tag start: edge $tc C after $(( $(date +%s) - t0 )) s of cooling" | tee "$OUT/$tag.start.txt"
+  "${STOP[@]}" >/dev/null 2>&1
+  bash "$H/cool_wait.sh" "$tag" "$OUT/$tag.start.txt" || { echo "agent_ab STOP: thermal start gate ($tag)"; exit 2; }
   # the environment of this half against the bench's (the first half's); the summary judges the diff (exit 0 = unchanged)
   python3 "$H/env_block.py" --kit "$LSK" --pkg "$A" --pkg "$B" > "$OUT/$tag.env.txt" 2> "$OUT/$tag.env.err"
   [ -f "$OUT/env.txt" ] || cp "$OUT/$tag.env.txt" "$OUT/env.txt"

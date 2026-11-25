@@ -25,6 +25,7 @@ mkdir -p "$OUT"; n=0; runs=()
 for p in "$@"; do
   n=$((n + 1)); d=$OUT/$n-$(basename "$p"); rm -rf "$d"; mkdir -p "$d"; runs+=("$d")
   lsk_stop || exit 1
+  bash "$H/cool_wait.sh" "$(basename "$d")" "$d/start.txt" || die "events_ab STOP: thermal start gate before run $n"   # E485: every run from the same thermal state
   python3 "$H/env_block.py" --kit "$LSK" "${eb[@]}" > "$d/env.txt" 2> "$d/env.err"
   bash "$H/wait_quiet.sh" | tail -1 || die "events_ab STOP: machine not quiet before run $n"
   python3 "$H/mem_admit.py" frag > "$d/mem.txt" 2>&1   # free large blocks before the server allocates (E471); measured, not judged
