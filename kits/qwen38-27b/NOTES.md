@@ -45,3 +45,9 @@ drafter's proposal head. Attribute a kernel by the program that launches it (eve
 The README's table lists what each switch in kit.env's KIT_RECIPE does. Off-recipe switches under evaluation: `EPI_FUSE=1`
 (residual add in the output GEMMs' 256-row epilogue + skipping unread f32 norm outputs; exact; kernel-tested, served gates
 pending), `F16O11=1` (the f16 swiglu GEMM writes the row-scaled f16 copy itself).
+
+## Served-profile noise floors (noise_floor.json, 11-25)
+Per-lane spread (max - min over mean, %) of one package over 8 heat-soaked starts at 81,432 tokens (pkg-e379 vs its copy, held 2.15 GHz
+at 85-86 C; HRX-like E485, W/static-1125/q194/all.md cycles table). For `events_summary.py --noise-floor`. These are single-start
+ranges: a gate comparing the mean of 2 starts per arm overstates its noise with them (flash2's 4.2 % includes one +3 % start), so the
+lane gates do not pass them yet; a per-arm-mean floor needs the same A/A cut into 2-start means.
