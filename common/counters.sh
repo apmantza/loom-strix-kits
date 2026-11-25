@@ -7,7 +7,7 @@
 #   issue    is the loop issue-bound? WaitInstAnyPct (AMD 2.1 Wave Issue Wait), WaitInstValuPct, IPC (AMD 2.1), VALU and VOPD counts
 #   bytes    MemReadBytes (size-weighted L2 -> fabric read requests = AMD GL2-Fabric Read BW x time) and GPU busy cycles
 #   l2       L2CacheHit (AMD 13.1), GL2C hits, misses, DRAM and memory-controller read requests
-#   cache    GL0HitPct GL1HitPct (AMD 9.3, 11.3), MemWriteBytes, DramReadBytes / DramWriteBytes (GCEA, AMD 3.9)
+#   cache    GL0HitPct GL1HitPct (AMD 9.3, 11.3), MemWriteBytes, FabricReadBytes / FabricWriteBytes (GCEA, AMD 3.9: fabric requests incl. MALL hits, not DRAM, E497)
 #   latency  VmemLoadLatency, VmemLoadsInFlight, LdsLatency (+ the TEX / FLAT load counts VmemLoadLatency divides by)
 #   lds      LDSBankConflict (% of LDS-active cycles stalled by conflicts, = AMD 3.4 LDS Bank Conflict Rate), SQC_LDS_BANK_CONFLICT,
 #            LDS activity and instructions, ALUStalledByLDS: is a modelled bank conflict (Loom's compile report,
@@ -30,7 +30,7 @@ declare -A PMC=(
   [issue]="WaitInstAnyPct WaitInstValuPct IPC SQ_INSTS_VALU SQ_INSTS_DUAL_VALU_WAVE32"
   [bytes]="MemReadBytes GRBM_GUI_ACTIVE"
   [l2]="L2CacheHit GL2C_HIT GL2C_MISS GL2C_EA_RDREQ_DRAM GL2C_MC_RDREQ GRBM_GUI_ACTIVE"
-  [cache]="GL0HitPct GL1HitPct MemWriteBytes DramReadBytes DramWriteBytes GRBM_GUI_ACTIVE"
+  [cache]="GL0HitPct GL1HitPct MemWriteBytes FabricReadBytes FabricWriteBytes GRBM_GUI_ACTIVE"
   [latency]="VmemLoadLatency VmemLoadsInFlight LdsLatency SQ_INSTS_TEX_LOAD SQ_INSTS_FLAT_LOAD"
   [lds]="LDSBankConflict SQC_LDS_BANK_CONFLICT SQC_LDS_IDX_ACTIVE SQ_INSTS_LDS ALUStalledByLDS SQ_INST_CYCLES_LDS SQ_WAVE_CYCLES"
 )

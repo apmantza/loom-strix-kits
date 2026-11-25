@@ -21,14 +21,14 @@ rocprofiler-sdk:
       definitions:
         - architectures: [gfx1151]
           expression: reduce(GL2C_EA_WRREQ_64B,sum)*64+(reduce(GL2C_MC_WRREQ,sum)-reduce(GL2C_EA_WRREQ_64B,sum))*32
-    - name: DramReadBytes
-      description: 'Bytes read at the DRAM interface (AMD 3.9 DRAM Read Bandwidth x time: GCEA_RDRAM_SIZE_REQ in 32 B). Unit: bytes'
+    - name: FabricReadBytes
+      description: 'Bytes the GPU requests from the data fabric (GCEA_RDRAM_SIZE_REQ in 32 B; AMD 3.9 calls it DRAM Read). NOT DRAM bytes on Strix Halo: the memory-side MALL serves part of it (HRX-like E497: 345 GB/s on a grouped GEMM, above the DRAM ceiling). Unit: bytes'
       properties: []
       definitions:
         - architectures: [gfx1151]
           expression: reduce(GCEA_RDRAM_SIZE_REQ,sum)*32
-    - name: DramWriteBytes
-      description: 'Bytes written at the DRAM interface (AMD 3.9 DRAM Write Bandwidth x time). Unit: bytes'
+    - name: FabricWriteBytes
+      description: 'Bytes the GPU writes to the data fabric (AMD 3.9 DRAM Write; the MALL may absorb them, E497). Unit: bytes'
       properties: []
       definitions:
         - architectures: [gfx1151]

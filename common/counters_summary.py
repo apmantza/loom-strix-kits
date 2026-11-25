@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Summarise rocprofv3 counter CSVs (common/counters.sh): per kernel, the mean of each counter over its dispatches, the mean
-dispatch time, and MemReadBytes as GB/s. Column names are matched case-insensitively (rocprofv3 writes Kernel_Name /
+dispatch time, and MemReadBytes / FabricReadBytes as GB/s (flagged when above the device's DRAM read ceiling: E497). Column names are matched case-insensitively (rocprofv3 writes Kernel_Name /
 Counter_Name, the rocpd exporter kernel_name / counter_name).
 --expect-bytes KERNEL_REGEX=BYTES (calibrate): print MemReadBytes / BYTES for matching kernels, the check that the size-weighted
 L2 read requests count real memory bytes (bw_probe's read kernel reads its whole buffer once per dispatch).
 usage: counters_summary.py DIR [--kernel REGEX] [--expect-bytes 'k_read=4294967296' ...]"""
-import argparse, collections, csv, glob, os, re, sys
+import argparse, collections, csv, glob, json, os, re, sys
 
 
 def rows(d):
@@ -40,6 +40,12 @@ def summarise(d, kernel=None):
     return out
 
 
+RATES = ("MemReadBytes", "FabricReadBytes")
+# The device's practical DRAM read ceiling (devices/<gfx>.json, default profile); GFX env selects the file (default gfx1151).
+_dev = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices", os.environ.get("GFX", "gfx1151") + ".json")))
+CEIL = _dev["profiles"][_dev["default_profile"]]["bw_practical_gbs"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir")
@@ -50,7 +56,12 @@ def main():
     for k, s in sorted(S.items()):
         print(f"{k[:90]}  dispatches {s['n']}  mean {s['ns'] / 1e3:.1f} us")
         for c in sorted(x for x in s if x not in ("n", "ns")):
-            extra = f"   ({s[c] / s['ns']:.1f} GB/s)" if c == "MemReadBytes" and s["ns"] else ""
+            extra = ""
+            if c in RATES and s["ns"]:
+                gbs = s[c] / s["ns"]
+                extra = f"   ({gbs:.1f} GB/s)"
+                if gbs > CEIL:   # HRX-like E497: L2->fabric requests include MALL hits; above the DRAM ceiling they cannot all be DRAM
+                    extra += f"  ABOVE the {CEIL:.0f} GB/s DRAM read ceiling: fabric requests incl. MALL hits, not DRAM bytes"
             print(f"    {c:28s} {s[c]:16.4g}{extra}")
     bad = 0
     for e in a.expect_bytes:

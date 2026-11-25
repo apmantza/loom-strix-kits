@@ -35,6 +35,13 @@ def main():
         r = subprocess.run([sys.executable, f"{H}/counters_summary.py", f"{t}/a", "--expect-bytes", "nomatch=1"], capture_output=True, text=True)
         ok = r.returncode == 1
         print(("ok  " if ok else "FAIL"), "calibrate with no matching kernel exits 1"); fails += not ok
+        # Recurrence HRX-like E497: GCEA_RDRAM_SIZE_REQ (then named DramReadBytes) read 6.3 GB in 18.4 ms = 345 GB/s on a grouped GEMM,
+        # above the chip's DRAM read ceiling: the fabric requests include MALL hits. A byte rate above the device's ceiling must say so.
+        write(f"{t}/c", TITLE, ["1,1,_Z4gemm,MemReadBytes,6340000000,0,18400000", "2,2,_Z4slow,MemReadBytes,3800000000,0,18700000"])
+        r = subprocess.run([sys.executable, f"{H}/counters_summary.py", f"{t}/c"], capture_output=True, text=True)
+        g, sl = r.stdout.split("_Z4slow")[0], r.stdout.split("_Z4slow")[1]
+        ok = r.returncode == 0 and "344.6 GB/s" in g and "MALL" in g and "MALL" not in sl
+        print(("ok  " if ok else "FAIL"), "a byte rate above the DRAM ceiling is flagged as MALL-inclusive, one below is not"); fails += not ok
     sys.exit(1 if fails else 0)
 
 
