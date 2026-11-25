@@ -276,6 +276,10 @@ def main():
         txt = "\n".join(lc.section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, 10, "fixture hw"))
         occ = [x for x in txt.split("(d2)")[1].splitlines() if x.lstrip().startswith("g_mv_a")]
         ok(occ and "35.0 %" in occ[0], "occupancy lever shows the latency-wait share (vmem 30 + lgkm 5)", occ)
+        wps = lc.load_workloads([workload(os.path.join(t, "wps"), hs, kernel="g_mv_a", level="profile_standard",
+                                          wait={"vmem": 30, "lgkm": 5})], codes)
+        ok(lc.latency_wait(wps, "g_mv_a").startswith("unknown"), "load waits at profile_standard are not the served latency (q171: 16 vs 75 %)",
+           lc.latency_wait(wps, "g_mv_a"))
 
     print(f"{'FAILED ' + str(fails) if fails else 'all ok'}")
     sys.exit(1 if fails else 0)
