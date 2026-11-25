@@ -53,6 +53,12 @@
   - live registers read by hand from RGA's .live files (E527 / E531; E533: flash2's loop never drops below 159 live VGPRs, so 168
     needs a new organisation): flash2_f16o's RGA output gives peak 229, loop floor 159, 766 loop instructions over 168; a row
     missing or not ours, or RGA absent, gives no number.
+  - C18's notes (11-25 lessons): a one-round grid not said (E539: a study to learn that g_gdn_recurrence_pf's 384 one-wave
+    workgroups are all resident at spans = 1), LDS loads drained right after issue not said (E534: the m256 GEMMs keep none in
+    flight across a wait, hipBLASLt up to 16), a guard's wait draining a prefetch issued before the branch not caught on a single
+    build (E520: STAGE_LIVE x FLATADDR), VOPD pairs left unformed not counted (E551: flash2's back-edge 65 moves -> 31 pairs);
+    each with near misses (two rounds, a runtime grid, an unmodelled op; loads kept in flight or issued early; loads issued after
+    the join, read inside the block or issued inside it, an exit test; one-parity destinations, dependent moves, modifiers).
 usage: python3 kit/test_kernel_lint.py   (needs loom-compile: VENV from the environment or the machine env file)"""
 import os
 import subprocess
@@ -210,6 +216,320 @@ def livereg():
         got = kl.rga_live("x.hsaco", os.path.join(t, "two"))
         ok(isinstance(got, dict) and "2 .live files" in got.get("error", ""), f"livereg: two .live files (a multi-kernel object) give "
            f"no figure, never the first one's ({got if isinstance(got, dict) else len(got)})")
+
+
+def lesson_notes():
+    """C18's notes (11-25 lessons; r2 after review E581), each with a fixture that fires, near misses that do not, and a test for
+    every guard (a guard no test can red is deleted)"""
+    def listing(body):
+        return body, [4 * i for i in range(len(body))]
+    def back(i, target):
+        return f"s_branch {(target - (i + 1)) & 0xFFFF}"
+    def fwd(i, target, op="s_cbranch_scc0"):
+        return f"{op} {(target - (i + 1)) & 0xFFFF}"
+    def loop_of(body):
+        b = ["s_mov_b32 s0, 0"] + body
+        return b + [back(len(b), 1)]
+    wm = "v_wmma_f32_16x16x16_f16 v[200:207], v[192:199], v[184:191], v[200:207]"
+    notes = lambda r: r.get("notes", [])
+    # ---- (a) rounds (E539: a worker's study established that g_gdn_recurrence_pf runs one round at spans 1). Review r2, option
+    # iii: information only (grid at size 1, resident, the one-round bound in the size variable), never a note, no served-size claim
+    def prog(tiles=8, extra="", grid="%heads, %tiles, %spans", body=None, params="%spans: index"):
+        body = body if body is not None else ("  %spans = config.get @llm.spans : index\n"
+                                              "  kernel.launch @g_r[%spans](%spans) : [index](index)\n")
+        return (f'kernel.def export("g_r") @g_r({params}) {{\n  %c1 = index.constant 1 : index\n  %heads = index.constant 48 : index\n'
+                f"  %tiles = index.constant {tiles} : index\n  %c32 = index.constant 32 : index\n{extra}"
+                f"  kernel.launch.config workgroups({grid}) workgroup_size(%c32, %c1, %c1) : index\n}} launch(%spans_arg: index) {{\n}}\n"
+                f"command.def public target(@device) @llm_advance() launch(%x: buffer) {{\n{body}}}\n")
+    gdn = kl.tier_state(occ(32, 166, 9, 0, 16, 16, 9), 4)            # pkg-e480's g_gdn_recurrence_pf report rows: 36 per WGP, 720
+    def rnd(text, o=gdn):
+        rows = [{"kernel": "g_r", "occ": o}]
+        try:
+            kl.rounds(rows, [text])
+        except TypeError:                                             # r2's rounds(rows, texts, sizes)
+            kl.rounds(rows, [text], {})
+        line = getattr(kl, "rounds_info", lambda r: None)(rows[0])
+        return rows[0].get("rounds") or {}, line, "rounds" in notes(rows[0])
+    g, line, n = rnd(prog())
+    ok(not n and g.get("resident") == 720 and g.get("sites") == [("@llm.spans", 384, 1)] and line and "one round while spans <= 1" in line
+       and "384 workgroups at size 1" in line, f"rounds: 48 x 8 x spans one-wave workgroups, 720 resident: an information line, one "
+       f"round while spans <= 1 (E539), never a note ({g}; {line})")
+    g, line, n = rnd(prog(tiles=16))
+    ok(g.get("sites") == [("@llm.spans", 768, None)] and line is None, f"rounds: 16 tiles (768 at size 1) exceed 720: no line ({g})")
+    tok = "  %t = config.get @llm.tokens : index\n  kernel.launch @g_r[%t](%t) : [index](index)\n"
+    g, line, n = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok))
+    ok(g.get("sites") == [("@llm.tokens", 1, 720)] and line is None, f"rounds: one workgroup at size 1 has no order: no line, bound "
+       f"720 kept (above 2, review R12) ({g}; {line})")
+    g, line, n = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok.replace("[%t](%t)", "[%t2](%t2)").replace(
+        "kernel.launch", "%c2 = index.constant 2 : index\n  %t2 = index.mul %t, %c2 : index\n  kernel.launch")))
+    ok(g.get("sites") == [("@llm.tokens", 2, 360)] and line and "tokens <= 360" in line and "2 workgroups" in line,
+       f"rounds: 2 x tokens: 2 workgroups at size 1, one round while tokens <= 360 ({g}; {line})")
+    sel = ("template.decl @sel1_g_r(%g0: index, %a0: index)\n"
+           "template.def<@sel1_g_r> target(@rdna3) @sel1_g_r_rdna3(%g0: index, %a0: index) {\n"
+           "  kernel.launch @g_r[%g0](%a0) : [index](index)\n  template.return\n}\n")
+    g, line, n = rnd(sel + prog(body="  %two = index.constant 1 : index\n  template.apply<@sel1_g_r>(%two, %two) : (index, index)\n"))
+    ok(g.get("sites") == [(None, 384, 1)] and line and "constant grid" in line, f"rounds: a constant grid through a dual-target "
+       f"selector ({g}; {line})")
+    g, line, n = rnd(prog(extra="  %sh = index.shl %tiles, %c1 : index\n", grid="%heads, %sh, %spans"))
+    ok(g.get("unknown") == 1 and line is None, f"rounds: an op the evaluator does not model in the config: unknown ({g})")
+    g, line, n = rnd(prog(body="  %s0 = config.get @llm.spans : index\n  %spans = index.shl %s0, %s0 : index\n"
+                               "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"))
+    ok(g.get("unknown") == 1, f"rounds: an op the evaluator does not model in the launcher: unknown, never a size (R13) ({g})")
+    g, line, n = rnd(prog(body="  %spans = config.get @llm.spans : index\n  %spans = index.constant 2 : index\n"
+                               "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"))
+    ok(g.get("unknown") == 1, f"rounds: a launcher name defined twice: unknown, never either definition (R6) ({g})")
+    g, line, n = rnd(prog(body="  %c4 = index.constant 4 : index\n  kernel.launch @g_r[%c4, %c4](%c4) : [index, index](index)\n"))
+    ok(g.get("unknown") == 1, f"rounds: a launch with more grid operands than the config's parameters: unknown (R7) ({g})")
+    g, line, n = rnd(prog(grid="%heads, %c0, %c1", extra="  %c0 = index.constant 0 : index\n"))
+    ok(g.get("unknown") == 1, f"rounds: an empty constant grid: unknown (R3) ({g})")
+    g, line, n = rnd(prog(extra="  %c99 = index.constant 99 : index\n  %dn = index.sub %c99, %spans : index\n", grid="%heads, %dn, %c1"))
+    ok(g.get("unknown") == 1, f"rounds: a grid that shrinks as the size grows: unknown (R2) ({g})")
+    g, line, n = rnd(prog(params="%spans: index, %t: index", grid="%spans, %t, %c1",
+                          body="  %spans = config.get @llm.spans : index\n  %t = config.get @llm.tokens : index\n"
+                               "  kernel.launch @g_r[%spans, %t](%spans) : [index, index](index)\n"))
+    ok(g.get("unknown") == 1 and line is None, f"rounds: a grid of two size keys: unknown, no single bound ({g})")
+    g, line, n = rnd(prog(extra="  %sp = index.assume %spans [range(%spans, 1, 8)] : index\n", grid="%heads, %tiles, %sp"))
+    ok(g.get("sites") == [("@llm.spans", 384, 1)], f"rounds: index.assume passes its operand through (R8) ({g})")
+    two = ("  %spans = config.get @llm.spans : index\n  kernel.launch @g_r[%spans](%spans) : [index](index)\n"
+           "  %x = index.shl %spans, %spans : index\n  kernel.launch @g_r[%x](%x) : [index](index)\n")
+    g, line, n = rnd(prog(body=two))
+    ok(len(g.get("sites", [])) == 1 and g.get("unknown") == 1 and line is None, f"rounds: one site resolved, another unknown: no "
+       f"line ({g})")
+    g, line, n = rnd(prog(), kl.tier_state(occ(32, 166, 9, 0, 16, 16, 8), 4))
+    ok(not g and line is None, f"rounds: an unverified tier ({{'why'}}, no target) gives no figure (R1 / N14) ({g})")
+    rows = [{"kernel": "g_a", "rounds": {"sites": [], "unknown": 1, "size_unknown": 0}},     # size_unknown: r2's shape, for the red run
+            {"kernel": "g_b", "rounds": {"sites": [("@llm.tokens", 5, 1)], "unknown": 0, "size_unknown": 0}}]
+    s = getattr(kl, "rounds_summary", lambda r: "")(rows)
+    ok("not resolved (1): g_a" in s and "g_b" not in s, f"rounds: one summary line names the kernels not resolved (review F5) ({s})")
+    ok(getattr(kl, "device_domains", lambda t: None)("gfx1151") == 20 and kl.device_domains("nonesuch") is None, "rounds: 20 WGPs")
+    ok(not hasattr(kl, "served_sizes"), "rounds: no admitted-size reader (review r2: Loom admits tokens / spans up to the prefill "
+       "capacity; rows and draft_depth are not caps)")
+    # ---- (c) guardwait (E520). r2 (review F4): a victim is younger than every load the block's wait must retire for the block
+    def guard(v_after=False, read_v=False, scale_only=False, write_v=False, scratch=False):
+        b = ["s_mov_b32 s0, 0"]
+        vl = [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+        if scratch:
+            vl = ["scratch_load_b128 v[40:43], off, s33 offset:16"]
+        b += ([] if v_after or scale_only else vl) + ["s_cmp_eq_u32 s1, 0"]
+        br = len(b); b.append("")
+        b += ["s_waitcnt vmcnt(0)", "v_cvt_f32_f16_e32 v11, v10"]
+        b += ["v_add_f32_e32 v12, v40, v44", "v_add_f32_e32 v12, v48, v12"] if read_v else []
+        b += ["v_mov_b32_e32 v40, 0", "v_mov_b32_e32 v44, 0", "v_mov_b32_e32 v48, 0"] if write_v else []
+        b[br] = fwd(br, len(b))
+        b += ([] if not v_after or scale_only else vl + ["s_waitcnt vmcnt(0)"]) + ["v_add_f32_e32 v13, v40, v44", wm,
+                                                                                  "global_load_b32 v10, v3, s[8:9]"]
+        b.append(back(len(b), 1))
+        return b
+    gw = lambda b: (lambda r: (r.get("guard_waits"), "guardwait" in notes(r)))(kl.lint_listing("gw", *listing(b)))
+    w, n = gw(guard())
+    ok(n and w == [(6, 5, 3)], f"guardwait: the guard waits for the older carried scale; V's three newer loads, read after the "
+       f"join, are drained (E520) ({w})")
+    gs = guard()
+    gs.insert(gs.index("v_cvt_f32_f16_e32 v11, v10") + 1, "global_store_b32 v7, v11, s[38:39]")
+    gs[5] = fwd(5, gs.index("v_add_f32_e32 v13, v40, v44"))
+    gs[-1] = back(len(gs) - 1, 1)
+    w, n = gw(gs)
+    ok(n and w == [(6, 5, 3)], f"guardwait: a global store in the block does not excuse a wait that needs the carried scale (only "
+       f"the loads carried over the back-edge, seen on the second pass, show the need) ({w})")
+    w, n = gw(guard(v_after=True))
+    ok(not n, f"guardwait: V's loads issued after the join (STAGE_LIVE alone): no note ({w})")
+    w, n = gw(guard(scale_only=True))
+    ok(not n, f"guardwait: the wait retires only the scale the block reads: no note ({w})")
+    w, n = gw(guard(read_v=True))
+    ok(not n, f"guardwait: the block reads V itself: no note ({w})")
+    w, n = gw(guard(write_v=True))
+    ok(not n, f"guardwait: the block overwrites V's registers (a write counts as a read, review F4 / b023): no note ({w})")
+    w, n = gw(guard(scratch=True))
+    ok(n and w and w[0][2] == 1, f"guardwait: a spill reload drained the same way counts (scratch loads share vmcnt) ({w})")
+    inb = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    inb += ["s_cmp_eq_u32 s1, 0", ""]
+    inb += ["global_load_b32 v60, v2, s[8:9]", "s_waitcnt vmcnt(0)", "v_mov_b32_e32 v61, 0"]
+    inb[5] = fwd(5, len(inb))
+    inb += ["ds_store_b32 v1, v60", "v_add_f32_e32 v13, v40, v44", wm]
+    inb.append(back(len(inb), 1))
+    w, n = gw(inb)
+    ok(not n, f"guardwait: the wait is for a load issued inside the block, the newest; in-order vmcnt cannot spare the older V "
+       f"loads (llama.cpp sample, review F4): no note ({w})")
+    st = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    st += ["s_cmp_eq_u32 s1, 0", "", "s_waitcnt vmcnt(0)", "global_store_b128 v7, v[20:23], s[38:39]"]
+    st[5] = fwd(5, len(st))
+    st += ["v_add_f32_e32 v13, v40, v44", wm]
+    st.append(back(len(st), 1))
+    w, n = gw(st)
+    ok(not n, f"guardwait: a wait that retires no load the block needs, before a global store (may order the store after a pending "
+       f"load; live g_gdn_recurrence_pf / _rec): no note ({w})")
+    fen = [x.replace("global_store_b128 v7, v[20:23], s[38:39]", "s_barrier") for x in st]
+    w, n = gw(fen)
+    ok(not n, f"guardwait: the same wait before a barrier (release: the wait may order it): no note ({w})")
+    lds = [x.replace("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(2)").replace("global_store_b128 v7, v[20:23], s[38:39]", "ds_store_b128 v7, v[20:23]")
+           for x in st]
+    w, n = gw(lds)
+    ok(n and w == [(6, 5, 1)], f"guardwait: the same over-wait before an LDS store (no global memory to order): the oldest V load is "
+       f"drained for nothing the block needs (pkg-cmb2's partial kernels, E521's residue) ({w})")
+    def blk(block, pre=()):                       # V's three loads (and PRE) before a guard holding BLOCK; V read after the join
+        b = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+        b += list(pre) + ["s_cmp_eq_u32 s1, 0", ""]
+        br = len(b) - 1
+        b += block
+        b[br] = fwd(br, len(b))
+        b += ["v_add_f32_e32 v13, v40, v44", wm]
+        b.append(back(len(b), 1))
+        return gw(b)
+    w, n = blk(["s_barrier", "s_waitcnt vmcnt(0)", "buffer_gl0_inv"])
+    ok(not n, f"guardwait: llama.cpp soft_max's shape (s_barrier, vmcnt(0), buffer_gl0_inv): the invalidate after the wait is an "
+       f"acquire the wait may serve: no note ({w})")
+    w, n = blk(["s_barrier", "s_waitcnt vmcnt(0)", "v_mov_b32_e32 v61, 0"])
+    ok(n and w and w[0][2] == 3, f"guardwait: a barrier before the wait only orders nothing the wait serves: note ({w})")
+    w, n = blk(["s_waitcnt vmcnt(0)", "buffer_gl1_inv"])
+    ok(not n, f"guardwait: a cache invalidate after the wait (N2): no note ({w})")
+    w, n = blk(["s_waitcnt vmcnt(2)", "scratch_store_b32 off, v20, s33", "ds_store_b128 v7, v[20:23]"])
+    ok(n and w and w[0][2] == 1, f"guardwait: E521's residue with an unrelated spill store in the block still fires (N1: a spill "
+       f"orders nothing) ({w})")
+    w, n = blk(["global_store_b32 v7, v20, s[38:39]", "s_waitcnt vmcnt(2)", "ds_store_b128 v7, v[20:23]"])
+    ok(n and w and w[0][2] == 1, f"guardwait: E521's residue with a global store before the wait still fires (N3: a wait cannot "
+       f"order an earlier store) ({w})")
+    w, n = blk(["s_waitcnt vmcnt(0)", "v_add_f32_e32 v61, v5, v5"], pre=["global_atomic_add_u32 v5, v1, v2, s[8:9] glc"])
+    ok(not n, f"guardwait: the wait is for a returning atomic issued after V (a vmcnt entry, loop_census.VMCNT_ENTRY, review F-G3): "
+       f"the block needs the newest entry: no note ({w})")
+    aj = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    aj += ["s_cmp_eq_u32 s1, 0", "", "v_cvt_f32_f16_e32 v11, v10"]
+    aj[5] = fwd(5, len(aj))
+    aj += ["s_waitcnt vmcnt(0)", "v_add_f32_e32 v13, v40, v44", wm]
+    aj.append(back(len(aj), 1))
+    w, n = gw(aj)
+    ok(not n, f"guardwait: a wait after the join is not judged against the block it follows ({w})")
+    ex = guard()
+    ex[5] = fwd(5, len(ex))
+    w, n = gw(ex + ["s_endpgm"])
+    ok(not n, f"guardwait: a branch out of the loop (its exit) is not a guard ({w})")
+    nest = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    it = len(nest)
+    nest += ["s_cmp_lt_i32 s16, s22", "", "s_waitcnt vmcnt(0)", "v_add_f32_e32 v11, v10, v10", "s_add_u32 s16, s16, 1"]
+    nest.append(back(len(nest), it))
+    nest[it + 1] = fwd(it + 1, len(nest))
+    nest += ["v_add_f32_e32 v13, v40, v44", wm, "global_load_b32 v10, v3, s[8:9]"]
+    nest.append(back(len(nest), 1))
+    w, n = gw(nest)
+    ok(not n, f"guardwait: an inner loop's exit test seen from the outer loop is not a guard (g_spec_accept) ({w})")
+    # an else block: s_cbranch to the else, the then block issues V and jumps over the else with s_branch; the else's wait is not
+    # after V on any executed path (review G3: only s_cbranch opens a guard)
+    el = ["s_mov_b32 s0, 0", "s_cmp_eq_u32 s1, 0", ""]
+    el += [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    sb = len(el); el.append("")
+    el[2] = fwd(2, len(el))
+    el += ["s_waitcnt vmcnt(0)", "v_cvt_f32_f16_e32 v11, v10"]
+    el[sb] = fwd(sb, len(el), "s_branch")
+    el += ["v_add_f32_e32 v13, v40, v44", wm, "global_load_b32 v10, v3, s[8:9]"]
+    el.append(back(len(el), 1))
+    w, n = gw(el)
+    ok(not n, f"guardwait: an else block (behind an unconditional s_branch) is not judged against the then block's loads ({w})")
+    two = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    two += ["s_cmp_eq_u32 s1, 0", "", "s_cmp_eq_u32 s2, 0", "", "s_waitcnt vmcnt(0)", "v_cvt_f32_f16_e32 v11, v10"]
+    two[7] = fwd(7, len(two))
+    two[5] = fwd(5, len(two) + 1)
+    two += ["v_add_f32_e32 v12, v11, v11", "v_add_f32_e32 v13, v40, v44", wm, "global_load_b32 v10, v3, s[8:9]"]
+    two.append(back(len(two), 1))
+    w, n = gw(two)
+    ok(n and w == [(8, 7, 3)], f"guardwait: nested guards: one hit per wait, named by the innermost guard (review G5) ({w})")
+    # ---- (d) vopd (C5 / E551, corrected by q210's llvm-mc build, E580: shared VSRC1 and two literals are refused)
+    mv = lambda k: f"v_mov_b32_e32 v{100 + k}, v{1 + k}"
+    r = kl.lint_listing("vopd", *listing(loop_of([wm] + [mv(k) for k in range(40)])))
+    ok("vopd" in notes(r) and r.get("vopd_pairs") == 20 and r.get("backedge") and r["backedge"][:2] == (40, 20),
+       f"vopd: 40 single copies at the back-edge (alternating parity) form 20 pairs: note ({r.get('vopd_pairs')}, {r.get('backedge')})")
+    r = kl.lint_listing("vopd15", *listing(loop_of([wm] + [mv(k) for k in range(30)])))
+    ok("vopd" not in notes(r) and r.get("vopd_pairs") == 15, f"vopd: 15 pairs, under VOPD_MIN: no note ({r.get('vopd_pairs')})")
+    def pairs_of(body):
+        r = kl.lint_listing("v", *listing(loop_of([wm] + body)))
+        return r.get("vopd_pairs"), r.get("vopd_eligible")
+    same = [f"v_mov_b32_e32 v{100 + 2 * k}, v{1 + 2 * k}" for k in range(40)]
+    ok(pairs_of(same)[0] == 0, f"vopd: destinations and sources of one parity: no pair ({pairs_of(same)})")
+    sd = [f"v_mov_b32_e32 v{100 + 2 * k}, v{1 + k}" for k in range(40)]
+    ok(pairs_of(sd)[0] == 0, f"vopd: destinations of one parity (R5): no pair ({pairs_of(sd)})")
+    sp = [f"v_mov_b32_e32 v{100 + k}, v{1 + 2 * k}" for k in range(40)]
+    ok(pairs_of(sp)[0] == 0, f"vopd: SRC0 of one parity (gfx11.5 interlock, R5a): no pair ({pairs_of(sp)})")
+    dual = [f"v_dual_mov_b32 v{100 + 2 * k}, v{1 + 2 * k} :: v_dual_mov_b32 v{101 + 2 * k}, v{2 + 2 * k}" for k in range(20)]
+    ok(pairs_of(dual) == (0, 0), f"vopd: moves already paired are not eligible ({pairs_of(dual)})")
+    dep = [mv(0)] + [f"v_mov_b32_e32 v{100 + k}, v{99 + k}" for k in range(1, 40)]
+    ok(pairs_of(dep)[0] == 0, f"vopd: a dependent chain: no pair ({pairs_of(dep)})")
+    mid = sum(([mv(2 * k), f"v_mov_b32_e32 v{1 + 2 * k + 1}, v90", mv(2 * k + 1), "s_waitcnt vmcnt(0)"] for k in range(20)), [])
+    ok(pairs_of(mid)[0] == 0, f"vopd: an instruction between writes the second half's source: no pair ({pairs_of(mid)})")
+    yy = [f"v_add_nc_u32_e32 v{100 + k}, v{1 + k}, v{51 + k}" if k % 2 == 0 else f"v_lshlrev_b32_e32 v{100 + k}, v{1 + k}, v{51 + k}"
+          for k in range(40)]
+    ok(pairs_of(yy)[0] == 0 and pairs_of(yy)[1] == 40, f"vopd: two Y-only opcodes cannot pair (R5b: one half must be X) ({pairs_of(yy)})")
+    wt = sum(([mv(2 * k), "s_waitcnt vmcnt(0)", mv(2 * k + 1), "s_barrier"] for k in range(20)), [])
+    ok(pairs_of(wt)[0] == 0, f"vopd: a wait between the halves: no pair ({pairs_of(wt)})")
+    far = sum(([mv(2 * k)] + ["s_nop 0"] * 8 + [mv(2 * k + 1)] + ["s_nop 0"] * 8 for k in range(20)), [])
+    ok(pairs_of(far)[0] == 0, f"vopd: halves 9 instructions apart, past the window: no pair ({pairs_of(far)})")
+    e64 = [f"v_add_f32_e64 v{100 + k}, v{1 + k}, v{51 + k}" for k in range(40)]
+    ok(pairs_of(e64)[1] == 0, f"vopd: VOP3 forms are not eligible (C5's port) ({pairs_of(e64)})")
+    neg = [f"v_add_f32 v{100 + k}, -v{1 + k}, v{51 + k}" for k in range(40)]
+    ok(pairs_of(neg)[1] == 0, f"vopd: a source negation is not eligible ({pairs_of(neg)})")
+    vs = [f"v_add_f32_e32 v{100 + k}, v{1 + k}, v238" for k in range(40)]
+    ok(pairs_of(vs)[0] == 0, f"vopd: one VSRC1 register in both halves: refused, swaps or not (Loom vopd_component.c: same register "
+       f"is same parity) ({pairs_of(vs)})")
+    vb = [f"v_sub_f32_e32 v{100 + k}, v{1 + k}, v{60 + 2 * k}" for k in range(40)]
+    ok(pairs_of(vb)[0] == 0, f"vopd: VSRC1 of one parity, different banks (llvm-mc accepts; Loom's interlock rule refuses) "
+       f"({pairs_of(vb)})")
+    cases = {"shared SRC0 (fmac, llama.cpp mul_mat_q)": (["v_fmac_f32_e32 v112, v58, v21", "v_fmac_f32_e32 v113, v58, v22"], 0),
+             "SRC0 same parity, a commutable swap makes it legal": (["v_add_f32_e32 v10, v1, v2", "v_add_f32_e32 v11, v3, v4"], 1),
+             "the same with sub (not commutable)": (["v_sub_f32_e32 v10, v1, v2", "v_sub_f32_e32 v11, v3, v4"], 0),
+             "VSRC1 same parity, mul swaps cannot fix it": (["v_mul_f32_e32 v10, v1, v4", "v_mul_f32_e32 v11, v2, v6"], 0),
+             "fmamk's VSRC1 is its 4th operand, in the SRC2 port (v6 / v4 even)": (["v_fmamk_f32 v1, v2, 0x3f800000, v6",
+                                                                                   "v_fmac_f32_e32 v4, v3, v10"], 0),
+             "fmamk's VSRC1 v6 against fmac's destination v4 in SRC2, VSRC1 ports apart (N11b)": (["v_fmamk_f32 v1, v2, 0x3f800000, v6",
+                                                                                               "v_fmac_f32_e32 v4, v3, v11"], 0),
+             "fmamk with VSRC1 v7 against fmac's v4: legal (N11)": (["v_fmamk_f32 v1, v2, 0x3f800000, v7", "v_fmac_f32_e32 v4, v3, v10"], 1),
+             "a literal SRC0 is not a VGPR binary (Loom reads VGPR sources only)": (["v_mul_f32_e32 v1, 0x3db8aa3b, v2",
+                                                                                    "v_mul_f32_e32 v4, v5, v7"], 0),
+             "an SGPR SRC0 likewise": (["v_add_f32_e32 v1, s2, v3", "v_add_f32_e32 v4, v5, v7"], 0),
+             "a move from an SGPR is not eligible": (["v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v4, v5"], 0),
+             "a move of a non-inline literal is not eligible": (["v_mov_b32_e32 v1, 0x400", "v_mov_b32_e32 v4, v5"], 0),
+             "a move of inline 64 pairs (N12)": (["v_mov_b32_e32 v1, 64", "v_mov_b32_e32 v4, v5"], 1),
+             "a move of inline 1.0 stays single: Loom pairs integer inline constants only (N13, verify r3 F1)": (["v_mov_b32_e32 v1, 1.0", "v_mov_b32_e32 v4, v5"], 0),
+             "a move of inline 64 pairs (verify r3 F1)": (["v_mov_b32_e32 v1, 64", "v_mov_b32_e32 v4, v5"], 1),
+             "a move of 65 (printed 0x41) stays single (verify r3 F1)": (["v_mov_b32_e32 v1, 0x41", "v_mov_b32_e32 v4, v5"], 0),
+             "a move of inline -16 pairs (verify r3 F1)": (["v_mov_b32_e32 v1, -16", "v_mov_b32_e32 v4, v5"], 1),
+             "a move of inline -16 pairs": (["v_mov_b32_e32 v1, -16", "v_mov_b32_e32 v4, v5"], 1)}
+    for name, (b2, want) in cases.items():
+        got = pairs_of(b2)[0]
+        ok(got == want, f"vopd: {name}: {want} pair(s) ({got})")
+    lit = [f"v_fmamk_f32 v{100 + k}, v{1 + k}, 0x{0x3fb8aa3b + k:x}, v{51 + k}" for k in range(40)]
+    ok(pairs_of(lit)[0] == 0 and pairs_of(lit)[1] == 40, f"vopd: two different literals in one pair: refused (R5) ({pairs_of(lit)})")
+    lit1 = [f"v_fmamk_f32 v{100 + k}, v{1 + k}, 0x3fb8aa3b, v{51 + k}" for k in range(40)]
+    ok(pairs_of(lit1)[0] == 20, f"vopd: the same literal in both halves is one literal: pairs ({pairs_of(lit1)})")
+    r = kl.lint_listing("bfar", *listing(loop_of([wm] + [mv(k) for k in range(40)] + ["s_nop 0"] * 9)))
+    ok(r.get("backedge") is None and "backedge" in r, f"vopd: a copy run ending 10 instructions before the back-edge is not its block "
+       f"({r.get('backedge')})")
+    r = kl.lint_listing("bgap", *listing(loop_of([wm] + [mv(k) for k in range(20)] + ["s_nop 0"] * 4 + [mv(20 + k) for k in range(10)])))
+    ok(r.get("backedge") and r["backedge"][:2] == (10, 5), f"vopd: the back-edge block is the last run (moves <= 3 apart), not the one "
+       f"before a gap of 5 ({r.get('backedge')})")
+    r = kl.lint_listing("nomm", *listing(["s_mov_b32 s0, 0"] + [mv(k) for k in range(40)] + ["s_endpgm"]))
+    ok("vopd" not in notes(r) and r.get("vopd_pairs") is None, f"vopd: no MMA loop, no figure ({r.get('vopd_pairs')})")
+    chain = ["v_wmma_f32_16x16x16_f16 v[0:7], v[8:15], v[16:23], v[0:7]", "v_wmma_f32_16x16x16_f16 v[24:31], v[8:15], v[16:23], v[24:31]",
+             "v_wmma_f32_16x16x16_f16 v[0:7], v[8:15], v[16:23], v[0:7]", "v_wmma_f32_16x16x16_f16 v[24:31], v[8:15], v[16:23], v[24:31]"]
+    r = kl.lint_listing("dep1", *listing(loop_of(chain)))
+    ok(r.get("wmma_dep1") == 4, f"vopd: two interleaved accumulators: 4 of 4 WMMAs at D->C gap 1 (informational, R6a) ({r.get('wmma_dep1')})")
+    chain16 = [f"v_wmma_f32_16x16x16_f16 v[{8 * k}:{8 * k + 7}], v[200:207], v[208:215], v[{8 * k}:{8 * k + 7}]" for k in range(16)]
+    r = kl.lint_listing("dep16", *listing(loop_of(chain16)))
+    ok(r.get("wmma_dep1") == 0, f"vopd: 16 independent accumulators count 0 ({r.get('wmma_dep1')})")
+    # live pins (review F1): pkg-e480's flash2_f16o hot loop (C5's 56 corrected to 54 by q210's llvm-mc build, E580) and the m256 GEMM
+    def fx(name):
+        lst = [x.split("\t", 1) for x in open(os.path.join(HERE, "fixtures", name)).read().split("\n") if x]
+        return [i for _, i in lst], [int(a, 16) for a, _ in lst]
+    r = kl.lint_listing("flash2_f16o", *fx("flash2_f16o_e480_loop.listing"))
+    got = (r.get("vopd_pairs"), r.get("vopd_eligible"), r.get("backedge") and r["backedge"][:2], r.get("wmma_dep1"))
+    ok(got == (35, 129, (65, 31), 16), f"vopd: live flash2_f16o by Loom 0.2.0's planner rules: 35 pairs of 129 eligible, back-edge 65 "
+       f"moves -> 31 pairs, 16 WMMAs at D->C gap <= 1 (C5 / E551 counted 56 of 186 under looser rules; review r2) ({got})")
+    lb = fx("flash2_f16o_e480_loop.listing")[0]
+    two = lambda i, j: kl.lint_listing("v2", *listing(loop_of([wm, lb[i], lb[j]]))).get("vopd_pairs")
+    got = [two(i, j) for i, j in ((776, 777), (779, 780), (514, 515), (597, 601), (667, 670), (882, 884))]
+    ok(got == [0, 0, 0, 0, 0, 1], f"vopd: live pairs refused: C5's two shared-v238 pairs, the reviewer's three VSRC1-parity pairs (one "
+       f"by parity, two by a literal SRC0); a back-edge move pair is formed ({got})")
+    r = kl.lint_listing("gemm_m256", *fx("gemm_f16_store_m256_e480_loop.listing"))
+    got = (r.get("vopd_pairs"), r.get("vopd_eligible"), r.get("wmma_dep1"))
+    ok(got == (0, 1, 0), f"vopd: live m256 GEMM: 0 pairs of 1 eligible, 0 at gap <= 1 ({got})")
+    ok("ldswait" not in notes(r) and not hasattr(kl, "lds_waits"), "ldswait is deleted (the ldsser lever, refuted E293 / E309 / E335 / "
+       "E340; re-add only if E534's SQ_WAIT_INST_LDS contradicts E341)")
 
 
 def main():
@@ -396,6 +716,7 @@ def main():
     ok(kl.regressions(dict(base), base) == [], "regress: nothing when nothing changed")
     occupancy_seam()
     livereg()
+    lesson_notes()
     prog = ("template.def<@sel1_g_k1> target(@rdna3) @sel1_g_k1_rdna3(%g0: index) {\n  kernel.launch @g_k1[%g0](%g0) : [index](index)\n}\n"
             "command.def public @c() {\n  template.apply<@sel1_g_k1>(%t) : (index)\n  template.apply<@sel1_g_k1>(%u) : (index)\n"
             "  kernel.launch @g_k2[%t](%t) : [index](index)\n  kernel.launch @g_k3(%t, %u) : (index, index)\n}\n")

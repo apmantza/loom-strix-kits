@@ -1,0 +1,209 @@
+14a8	s_cmp_lt_i32 s1, s7
+14ac	s_delay_alu instid0(SALU_CYCLE_1)
+14b0	s_cbranch_scc0 367
+14b4	v_lshlrev_b32_e32 v1, 1, v6
+14b8	s_mul_i32 s2, s1, 64
+14bc	s_add_u32 s2, s2, 64
+14c0	s_min_i32 s2, s2, s4
+14c4	s_add_u32 s5, s1, 1
+14c8	s_waitcnt vmcnt(0)
+14cc	ds_store_b128 v1, v[20:23] offset:36864
+14d4	s_lshl_b32 s2, s2, 1
+14d8	v_lshlrev_b32_e32 v2, 2, v7
+14dc	s_add_u32 s18, s12, s2
+14e0	ds_store_b128 v1, v[32:35]
+14e8	s_addc_u32 s19, s13, 0
+14ec	s_add_u32 s20, s12, s2
+14f0	s_addc_u32 s21, s13, 0
+14f4	ds_store_b128 v1, v[48:51] offset:18432
+14fc	s_cmp_lt_u32 s5, s7
+1500	ds_store_b128 v1, v[36:39] offset:16
+1508	ds_store_b128 v1, v[52:55] offset:18448
+1510	ds_store_b128 v1, v[24:27] offset:36880
+1518	ds_store_b128 v1, v[56:59] offset:18464
+1520	ds_store_b128 v1, v[28:31] offset:36896
+1528	ds_store_b128 v1, v[40:43] offset:32
+1530	ds_store_b128 v1, v[16:19] offset:36912
+1538	ds_store_b128 v1, v[44:47] offset:48
+1540	ds_store_b128 v1, v[60:63] offset:18480
+1548	s_waitcnt lgkmcnt(0)
+154c	s_barrier
+1550	global_load_b128 v[20:23], v2, s[18:19]
+1558	global_load_b128 v[24:27], v2, s[18:19] offset:16
+1560	global_load_b128 v[28:31], v2, s[20:21] offset:32
+1568	global_load_b128 v[16:19], v2, s[20:21] offset:48
+1570	s_cbranch_scc0 26
+1574	v_mov_b32_e32 v1, s1
+1578	s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_2)
+157c	v_lshl_add_u32 v2, v1, 6, v14
+1584	v_lshl_add_u32 v1, v1, 6, v8
+158c	v_lshlrev_b32_e32 v2, 1, v2
+1590	s_delay_alu instid0(VALU_DEP_2)
+1594	v_lshlrev_b32_e32 v1, 1, v1
+1598	global_load_b128 v[32:35], v2, s[8:9] offset:128
+15a0	global_load_b128 v[36:39], v2, s[8:9] offset:144
+15a8	global_load_b128 v[40:43], v2, s[8:9] offset:160
+15b0	global_load_b128 v[44:47], v2, s[8:9] offset:176
+15b8	global_load_b128 v[48:51], v1, s[8:9] offset:128
+15c0	global_load_b128 v[52:55], v1, s[8:9] offset:144
+15c8	global_load_b128 v[56:59], v1, s[8:9] offset:160
+15d0	global_load_b128 v[60:63], v1, s[8:9] offset:176
+15d8	s_branch 0
+15dc	v_and_b32_e32 v1, 31, v0
+15e0	v_mul_lo_u32 v2, v3, 0x240
+15ec	v_mul_lo_u32 v9, v5, 0x2400
+15f8	s_delay_alu instid0(VALU_DEP_3) | instskip(NEXT) | instid1(VALU_DEP_3)
+15fc	v_and_b32_e32 v1, 15, v1
+1600	v_mad_u32_u24 v2, v4, lit(0x9), v2
+160c	s_delay_alu instid0(VALU_DEP_2) | instskip(NEXT) | instid1(VALU_DEP_2)
+1610	v_mul_u32_u24_e32 v1, 0x90, v1
+1618	v_lshlrev_b32_e32 v2, 4, v2
+161c	s_delay_alu instid0(VALU_DEP_2)
+1620	v_add_nc_u32_e32 v1, v9, v1
+1624	ds_load_b128 v[192:195], v2 offset:36864
+162c	ds_load_b128 v[200:203], v1
+1634	ds_load_b128 v[204:207], v1 offset:16
+163c	ds_load_b128 v[208:211], v1 offset:2304
+1644	ds_load_b128 v[212:215], v1 offset:2320
+164c	ds_load_b128 v[216:219], v1 offset:4608
+1654	ds_load_b128 v[220:223], v1 offset:4624
+165c	ds_load_b128 v[224:227], v1 offset:6912
+1664	ds_load_b128 v[228:231], v1 offset:6928
+166c	ds_load_b128 v[196:199], v2 offset:36880
+1674	s_waitcnt lgkmcnt(0)
+1678	v_wmma_f32_16x16x16_f16 v[64:71], v[200:207], v[192:199], v[64:71]
+1680	v_wmma_f32_16x16x16_f16 v[96:103], v[208:215], v[192:199], v[96:103]
+1688	v_wmma_f32_16x16x16_f16 v[128:135], v[216:223], v[192:199], v[128:135]
+1690	v_wmma_f32_16x16x16_f16 v[160:167], v[224:231], v[192:199], v[160:167]
+1698	ds_load_b128 v[232:235], v2 offset:39168
+16a0	ds_load_b128 v[236:239], v2 offset:39184
+16a8	s_waitcnt lgkmcnt(0)
+16ac	v_wmma_f32_16x16x16_f16 v[72:79], v[200:207], v[232:239], v[72:79]
+16b4	v_wmma_f32_16x16x16_f16 v[104:111], v[208:215], v[232:239], v[104:111]
+16bc	v_wmma_f32_16x16x16_f16 v[136:143], v[216:223], v[232:239], v[136:143]
+16c4	v_wmma_f32_16x16x16_f16 v[168:175], v[224:231], v[232:239], v[168:175]
+16cc	ds_load_b128 v[240:243], v2 offset:41472
+16d4	ds_load_b128 v[244:247], v2 offset:41488
+16dc	s_waitcnt lgkmcnt(0)
+16e0	v_wmma_f32_16x16x16_f16 v[80:87], v[200:207], v[240:247], v[80:87]
+16e8	v_wmma_f32_16x16x16_f16 v[112:119], v[208:215], v[240:247], v[112:119]
+16f0	v_wmma_f32_16x16x16_f16 v[144:151], v[216:223], v[240:247], v[144:151]
+16f8	v_wmma_f32_16x16x16_f16 v[176:183], v[224:231], v[240:247], v[176:183]
+1700	ds_load_b128 v[248:251], v2 offset:43776
+1708	ds_load_b128 v[252:255], v2 offset:43792
+1710	s_waitcnt lgkmcnt(0)
+1714	v_wmma_f32_16x16x16_f16 v[88:95], v[200:207], v[248:255], v[88:95]
+171c	v_wmma_f32_16x16x16_f16 v[120:127], v[208:215], v[248:255], v[120:127]
+1724	v_wmma_f32_16x16x16_f16 v[152:159], v[216:223], v[248:255], v[152:159]
+172c	v_wmma_f32_16x16x16_f16 v[184:191], v[224:231], v[248:255], v[184:191]
+1734	ds_load_b128 v[192:195], v1 offset:32
+173c	ds_load_b128 v[196:199], v1 offset:48
+1744	ds_load_b128 v[200:203], v1 offset:2336
+174c	ds_load_b128 v[204:207], v1 offset:2352
+1754	ds_load_b128 v[208:211], v1 offset:4640
+175c	ds_load_b128 v[212:215], v1 offset:4656
+1764	ds_load_b128 v[216:219], v1 offset:6944
+176c	ds_load_b128 v[220:223], v1 offset:6960
+1774	ds_load_b128 v[224:227], v2 offset:36896
+177c	ds_load_b128 v[228:231], v2 offset:36912
+1784	s_waitcnt lgkmcnt(0)
+1788	v_wmma_f32_16x16x16_f16 v[64:71], v[192:199], v[224:231], v[64:71]
+1790	v_wmma_f32_16x16x16_f16 v[96:103], v[200:207], v[224:231], v[96:103]
+1798	v_wmma_f32_16x16x16_f16 v[128:135], v[208:215], v[224:231], v[128:135]
+17a0	v_wmma_f32_16x16x16_f16 v[160:167], v[216:223], v[224:231], v[160:167]
+17a8	ds_load_b128 v[224:227], v2 offset:39200
+17b0	ds_load_b128 v[228:231], v2 offset:39216
+17b8	s_waitcnt lgkmcnt(0)
+17bc	v_wmma_f32_16x16x16_f16 v[72:79], v[192:199], v[224:231], v[72:79]
+17c4	v_wmma_f32_16x16x16_f16 v[104:111], v[200:207], v[224:231], v[104:111]
+17cc	v_wmma_f32_16x16x16_f16 v[136:143], v[208:215], v[224:231], v[136:143]
+17d4	v_wmma_f32_16x16x16_f16 v[168:175], v[216:223], v[224:231], v[168:175]
+17dc	ds_load_b128 v[224:227], v2 offset:41504
+17e4	ds_load_b128 v[228:231], v2 offset:41520
+17ec	s_waitcnt lgkmcnt(0)
+17f0	v_wmma_f32_16x16x16_f16 v[80:87], v[192:199], v[224:231], v[80:87]
+17f8	v_wmma_f32_16x16x16_f16 v[112:119], v[200:207], v[224:231], v[112:119]
+1800	v_wmma_f32_16x16x16_f16 v[144:151], v[208:215], v[224:231], v[144:151]
+1808	v_wmma_f32_16x16x16_f16 v[176:183], v[216:223], v[224:231], v[176:183]
+1810	ds_load_b128 v[224:227], v2 offset:43808
+1818	ds_load_b128 v[228:231], v2 offset:43824
+1820	s_waitcnt lgkmcnt(0)
+1824	v_wmma_f32_16x16x16_f16 v[88:95], v[192:199], v[224:231], v[88:95]
+182c	v_wmma_f32_16x16x16_f16 v[120:127], v[200:207], v[224:231], v[120:127]
+1834	v_wmma_f32_16x16x16_f16 v[152:159], v[208:215], v[224:231], v[152:159]
+183c	v_wmma_f32_16x16x16_f16 v[184:191], v[216:223], v[224:231], v[184:191]
+1844	ds_load_b128 v[192:195], v1 offset:64
+184c	ds_load_b128 v[196:199], v1 offset:80
+1854	ds_load_b128 v[200:203], v1 offset:2368
+185c	ds_load_b128 v[204:207], v1 offset:2384
+1864	ds_load_b128 v[208:211], v1 offset:4672
+186c	ds_load_b128 v[212:215], v1 offset:4688
+1874	ds_load_b128 v[216:219], v1 offset:6976
+187c	ds_load_b128 v[220:223], v1 offset:6992
+1884	ds_load_b128 v[224:227], v2 offset:36928
+188c	ds_load_b128 v[228:231], v2 offset:36944
+1894	s_waitcnt lgkmcnt(0)
+1898	v_wmma_f32_16x16x16_f16 v[64:71], v[192:199], v[224:231], v[64:71]
+18a0	v_wmma_f32_16x16x16_f16 v[96:103], v[200:207], v[224:231], v[96:103]
+18a8	v_wmma_f32_16x16x16_f16 v[128:135], v[208:215], v[224:231], v[128:135]
+18b0	v_wmma_f32_16x16x16_f16 v[160:167], v[216:223], v[224:231], v[160:167]
+18b8	ds_load_b128 v[224:227], v2 offset:39232
+18c0	ds_load_b128 v[228:231], v2 offset:39248
+18c8	s_waitcnt lgkmcnt(0)
+18cc	v_wmma_f32_16x16x16_f16 v[72:79], v[192:199], v[224:231], v[72:79]
+18d4	v_wmma_f32_16x16x16_f16 v[104:111], v[200:207], v[224:231], v[104:111]
+18dc	v_wmma_f32_16x16x16_f16 v[136:143], v[208:215], v[224:231], v[136:143]
+18e4	v_wmma_f32_16x16x16_f16 v[168:175], v[216:223], v[224:231], v[168:175]
+18ec	ds_load_b128 v[224:227], v2 offset:41536
+18f4	ds_load_b128 v[228:231], v2 offset:41552
+18fc	s_waitcnt lgkmcnt(0)
+1900	v_wmma_f32_16x16x16_f16 v[80:87], v[192:199], v[224:231], v[80:87]
+1908	v_wmma_f32_16x16x16_f16 v[112:119], v[200:207], v[224:231], v[112:119]
+1910	v_wmma_f32_16x16x16_f16 v[144:151], v[208:215], v[224:231], v[144:151]
+1918	v_wmma_f32_16x16x16_f16 v[176:183], v[216:223], v[224:231], v[176:183]
+1920	ds_load_b128 v[224:227], v2 offset:43840
+1928	ds_load_b128 v[228:231], v2 offset:43856
+1930	s_waitcnt lgkmcnt(0)
+1934	v_wmma_f32_16x16x16_f16 v[88:95], v[192:199], v[224:231], v[88:95]
+193c	v_wmma_f32_16x16x16_f16 v[120:127], v[200:207], v[224:231], v[120:127]
+1944	v_wmma_f32_16x16x16_f16 v[152:159], v[208:215], v[224:231], v[152:159]
+194c	v_wmma_f32_16x16x16_f16 v[184:191], v[216:223], v[224:231], v[184:191]
+1954	ds_load_b128 v[192:195], v1 offset:96
+195c	ds_load_b128 v[196:199], v1 offset:112
+1964	ds_load_b128 v[200:203], v1 offset:2400
+196c	ds_load_b128 v[204:207], v1 offset:2416
+1974	ds_load_b128 v[208:211], v1 offset:4704
+197c	ds_load_b128 v[212:215], v1 offset:4720
+1984	ds_load_b128 v[216:219], v1 offset:7008
+198c	ds_load_b128 v[220:223], v1 offset:7024
+1994	ds_load_b128 v[224:227], v2 offset:36960
+199c	ds_load_b128 v[228:231], v2 offset:36976
+19a4	s_waitcnt lgkmcnt(0)
+19a8	v_wmma_f32_16x16x16_f16 v[64:71], v[192:199], v[224:231], v[64:71]
+19b0	v_wmma_f32_16x16x16_f16 v[96:103], v[200:207], v[224:231], v[96:103]
+19b8	v_wmma_f32_16x16x16_f16 v[128:135], v[208:215], v[224:231], v[128:135]
+19c0	v_wmma_f32_16x16x16_f16 v[160:167], v[216:223], v[224:231], v[160:167]
+19c8	ds_load_b128 v[224:227], v2 offset:39264
+19d0	ds_load_b128 v[228:231], v2 offset:39280
+19d8	s_waitcnt lgkmcnt(0)
+19dc	v_wmma_f32_16x16x16_f16 v[72:79], v[192:199], v[224:231], v[72:79]
+19e4	v_wmma_f32_16x16x16_f16 v[104:111], v[200:207], v[224:231], v[104:111]
+19ec	v_wmma_f32_16x16x16_f16 v[136:143], v[208:215], v[224:231], v[136:143]
+19f4	v_wmma_f32_16x16x16_f16 v[168:175], v[216:223], v[224:231], v[168:175]
+19fc	ds_load_b128 v[224:227], v2 offset:41568
+1a04	ds_load_b128 v[228:231], v2 offset:41584
+1a0c	s_waitcnt lgkmcnt(0)
+1a10	v_wmma_f32_16x16x16_f16 v[80:87], v[192:199], v[224:231], v[80:87]
+1a18	v_wmma_f32_16x16x16_f16 v[112:119], v[200:207], v[224:231], v[112:119]
+1a20	v_wmma_f32_16x16x16_f16 v[144:151], v[208:215], v[224:231], v[144:151]
+1a28	v_wmma_f32_16x16x16_f16 v[176:183], v[216:223], v[224:231], v[176:183]
+1a30	ds_load_b128 v[224:227], v2 offset:43872
+1a38	ds_load_b128 v[228:231], v2 offset:43888
+1a40	s_waitcnt lgkmcnt(0)
+1a44	v_wmma_f32_16x16x16_f16 v[88:95], v[192:199], v[224:231], v[88:95]
+1a4c	v_wmma_f32_16x16x16_f16 v[120:127], v[200:207], v[224:231], v[120:127]
+1a54	v_wmma_f32_16x16x16_f16 v[152:159], v[208:215], v[224:231], v[152:159]
+1a5c	v_wmma_f32_16x16x16_f16 v[184:191], v[216:223], v[224:231], v[184:191]
+1a64	s_barrier
+1a68	s_mov_b32 s1, s5
+1a6c	s_branch 65166
