@@ -12,6 +12,11 @@ make it worse. Classify first, with numbers:
 
 - **bytes/time vs bandwidth** and **instructions/time vs issue rate** (E40: a design assumed DRAM-bound at 3.7x the
   read-once floor; it was VALU-bound and the caches already shared the data, so the load-sharing kernel was slower).
+- **bytes from counters are fabric requests, not DRAM**: the L2-to-fabric and GCEA read counters include what the memory-side
+  MALL serves (HRX-like E497: a grouped GEMM read 345 GB/s of them, above the 240 GB/s DRAM ceiling). Check a counter's byte rate
+  against the device ceiling before calling a kernel DRAM-bound (counters_summary.py flags it), and price a traffic lever by an
+  order or ablation's time, not its bytes: two tile orders moved the f16 GEMMs' fabric reads by -28 % and +52 % and their time by
+  under 1 % (E305, E494).
 - **latency**: a timing ablation that removes the loads (zeros staged instead) and one that keeps them cache-resident.
   L18/E52: prefill attention ran 0.57x without K/V loads and 0.85x with cache-resident loads: latency, not bandwidth.
 - **registers**: final VGPRs and the occupancy tier from the compile report; spills share the load counter on gfx11.
