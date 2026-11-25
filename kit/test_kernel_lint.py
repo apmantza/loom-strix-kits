@@ -485,7 +485,10 @@ def lesson_notes():
              "a move from an SGPR is not eligible": (["v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v4, v5"], 0),
              "a move of a non-inline literal is not eligible": (["v_mov_b32_e32 v1, 0x400", "v_mov_b32_e32 v4, v5"], 0),
              "a move of inline 64 pairs (N12)": (["v_mov_b32_e32 v1, 64", "v_mov_b32_e32 v4, v5"], 1),
-             "a move of inline 1.0 pairs (N13)": (["v_mov_b32_e32 v1, 1.0", "v_mov_b32_e32 v4, v5"], 1),
+             "a move of inline 1.0 stays single: Loom pairs integer inline constants only (N13, verify r3 F1)": (["v_mov_b32_e32 v1, 1.0", "v_mov_b32_e32 v4, v5"], 0),
+             "a move of inline 64 pairs (verify r3 F1)": (["v_mov_b32_e32 v1, 64", "v_mov_b32_e32 v4, v5"], 1),
+             "a move of 65 (printed 0x41) stays single (verify r3 F1)": (["v_mov_b32_e32 v1, 0x41", "v_mov_b32_e32 v4, v5"], 0),
+             "a move of inline -16 pairs (verify r3 F1)": (["v_mov_b32_e32 v1, -16", "v_mov_b32_e32 v4, v5"], 1),
              "a move of inline -16 pairs": (["v_mov_b32_e32 v1, -16", "v_mov_b32_e32 v4, v5"], 1)}
     for name, (b2, want) in cases.items():
         got = pairs_of(b2)[0]

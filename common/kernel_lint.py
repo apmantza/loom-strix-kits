@@ -675,9 +675,9 @@ def ldsbank(r, js, ins):
         r.setdefault("notes", []).append("ldsbank")
 
 
-# ---- 11-25 lesson notes (C18): guardwait, vopd (binary); rounds (program text + residency + the package's admitted sizes). Notes,
+# ---- 11-25 lesson notes (C18): guardwait, vopd (binary); rounds (program text + residency: an information line, no size claim). Notes,
 # never flags (E251). ldswait: deleted in review (docstring).
-VOPD_MIN = 16    # VOPD pairs left unformed as allocated (whole loop) at or above which the note fires (C5 / E551 / E580: flash2 54)
+VOPD_MIN = 16    # VOPD pairs left unformed as allocated (whole loop) at or above which the note fires (C5 / E551 / E580 / E585: flash2_f16o 35 by Loom's rule)
 
 
 FENCE = re.compile(r"(?:global|buffer|flat)_store|s_barrier|buffer_gl\d_inv")   # memory ordering a wait may serve (no spill store)
@@ -741,13 +741,16 @@ def guardwait(r, ins, addr):
 
 # VOPD components as Loom 0.2.0's planner reads them on amdgpu.rdna3_5.core (hrx-system v0.2.0: amdgpu_vopd_component_tables.py
 # _component_definitions; planning/vopd_plan.c read_*_component; descriptors/alu.py COMMUTABLE constraints): opcode -> (lanes,
-# form, commutable). Loom's dot2 component is the VOP3P v_dot2_f32_f16, not v_dot2acc: not modelled
+# form, commutable). Loom's dot2 component is the VOP3P v_dot2_f32_f16, not v_dot2acc: not modelled; nor is the planner's
+# transcendental-result rejection window (a pair right after v_exp may be refused)
 VOPD_OPS = {"fmac_f32": ("XY", "tied", True), "fmaak_f32": ("XY", "fmaak", True), "fmamk_f32": ("XY", "fmamk", False),
             "mul_f32": ("XY", "binary", True), "add_f32": ("XY", "binary", True), "sub_f32": ("XY", "binary", False),
             "subrev_f32": ("XY", "binary", False), "max_f32": ("XY", "binary", True), "min_f32": ("XY", "binary", True),
             "cndmask_b32": ("XY", "binary", False), "mov_b32": ("XY", "mov", False), "add_nc_u32": ("Y", "binary", True),
             "lshlrev_b32": ("Y", "binary", False), "and_b32": ("Y", "binary", True)}
-INLINE = re.compile(r"(?:-?(?:\d+|0\.5|1\.0|2\.0|4\.0)|0\.15915494)$")   # inline constants as the disassembler prints them
+INLINE = re.compile(r"(?:[0-9]|[1-5][0-9]|6[0-4]|-(?:[1-9]|1[0-6]))$")   # integer inline constants 0..64, -1..-16 only: Loom 0.2.0's
+# inline move takes loom_amdgpu_encoding_inline_u32_source (vopd_plan.c:840-860; loom-check: 1.0 / 0.5 / 65 stay single, C18 verify r3);
+# the disassembler prints every other integer in hex
 
 
 def vnum(tok):
@@ -805,7 +808,9 @@ def vopd_registers_ok(x, y):
 
 
 def vopd_pairs(body, lo=0, hi=None, win=8):
-    """VOPD pairs a greedy pass could form from eligible singles in body[lo..hi] as allocated, by Loom 0.2.0's planner rules (the
+    """VOPD pairs a greedy pass could form from eligible singles in body[lo..hi] as allocated (an estimate, not a bound either way:
+    the planner's transcendental window is not modelled, and a matching at any distance finds 1-2 more; on flash2_f16o 32 of 35 are
+    adjacent, most in the back-edge copies Loom left single), by Loom 0.2.0's planner rules (the
     oracle; review r2: ROCm 10.2 llvm-mc checks banks, not the gfx11.5 interlock): one half X-capable, the other Y-capable, at most
     WIN instructions apart, independent (no def / use overlap, nothing between writing their sources or reading / writing their
     destinations, no wait, barrier or branch between), vopd_registers_ok, and two literals only when equal (vopd_component.c
@@ -873,8 +878,8 @@ def wmma_dep1(body):
 
 def vopd(r, ins):
     """the hot loop's unformed VOPD pairs as allocated, its back-edge copy block (moves, pairs inside it) and WMMA D -> C gap <= 1
-    count; note `vopd` at >= VOPD_MIN unformed pairs (C5 / E551 corrected by E580: flash2_f16o 54 of 186, back-edge 65 moves -> 31
-    pairs, dep1 16; m256 GEMM 0 of 9)"""
+    count; note `vopd` at >= VOPD_MIN unformed pairs (C5 / E551 corrected by E580, E585: flash2_f16o 35 of 129, back-edge 65 moves ->
+    31 pairs, dep1 16; m256 GEMM 0 of 1)"""
     if r.get("where") != "loop":
         return
     t, e = r["hot_range"]
