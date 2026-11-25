@@ -855,7 +855,9 @@ def vopd_pairs(body, lo=0, hi=None, win=8):
 
 def backedge_block(body):
     """(first, last) of the register-copy run (moves at most 3 apart) whose last move sits within 8 instructions of the loop's end, or
-    None: the allocator's back-edge copies (E179 / #3542; C5: flash2's +882..+946, 65 v_mov)"""
+    None: the allocator's back-edge copies (E179 / #3542; C5: flash2's +882..+946, 65 v_mov). Informational (C18's vopd line): it joins
+    runs over gaps of up to 3 other instructions, so on vsplit it spans an s_barrier (64 moves, s_add_u32, s_barrier, 65 moves: 129 ->
+    64 pairs; C19 review F2). The Loom candidate uses edge_group(), which stops at any non-move."""
     mv = [j for j, x in enumerate(body) if copy_moves(x)]
     if not mv or len(body) - 1 - mv[-1] > 8:
         return None
@@ -863,6 +865,21 @@ def backedge_block(body):
     while a > 0 and mv[a] - mv[a - 1] <= 3:
         a -= 1
     return mv[a], mv[-1]
+
+
+EDGE_PASS = ("s_delay_alu", "s_nop", "v_swap")   # inside an edge-copy group besides moves: Loom's exchange moves and issue hints
+
+
+def edge_group(body):
+    """(first, last) of the edge-copy group before a loop body's closing branch (body[-1]), or None: the maximal run of VALU moves,
+    v_swap, s_delay_alu and s_nop ending right before it, holding at least one register copy. encode_branch_packet emits a branch's
+    group contiguously right before it (v0.2.0 emit/native/amdgpu/encoding.c:1719-1728), so any other instruction ends it (C19
+    review F2: vsplit's 64 moves before an s_barrier are not its edge group)."""
+    j = len(body) - 2
+    while j >= 0 and (moves(body[j]) or body[j].startswith(EDGE_PASS)):
+        j -= 1
+    mv = [k for k in range(j + 1, len(body) - 1) if copy_moves(body[k])]
+    return (mv[0], mv[-1]) if mv else None
 
 
 def wmma_dep1(body):
@@ -1099,7 +1116,8 @@ def lesson_lines(rows):
 
 
 EDGE_PAIRS_MIN = 8   # VOPD pairs in one back-edge copy group at or above which a vopd-edge candidate is printed (C19, fire data 11-25 on
-# pkg-e480: 230 groups at 0-3 pairs, 224 at 4-7 (almost all g_head_mv_t16_q8_p40's, a DRAM-bound decode matvec), 23 at >= 8 in 17 kernels)
+# pkg-e480: 230 groups at 0-3 pairs, 224 at 4-7 (almost all g_head_mv_t16_q8_p40's, a DRAM-bound decode matvec), 23 at >= 8 in 17 kernels;
+# the bar sits in a narrow gap: v_norm_ln_1152 and g_gdn_fold at 7 below it, g_dfl_ctx_split at 10 the lowest above it)
 LOOM_TIER_DOC = ("loom/docs/src/workflows/compile-report-queries.md:122-124 (v0.2.0: 'the producer's reduction required for the "
                  "jointly selected next residency tier') against Loom's own whole-workgroup ceil (planning/occupancy.c:377 "
                  "wave_limit_for_workgroups)")
@@ -1115,7 +1133,7 @@ def loom_candidates(name, ins, addr, rep):
     tier: the compile report's next tier (target_resources.residency.next_better_tier, or its current tier) differs from tier_state()'s
       whole-workgroup arithmetic (HRX-like E533: flash2 384 lanes reported 6 -> 7 at -21 VGPR / -18,944 B; a workgroup seats 3 waves
       per SIMD, so the next tier is 9 at VGPR <= 168 and LDS <= 43,008 B). An unverified tier is counted, never a candidate.
-    vopd-edge: a loop's back-edge copy group (backedge_block: the move run ending <= 8 instructions before the backward branch) in
+    vopd-edge: a loop's back-edge copy group (edge_group: the moves, swaps and issue hints right before the backward branch) in
       which vopd_pairs(), Loom 0.2.0's planner rules with the order constraint (neither half reads the other's destination, the
       copies being a sequentialized parallel copy), forms >= EDGE_PAIRS_MIN pairs: moves the allocator emits after the VOPD plan
       (HRX-like E592: flash2_f16o 65 moves -> 31 pairs). A details report's move_causes.branch_edge is cited when present."""
@@ -1143,19 +1161,18 @@ def loom_candidates(name, ins, addr, rep):
                                     + (f" ({red})" if red else "") + f"; whole workgroups ({occ['wg']} lanes = {w} waves, "
                                     f"{st['q']} per SIMD{', bound: placement undocumented' if st['bound'] else ''}): {ours}; "
                                     f"contradicts {LOOM_TIER_DOC}"})
-    groups, seen = [], set()
-    for t, e in loops(ins, addr):                  # one copy group can end within 8 of two backward branches (pkg-e480 g_post_add_norm:
-        body = ins[t:e + 1]                        # loops ending at 756 and 758): counted once, by its first instruction
-        bb = backedge_block(body)
-        if not bb or t + bb[0] in seen:
+    groups = []
+    for t, e in loops(ins, addr):                  # each group ends right before its own branch, and a branch is no move, so two
+        body = ins[t:e + 1]                        # branches never share one (r1's dedupe is gone with backedge_block's 8-instruction window)
+        bb = edge_group(body)
+        if not bb:
             continue
-        seen.add(t + bb[0])
         pairs = vopd_pairs(body, *bb)[0]
         if pairs >= EDGE_PAIRS_MIN:
             groups.append((sum(copy_moves(x) for x in body[bb[0]:bb[1] + 1]), pairs, t + bb[0]))
     if groups:
         bc = [c for c in ((rep or {}).get("move_causes") or {}).get("causes") or [] if c.get("cause") == "branch_edge"]
-        ev = (f"report: branch_edge {bc[0].get('unit_count')} moves in {bc[0].get('packet_count')} packets" if bc else
+        ev = (f"report (kernel-wide, all branches): branch_edge {bc[0].get('unit_count')} moves in {bc[0].get('packet_count')} packets" if bc else
               "report: move causes not itemised (summary report; --compile-report=details itemises branch_edge)")
         out.append({"kind": "vopd-edge", "groups": [(m, p) for m, p, _ in groups],
                     "line": f"loomcand vopd-edge {name}: " + "; ".join(f"back-edge copy group at instruction {i}: {m} moves -> {p} "
@@ -1167,32 +1184,61 @@ def loom_candidates(name, ins, addr, rep):
 SHAPE_NOTES = ("reread", "addr64", "guardwait", "vopd", "ldsbank")   # the notes lint() sets per kernel (the rest need texts or peers)
 
 
-def provenance(lc, progs, roots):
-    """what compiled a code-object directory: the compiler (real path), its hrx-loom version, each program's sha256, the roots regex,
-    the target; written by compile_programs as OUT/loom-provenance, read by the SDK differential"""
+def sha256(path):
     import hashlib
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+OBJ_EXT = (".hsaco", ".json")    # what a compile writes per kernel (code object, compile report)
+
+
+def provenance(lc, progs, roots, objects):
+    """what compiled a code-object directory: the compiler (real path), its hrx-loom version, each program's sha256, the roots regex
+    and the sha256 of each object this compile wrote (OBJECTS: paths); written by compile_programs as OUT/loom-provenance, read by the
+    SDK differential (review F1: objects left from another compile must not take this one's provenance)"""
     import loom_suggest
-    return {"compiler": os.path.realpath(lc), "version": loom_suggest.version(lc), "roots": roots, "target": "amdgpu:gfx1151",
-            "programs": {os.path.basename(p): hashlib.sha256(open(p, "rb").read()).hexdigest() for p in progs}}
+    return {"compiler": os.path.realpath(lc), "version": loom_suggest.version(lc), "roots": roots,
+            "programs": {os.path.basename(p): sha256(p) for p in progs},
+            "objects": {os.path.basename(o): sha256(o) for o in objects}}
 
 
 def read_provenance(d):
-    """a directory's loom-provenance, or None (absent or unreadable)"""
+    """a directory's loom-provenance plus "path" and, when any *.hsaco / *.json in D is unlisted, changed or missing (an object from
+    another compile, a kernel that failed under this compiler keeping its old object, an edit), "unverified" naming the first ones;
+    None when absent or unreadable"""
     f = os.path.join(d, "loom-provenance") if d and os.path.isdir(d) else None
     try:
-        return json.load(open(f)) if f and os.path.exists(f) else None
+        p = json.load(open(f)) if f and os.path.exists(f) else None
     except (OSError, ValueError):
         return None
+    if not isinstance(p, dict):
+        return None
+    p["path"] = f
+    rec = p.get("objects")
+    if not isinstance(rec, dict):
+        p["unverified"] = "no object hashes"
+        return p
+    have = sorted(x for x in os.listdir(d) if x.endswith(OBJ_EXT))
+    bad = ([f"unlisted: {x}" for x in have if x not in rec] + [f"changed: {x}" for x in have if x in rec and sha256(os.path.join(d, x)) != rec[x]]
+           + [f"missing: {x}" for x in sorted(rec) if x not in have])
+    p["unverified"] = (", ".join(bad[:3]) + (f" (+{len(bad) - 3})" if len(bad) > 3 else "")) if bad else None
+    return p
 
 
 def sdk_diff(cur, base, pc, pb):
     """the SDK differential (C19; by hand so far: HRX-like E177 / E227): kernel -> row of two compiles of the same programs by two
     compilers (provenance pc / pb). Per kernel in both, the shapes (flags, the per-kernel notes SHAPE_NOTES, candidate kinds) that
     appear or disappear and regressions() each way; a kernel compiled by one side only. Fails closed: without both provenances, with
-    different programs, roots or targets, or with one compiler, one 'not attributable' line and nothing else."""
-    why = ("provenance missing" if not (pc and pb) else "programs differ" if pc.get("programs") != pb.get("programs") or not pc.get("programs")
-           else "roots or target differ" if (pc.get("roots"), pc.get("target")) != (pb.get("roots"), pb.get("target"))
-           else "one compiler" if pc.get("compiler") == pb.get("compiler") else None)
+    an object in either directory that its provenance does not list with the same sha256 (read_provenance's "unverified": review
+    F1), different programs or roots, one compiler (same path or same version) or an unknown version, one 'not attributable' line
+    and nothing else."""
+    unv = [f"{x.get('path', '?')}: {x['unverified']}" for x in (pc, pb) if x and x.get("unverified")]
+    known = lambda x: x.get("version") and x.get("version") != "version unknown"
+    why = ("provenance missing" if not (pc and pb) else f"objects not as recorded: {'; '.join(unv)}" if unv
+           else "programs differ" if pc.get("programs") != pb.get("programs") or not pc.get("programs")
+           else "roots differ" if pc.get("roots") != pb.get("roots")
+           else "one compiler" if pc.get("compiler") == pb.get("compiler") or pc.get("version") == pb.get("version")
+           else "compiler version unknown" if not (known(pc) and known(pb)) else None)
     if why:
         return [f"loomcand sdk: not attributable ({why}): an SDK differential needs both directories compiled by kernel_lint "
                 f"(--package / --program) from identical programs by two compilers"]
@@ -1211,9 +1257,9 @@ def sdk_diff(cur, base, pc, pb):
             n_same += 1
             continue
         out.append(f"loomcand sdk {k}: {vb} -> {vc}: " + " ".join([f"+{x}" for x in sorted(b - a)] + [f"-{x}" for x in sorted(a - b)])
-                   + (f" worse {','.join(worse)}" if worse else "") + (f" better {','.join(better)}" if better else "")
-                   + f"; programs {','.join(f'{p}:{h[:12]}' for p, h in sorted(pc['programs'].items()))}")
-    return out + [f"loomcand sdk: {vb} -> {vc}: {len(out)} kernel line(s), {n_same} kernel(s) with the same shapes"]
+                   + (f" worse {','.join(worse)}" if worse else "") + (f" better {','.join(better)}" if better else ""))
+    return out + [f"loomcand sdk: {vb} -> {vc}: {len(out)} kernel line(s), {n_same} kernel(s) with the same shapes; identical programs "
+                  f"and objects as recorded in {pb.get('path', '?')} and {pc.get('path', '?')}"]
 
 
 def lint_listing(name, ins, addr, res=(None, None)):
@@ -1941,10 +1987,13 @@ def compile_programs(progs, out, jobs, lc=None, roots=None):
         return k, r.returncode, r.stderr
     failed = []
     with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
-        for k, rc, err in ex.map(one, work):
+        results = list(ex.map(one, work))
+        for k, rc, err in results:
             if rc:
                 failed.append((k, (err.strip().split("\n") or [""])[0][:160]))
-    json.dump(provenance(lc, progs, roots), open(pv, "w"), indent=1)
+    done = [k for k, rc, _ in results if not rc]
+    objs = [f"{out}/{k}{x}" for k in done for x in OBJ_EXT if os.path.exists(f"{out}/{k}{x}")]
+    json.dump(provenance(lc, progs, roots, objs), open(pv, "w"), indent=1)
     return texts, failed
 
 

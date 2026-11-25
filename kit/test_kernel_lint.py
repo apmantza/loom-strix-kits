@@ -563,6 +563,10 @@ def loom_cands():
     c = one(kl.loom_candidates("g_mv_q4_k_k17408_t16_q8_r32", [], [], rep("mv_q4_k_k17408_t16_r32_e480_residency.json"))[0], "tier")
     ok(c and (c["report"], c["whole"]) == ((7, 8), (5, 9)) and "bound: placement undocumented" in c["line"],
        f"tier: a 544-lane matvec (17 waves) report 7 -> 8, whole workgroups 5 -> 9, marked bound (T1c) ({c and c['line']})")
+    c = one(kl.loom_candidates("g_attention_split", [], [], rep("attention_split_e480_residency.json"))[0], "tier")
+    ok(c and (c["report"], c["whole"]) == ((7, 8), (6, 8)) and "6 bound -> 8" in c["line"],
+       f"tier: live g_attention_split (192 lanes): report 7 -> 8, whole workgroups 6 -> 8: the next tiers agree and only the current "
+       f"tier differs, still a candidate (T-a, review B1; with the two k6144 matvecs and g16_attention_split_listed) ({c and c['line']})")
     cs, skip = kl.loom_candidates("g_gemm_f16_swiglu_m256", [], [], rep("gemm_f16_swiglu_m256_e480_residency.json"))
     ok(cs == [] and skip == [], f"tier: the swiglu m256 GEMM's report 4 -> 6 agrees: no candidate (N1) ({kinds(cs)}, {skip})")
     best = rep("gemm_f16_swiglu_m256_e480_residency.json")
@@ -606,15 +610,28 @@ def loom_cands():
     edge = lambda body, tail=(): one(kl.loom_candidates("x", *listing(loop_of(body, tail)), None)[0], "vopd-edge")
     c = edge([mv(k) for k in range(16)])
     ok(c and c["groups"] == [(16, 8)], f"vopd-edge: 16 independent copies at the back-edge, 8 pairs = EDGE_PAIRS_MIN: candidate ({c})")
-    two = loop_of([mv(k) for k in range(16)], ["s_nop 0"])
-    two.append(f"s_branch {(1 - (len(two) + 1)) & 0xFFFF}")          # a second backward branch 2 after the first (pkg-e480 g_post_add_norm)
-    c = one(kl.loom_candidates("x", *listing(two), None)[0], "vopd-edge")
-    ok(c and c["groups"] == [(16, 8)], f"vopd-edge: one copy group within 8 of two backward branches is one group, not two (fire "
-       f"11-25: g_post_add_norm's loops end at 756 and 758 after one 61-move group) ({c})")
+    # T-b, live g_post_add_norm (pkg-e480): loop 119..756 ends `61 moves; s_branch`, loop 343..758 ends `s_branch (756);
+    # s_and_not1_b64 exec; s_cbranch_scc1 343`: two loops of different starts whose old 8-instruction window reached one group
+    pan = ["s_mov_b32 s0, 0", "s_nop 0", "v_wmma_f32_16x16x16_f16 v[200:207], v[192:199], v[184:191], v[200:207]"] + [mv(k) for k in range(16)]
+    pan.append(f"s_branch {(2 - (len(pan) + 1)) & 0xFFFF}")             # inner back-edge to index 2
+    pan.append("s_and_not1_b64 exec, s[4:5], s[0:1]")
+    pan.append(f"s_cbranch_scc1 {(1 - (len(pan) + 1)) & 0xFFFF}")       # outer back-edge to index 1
+    c = one(kl.loom_candidates("x", *listing(pan), None)[0], "vopd-edge")
+    ok(c and c["groups"] == [(16, 8)], f"vopd-edge: g_post_add_norm's shape (loops of different starts, one copy group) prints the "
+       f"group once (T-b; fire 11-25 printed it twice) ({c})")
+    # F2 (review): vsplit's 'group' joined 64 moves, s_add_u32 + s_barrier, then 65 moves before s_branch: only the run ending at the
+    # branch is the edge-copy group (emitted contiguously before it, encoding.c:1719-1728)
+    bar = [mv(k) for k in range(16)] + ["s_add_u32 s85, s85, 1", "s_barrier"] + [f"v_mov_b32_e32 v{140 + k}, v{41 + k}" for k in range(18)]
+    c = edge(bar)
+    ok(c and c["groups"] == [(18, 9)], f"vopd-edge: moves before an s_barrier are not the edge group: 18 moves -> 9 pairs, not 34 -> 17 "
+       f"(F2, live vsplit 129 -> 64 becomes 65 -> 32) ({c})")
+    c = edge([mv(k) for k in range(16)] + ["s_delay_alu instid0(VALU_DEP_1)", "v_swap_b32 v180, v181", "s_nop 0"])
+    ok(c and c["groups"] == [(16, 8)], f"vopd-edge: s_delay_alu, s_nop and v_swap between the moves and the branch stay inside the group "
+       f"(flash2's 4 v_swap) ({c})")
     c = edge([mv(k) for k in range(14)])
     ok(c is None, f"vopd-edge: 14 copies, 7 pairs, under EDGE_PAIRS_MIN: none (N5a) ({c})")
-    c = edge([mv(k) for k in range(16)], ["s_nop 0"] * 9)
-    ok(c is None, f"vopd-edge: a copy run ending 10 instructions before the branch is not the edge group (N5b) ({c})")
+    c = edge([mv(k) for k in range(16)], ["s_add_u32 s0, s0, 1"])
+    ok(c is None, f"vopd-edge: a copy run followed by any other instruction before the branch is not the edge group (N5b) ({c})")
     chain = [mv(0)] + [f"v_mov_b32_e32 v{100 + k}, v{99 + k}" for k in range(1, 20)]
     c = edge(chain)
     ok(c is None, f"vopd-edge: a sequentialized copy chain (each move reads the previous one's destination): no pair (N5c) ({c})")
@@ -631,17 +648,21 @@ def loom_cands():
     g2 = kl.lint_listing("g_gemm_f16_store_m256", *fx("gemm_f16_store_m256_e480_loop.listing"))
     g3 = kl.lint_listing("g_gemm_f16_store_m256", *fx("gemm_f16_store_m256_v030_loop.listing"))
     prov = lambda v, path, sha="a" * 64: {"compiler": path, "version": f"hrx-loom {v}", "programs": {"llm.loom": sha},
-                                          "roots": None, "target": "amdgpu:gfx1151"}
+                                          "roots": None, "path": f"{path}-out/loom-provenance"}
     pa, pb = prov("0.2.0", "/v020/bin/loom-compile"), prov("0.3.0", "/v030/bin/loom-compile")
     lines = kl.sdk_diff({"g_gemm_f16_store_m256": g3}, {"g_gemm_f16_store_m256": g2}, pb, pa)
     hit = [x for x in lines if x.startswith("loomcand sdk g_gemm_f16_store_m256:")]
-    ok(len(hit) == 1 and "+addr64" in hit[0] and "hrx-loom 0.2.0 -> hrx-loom 0.3.0" in hit[0] and "loop209->249" in hit[0],
+    ok(len(hit) == 1 and "+addr64" in hit[0] and "hrx-loom 0.2.0 -> hrx-loom 0.3.0" in hit[0] and "loop209->249" in hit[0]
+       and "aaaaaaaa" not in hit[0] and "/v030/bin/loom-compile-out/loom-provenance" in lines[-1]
+       and "/v020/bin/loom-compile-out/loom-provenance" in lines[-1],
        f"sdk: addr64 appears in the m256 GEMM with only the compiler changed (T5) ({lines})")
     same = kl.sdk_diff({"k": g2}, {"k": dict(g2)}, pb, pa)
     ok(not [x for x in same if x.startswith("loomcand sdk k:")], f"sdk: equal shapes: no candidate (N6) ({same})")
     for what, a_, b_ in (("programs differ", prov("0.3.0", "/v030/bin/loom-compile", "b" * 64), pa),
                          ("provenance missing", pb, None), ("one compiler", pa, dict(pa)), ("roots differ", dict(pb, roots="^g_gemm"), pa),
-                         ("target differs", dict(pb, target="amdgpu:gfx1201"), pa)):
+                         ("one version at two paths", dict(pb, version="hrx-loom 0.2.0"), pa),
+                         ("version unknown", dict(pb, version="version unknown"), pa),
+                         ("objects not as recorded", dict(pb, unverified="unlisted: g_x.hsaco"), pa)):
         got = kl.sdk_diff({"g_gemm_f16_store_m256": g3}, {"g_gemm_f16_store_m256": g2}, a_, b_)
         ok(len(got) == 1 and got[0].startswith("loomcand sdk: not attributable"), f"sdk: {what}: not attributable, no per-kernel line (N6) ({got})")
     got = kl.sdk_diff({"a": g3, "new": g3}, {"a": g3, "old": g2}, pb, pa)
@@ -661,8 +682,13 @@ def loom_cands():
         kl.compile_programs([os.path.join(d, "missing.loom")], d, 1, lc="/bin/false")
     except OSError:
         pass
-    ok(not os.path.exists(os.path.join(d, "loom-provenance")), "provenance: a compile that dies half-way leaves none (no differential "
-       "on mixed objects)")
+    ok(not os.path.exists(os.path.join(d, "loom-provenance")), "provenance: a stale one is removed before compiling (M15)")
+    d = tempfile.mkdtemp(prefix="kl_prov.")
+    try:                                     # T-c (review B13): the programs read fine, the compiler cannot start: dies after the reads
+        kl.compile_programs([F("binary_gate.loom")], d, 1, lc=os.path.join(d, "no-such-loom-compile"))
+    except OSError:
+        pass
+    ok(not os.path.exists(os.path.join(d, "loom-provenance")), "provenance: a compile that dies half-way leaves none (T-c, B13)")
     # ---- N7: candidates never reach flags or notes (cand_lint calls lint_listing / lint)
     ok("loomcand" not in g2 and "loomcand" not in g3, "isolation: lint_listing rows carry no candidates (N7)")
 
@@ -745,6 +771,34 @@ def main():
         ok(pr.get("programs") == {"iq4_new.loom": hashlib.sha256(open(prog_iq4, "rb").read()).hexdigest()} and
            pr.get("compiler") == os.path.realpath(lc) and pr.get("version", "").startswith("hrx-loom "),
            f"provenance: compiler, version and program sha256 recorded beside the objects ({pr})")
+        # F1 (review prov/stale.sh): a compile into a directory that already holds another compile's objects, and a kernel that fails
+        # under the second compiler leaving its old object: neither may be attributed to the second compiler
+        two_loom = os.path.join(t, "two.loom")
+        for name, roots, comp in (("stale", "^g_deq16_iq4_nl$", lc), ("failed", None, os.path.join(t, "lc-fails-nl2"))):
+            dd = os.path.join(t, "f1-" + name)
+            subprocess.run([sys.executable, klp, "--program", two_loom, "--out", dd, "--loom-compile", lc], capture_output=True, text=True, timeout=600)
+            open(os.path.join(t, "lc-fails-nl2"), "w").write(f'#!/bin/sh\ncase "$*" in *"--root=g_deq16_iq4_nl2 "*) exit 1;; esac\nexec {lc} "$@"\n')
+            os.chmod(os.path.join(t, "lc-fails-nl2"), 0o755)
+            subprocess.run([sys.executable, klp, "--program", two_loom, "--out", dd, "--loom-compile", comp]
+                           + (["--roots", roots] if roots else []), capture_output=True, text=True, timeout=600)
+            pr = kl.read_provenance(dd) or {}
+            base = dict(pr, compiler="/other/loom-compile", version="hrx-loom 0.0.0", unverified=None)
+            row1 = kl.lint(os.path.join(dd, "g_deq16_iq4_nl.hsaco"))
+            got = kl.sdk_diff({"g_deq16_iq4_nl": row1}, {"g_deq16_iq4_nl": dict(row1)}, pr, base)
+            ok("g_deq16_iq4_nl2.hsaco" in (pr.get("unverified") or "") and len(got) == 1
+               and got[0].startswith("loomcand sdk: not attributable (objects not as recorded"),
+               f"provenance: {name}: g_deq16_iq4_nl2's object left from the first compile is not the second compiler's (F1) ({pr.get('unverified')}; {got})")
+        import shutil as sh_
+        for what, act in (("changed", lambda d_: open(os.path.join(d_, "g_deq16_iq4_nl.hsaco"), "ab").write(b"\0")),
+                          ("missing", lambda d_: os.remove(os.path.join(d_, "g_deq16_iq4_nl.json")))):
+            dd = os.path.join(t, "f1-" + what)
+            sh_.copytree(pv1, dd)
+            act(dd)
+            got = (kl.read_provenance(dd) or {}).get("unverified") or ""
+            ok(got.startswith(what + ":"), f"provenance: an object {what} after the compile is not as recorded (F1) ({got})")
+        pr = kl.read_provenance(pv1) or {}
+        ok(pr.get("unverified") is None and "g_deq16_iq4_nl.hsaco" in (pr.get("objects") or {}),
+           f"provenance: a clean compile lists its objects and verifies ({pr.get('unverified')}, {sorted(pr.get('objects') or {})})")
         dr = subprocess.run([sys.executable, klp, pv2, "--baseline", pv1, "--loom-candidates"], capture_output=True, text=True, timeout=300)
         ok(dr.returncode == 0 and "loomcand sdk: not attributable (one compiler" in dr.stdout and "loomcand sdk g_" not in dr.stdout,
            f"sdk through main: the same compiler twice is not attributable ({[x for x in dr.stdout.splitlines() if 'loomcand' in x]} {dr.stderr[-300:]})")
