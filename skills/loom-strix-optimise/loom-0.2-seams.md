@@ -46,6 +46,9 @@ and only an orientation swap for traversal (GEMM_N_FASTEST, gen_gemm.py:1344-134
 
 ## Upstream main only (since 0.2.0, 2026-11-16; dev identity now 0.3.0, #3469)
 
+Stale since 11-20: refresh at the 0.3.0 port (main adds a novel-kernel baseline built from measured primitives, command-program
+compile reports, `suggest --expand`, and 11-24 agent-workflow additions on workgroup traversal and shared-operand reuse distance).
+
 | PR | Date | What | Relevance |
 |---|---|---|---|
 | #3419 "Keep prefetched loads in their loop-carried registers" | 11-18 | load writes the carried register directly, no backedge `v_mov` + vmcnt wait; also lets a loop-invariant lane index's byte offset take over its live range. Credits our #3409. Notes "The divergent control-flow join reported in #3409 remains open." | GEMM back-edge vmcnt(0)+copy (2), flash2 prefetch (1). Highest-value upgrade item |
