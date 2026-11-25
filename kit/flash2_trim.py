@@ -55,7 +55,7 @@ def sx11(text):
 
 
 def sxh(text):
-    """FLASH2_SXH=1 (after sx11; HRX-like E456 / E462): the SX11 exchange's bytes viewed [waves][2 key blocks][2 halves][32 lanes][4]
+    """Part of FLASH2_SX11 (after sx11; HRX-like E456 / E462; the switch census 11-25 folded FLASH2_SXH=1 into SX11): the SX11 exchange's bytes viewed [waves][2 key blocks][2 halves][32 lanes][4]
     (elements 0-3 of every lane, then elements 4-7) instead of [waves][2][32 lanes][8]. With a 32-byte lane record each 128-bit access
     (served 8 lanes per pass over 32 banks x 4 B) puts lanes l and l + 4 on the same banks, so every exchange access is 2-way conflicted
     (q175: 8.18 % of flash2's LDS cycles, all of them here); a 16-byte pitch makes each access 512 contiguous bytes, conflict-free (q184:
@@ -67,13 +67,13 @@ def sxh(text):
     ld = re.compile(r"^( *)(%\w+) = vector\.load %sx_view\[%partner_id, (%c[01]), %lane, %c0\] : view<(\d+)x2x32x8xf32> -> vector<8xf32>$", re.M)
     views = vw.findall(text)
     if len(views) != 1:
-        raise SystemExit(f"FLASH2_SXH: {len(views)} SX11 exchange views (%sx_view of [w]x2x32x8xf32) in the kernel (want 1; needs FLASH2_SX11=1)")
+        raise SystemExit(f"FLASH2_SX11 sxh: {len(views)} SX11 exchange views (%sx_view of [w]x2x32x8xf32) in the kernel (want 1)")
     w = views[0][1]
     vh = f"view<{w}x2x2x32x4xf32>"
 
     def store(m):
         i, v, b, ww = m.groups()
-        assert ww == w, f"FLASH2_SXH: store on view<{ww}x...> but %sx_view is view<{w}x...>"
+        assert ww == w, f"FLASH2_SX11 sxh: store on view<{ww}x...> but %sx_view is view<{w}x...>"
         return (f"{i}{v}_sxa = vector.slice {v}[0] : vector<8xf32> -> vector<4xf32>\n"
                 f"{i}{v}_sxb = vector.slice {v}[4] : vector<8xf32> -> vector<4xf32>\n"
                 f"{i}vector.store {v}_sxa, %sxh_view[%wave, {b}, %c0, %lane, %c0] : vector<4xf32>, {vh}\n"
@@ -81,7 +81,7 @@ def sxh(text):
 
     def load(m):
         i, v, b, ww = m.groups()
-        assert ww == w, f"FLASH2_SXH: load on view<{ww}x...> but %sx_view is view<{w}x...>"
+        assert ww == w, f"FLASH2_SX11 sxh: load on view<{ww}x...> but %sx_view is view<{w}x...>"
         return (f"{i}{v}_sxa = vector.load %sxh_view[%partner_id, {b}, %c0, %lane, %c0] : {vh} -> vector<4xf32>\n"
                 f"{i}{v}_sxb = vector.load %sxh_view[%partner_id, {b}, %c1, %lane, %c0] : {vh} -> vector<4xf32>\n"
                 f"{i}{v} = vector.concat<0> {v}_sxa, {v}_sxb : vector<4xf32>, vector<4xf32> -> vector<8xf32>")
@@ -91,7 +91,7 @@ def sxh(text):
     text, nl = ld.subn(load, text)
     left = text.count("%sx_view[")
     if ns != nl or ns not in (2, 4) or left:
-        raise SystemExit(f"FLASH2_SXH: {ns} exchange stores / {nl} loads rewritten, {left} accesses left on %sx_view "
+        raise SystemExit(f"FLASH2_SX11 sxh: {ns} exchange stores / {nl} loads rewritten, {left} accesses left on %sx_view "
                          "(want 2 / 2 (vsplit) or 4 / 4 (flash2), 0 left)")
     return text
 
