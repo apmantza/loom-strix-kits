@@ -12,6 +12,10 @@ arch=${DEVICE_ARCH:-$( (rocminfo 2>/dev/null | grep -o -m1 'gfx[1-9][0-9a-f]*' |
 echo "device arch: ${arch:-unknown}"
 "$bin/python" "$here/ktest_select.py" "$pkg/program/llm.loom" cases.loom-test cases_used.loom-test "$arch" || { echo "FAIL select: ktest_select.py failed, no cases run"; exit 1; }
 cat "$pkg/program/llm.loom" cases_used.loom-test > combined.loom
+# The cases' reference kernels sit past the package's ~160k lines, so their encodings lie beyond hrx-loom's 16-bit SSA
+# encoding ids (ENCODING/004 on every such view; HRX-like E609, q205): reorder the combined file as build.py does the package.
+"$bin/python" -c 'import sys; sys.path.insert(0, sys.argv[1]); import dual_target as d; p = sys.argv[2]; t = open(p).read(); o = d.encodings_first(t); o != t and open(p, "w").write(o)' "$here" combined.loom \
+  || { echo "FAIL encodings: dual_target.encodings_first refused combined.loom, no cases run"; exit 1; }
 "$bin/loom-test" combined.loom --device=${DEVICE:-amdgpu} > out.json 2> err.txt
 grep -v '^{"format' err.txt | head -20
 "$bin/python" - <<'PY'
