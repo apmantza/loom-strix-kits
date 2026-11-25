@@ -1,13 +1,14 @@
 #!/bin/bash
 # Build a package with a kit's recipe (kits/<kit>/kit.env) plus optional extra switches; the exact command goes to PKG.cmd.
-# usage: [EXTRA="SWITCH=1 ..."] [LINT_BASE=PKG [LINT_ALLOW="REGEX ..."] [LINT_ACCEPT="REGEX ..."]] build.sh KIT PKG
+# usage: [EXTRA="SWITCH=1 ..."] [LINT_BASE=PKG [LINT_ALLOW="REGEX ..."] [LINT_ACCEPT="KERNEL:KIND:FROM->TO,..."]] build.sh KIT PKG
 # Refuses while one of our measurement servers runs: a CPU build beside a measurement skews it (Strix Halo: CPU and GPU
 # share one DRAM bus; a build beside a profile moved GEMM time 123 -> 131 s).
 # LINT_BASE=PKG: a candidate lints itself after the build (common/cand_lint.py check: binary_gate against PKG, then kernel_lint's
 # prefetch and spill checks on the kernels the gate reports changed; report in PKG.lint.txt, code objects and rows in PKG.lint/).
 # HRX-like E520: STAGE_LIVE x FLATADDR drained flash2's V prefetch and took three hand-built pair packages to find; `cand_lint.py
 # pairs` builds the pairs. LINT_ALLOW: the switch's kernel patterns (binary_gate --allow); without it binary_gate's untouched-kernel
-# verdict is printed, not judged. LINT_ACCEPT: kernels whose loss a ledger row accepted (cand_lint --accept; cite the row).
+# verdict is printed, not judged. LINT_ACCEPT: comma-separated exact pins of losses a ledger row accepted (cand_lint --accept;
+# cite the row); a malformed pin makes the lint exit 2, i.e. a FAIL verdict.
 # Exit codes: 0 built (and, with LINT_BASE, lint passed); 3 = a COMPLETE but REJECTED package: the build succeeded and the lint
 # failed, so PKG/model.json exists. The verdict is PKG/cand_lint.verdict, one line starting "CAND_LINT: PASS", "CAND_LINT: FAIL" or
 # "CAND_LINT: NOT RUN" (no LINT_BASE). A resume idiom that skips the build when PKG/model.json exists must also require
@@ -31,7 +32,7 @@ rc=$?; grep -E "serve with|workspace" "$P.log" | tail -1; echo "build exit $rc (
 V=$P/cand_lint.verdict
 [ -n "${LINT_BASE:-}" ] || { echo "CAND_LINT: NOT RUN (no LINT_BASE)" > "$V"; echo "post-build lint not run (no LINT_BASE)"; exit 0; }
 allow=(); for x in ${LINT_ALLOW:-}; do allow+=(--allow "$x"); done
-for x in ${LINT_ACCEPT:-}; do allow+=(--accept "$x"); done
+[ -n "${LINT_ACCEPT:-}" ] && allow+=(--accept "$LINT_ACCEPT")
 python3 "$LSK/common/cand_lint.py" check "$LINT_BASE" "$P" --out "$P.lint" --jobs "${LINT_JOBS:-2}" "${allow[@]}" > "$P.lint.txt" 2>&1
 lr=$?; grep -E "^  (FAIL|NEW|ok|ACCEPTED|text) |^CAND_LINT" "$P.lint.txt"
 if [ $lr -eq 0 ] && grep -q '^CAND_LINT: PASS' "$P.lint.txt"; then echo "CAND_LINT: PASS against $LINT_BASE ($P.lint.txt)" > "$V"; exit 0; fi

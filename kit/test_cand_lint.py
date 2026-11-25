@@ -9,8 +9,12 @@ binary_gate-shaped rows. Recurrences it prevents:
   - a gate that could not establish the changed set (a kernel that did not compile: binary_gate ERROR) passing: fail closed;
   - review r1 F2: a loss with any other shape passing (the wait one WMMA later, a partial vmcnt(N) wait, the load sunk past the
     WMMAs): every loss of the base's prefetch fails; a new spill or new scratch fails without --allow (F2b);
-  - E521: a kernel_lint 'cov' drop alone (instructions, no lost MMA cover) is printed, not failed; a loss a ledger row accepted
-    passes only through --accept, and a stale --accept fails;
+  - E521: a kernel_lint 'cov' drop alone (instructions, no lost MMA cover) is printed, not failed;
+  - verify r2 V1: a waiver wider than the accepted loss ('--accept flash2' passed E520's whole clash): a pin passes a kernel only
+    when the pins equal its loss set, every pin must match, malformed pins are refused (the state table in HANDOFF r3);
+  - verify r2 V2: an already-exposed load decaying further with the exposed count unchanged ([3, 4] -> [0, 4]);
+  - verify r2 V6: the cover walk not following a load across the back-edge, or stopping before a deep pipeline's wait;
+  - verify r2 V13: a NEW kernel with scratch passing;
   - binary_gate's own failures not judged with --allow (R6); pairs taking a failed build or a missing verdict as built (R8, F8);
   - the pairwise mode naming a pair whose failure a single switch already explains, or missing the pair: the first failing set is
     the smallest one none of whose subsets fails.
@@ -60,6 +64,27 @@ LOSSES = {
     "load moved after the WMMAs": [WMMA] * 4 + [LOAD, "s_waitcnt vmcnt(0)", "v_mov_b32 v50, v40"],
 }
 SPILL = [LOAD, "scratch_load_b128 v[60:63], off, s0 offset:16"] + [WMMA] * 4 + ["s_waitcnt vmcnt(0)", "v_mov_b32 v50, v40"]
+# verify r2 V6: the next tile's load is issued late in the iteration and retired after the next iteration's first WMMA (cover
+# 2 + 1 = 3: only a walk across the back-edge sees the 1); DEEP: retired two iterations later by vmcnt(2) (cover 2 + 2 + 2 = 6)
+BACKEDGE = [WMMA, "s_waitcnt vmcnt(0)", "v_mov_b32 v50, v40", WMMA, LOAD, WMMA, WMMA]
+DEEP = [LOAD, WMMA, WMMA, "s_waitcnt vmcnt(2)", "v_mov_b32 v50, v40"]
+
+# the gate's state table (HANDOFF r3): a base kernel row and one candidate per loss kind, with the loss it must report
+BASE = {"pf": "kept", "covers": [0, 4, 4], "loop_mm": 4, "scratch": 0, "cover_min": 5, "in_flight": 0}
+KINDS = {
+    "pf": (dict(BASE, pf="drain"), {}, {("pf", "kept", "drain")}),
+    "pf '-'": (dict(BASE, pf="-"), {}, {("pf", "kept", "none")}),
+    "exposed": (dict(BASE, covers=[0, 0, 4]), {}, {("exposed", "1", "2")}),
+    "cover rank": (dict(BASE, covers=[0, 4]), {"covers": [3, 4]}, {("cover0", "3", "0")}),     # verify r2 V2
+    "loads": (dict(BASE, covers=[0, 4, 4, 4]), {}, {("loads", "3", "4")}),
+    "mma": (dict(BASE, loop_mm=8), {}, {("mma", "4", "8")}),
+    "lost loop": (dict(BASE, covers=None, loop_mm=None), {}, {("mma", "4", "none")}),
+    "spill": (dict(BASE, scratch=2), {}, {("spill", "0", "2")}),
+}
+
+
+def pin(k, ls):
+    return cl.parse_pins([",".join(f"{k}:{a}:{x}->{y}" for a, x, y in sorted(ls))])
 
 
 
@@ -73,7 +98,7 @@ def main():
     ok(kept["pf"] == "kept" and drain["pf"] == "drain", f"the synthetic listings read pf kept / drain ({kept['pf']}, {drain['pf']})")
 
     lines, f = cl.judge([gate_row("k", "CHANGED")], {"k": kept}, {"k": drain})
-    ok(any("pf kept -> drain" in x for x in f), f"E520: a CHANGED kernel whose prefetch drains against the base fails ({f})")
+    ok(any("pf kept->drain" in x for x in f), f"E520: a CHANGED kernel whose prefetch drains against the base fails ({f})")
     lines, f = cl.judge([gate_row("k", "CHANGED")], {"k": kept}, {"k": kept})
     ok(f == [] and any("ok" in x for x in lines), f"a CHANGED kernel that keeps its prefetch passes ({f})")
     lines, f = cl.judge([gate_row("k", "CHANGED")], {"k": drain}, {"k": drain})
@@ -94,7 +119,7 @@ def main():
     lines, f = cl.judge([gate_row("e", "ERROR", ["did not compile: x"])], {}, {})
     ok(len(f) == 1 and "unknown" in f[0], f"a binary_gate ERROR (the changed set is unknown) fails closed ({f})")
     lines, f = cl.judge([gate_row("n", "NEW")], {}, {"n": drain})
-    ok(f == [] and any("NEW" in x and "not judged" in x for x in lines), f"a NEW kernel has no base: printed, not judged ({lines})")
+    ok(f == [] and any("NEW" in x and "only scratch judged" in x for x in lines), f"a NEW kernel has no base: printed, not judged ({lines})")
 
     for n, body in LOSSES.items():
         c = row("k", body)
@@ -103,19 +128,58 @@ def main():
     nocov = lambda r: dict(r, covers=None, loop_mm=None)   # the exposure rule silent: pf alone must decide
     for pf in ("drain", "-"):
         f = cl.losses(gate_row("k", "CHANGED"), nocov(kept), dict(nocov(kept), pf=pf))
-        ok(any("pf kept -> " + pf in x for x in f), f"review F2: pf kept -> {pf} fails on its own ({f})")
+        ok(("pf", "kept", {"-": "none"}.get(pf, pf)) in f, f"review F2: pf kept -> {pf} fails on its own ({f})")
     lines, f = cl.judge([gate_row("k", "CHANGED")], {"k": kept}, {"k": row("k", SPILL)})
     ok(any("spill" in x for x in f), f"review F2b: a new spill in the hot loop fails without --allow ({f})")
     g = dict(gate_row("k", "CHANGED"), base={"scratch": 0}, cand={"scratch": 64})
     lines, f = cl.judge([g], {"k": kept}, {"k": kept})
-    ok(any("new scratch 64" in x for x in f), f"review F2b: binary_gate's new scratch fails without --allow ({f})")
+    ok(any("scratch 0->64" in x for x in f), f"review F2b: binary_gate's new scratch fails without --allow ({f})")
     g = dict(gate_row("k", "CHANGED"), base={"scratch": 64}, cand={"scratch": 64})
     ok(cl.judge([g], {"k": kept}, {"k": kept})[1] == [], "scratch the base already had is not the candidate's")
 
-    lines, f = cl.judge([gate_row("k", "CHANGED")], {"k": kept}, {"k": drain}, accept=["^k$"])
-    ok(f == [] and any(x.strip().startswith("ACCEPTED") for x in lines), f"E521: --accept passes a ledger-accepted loss, printed ({f}; {lines})")
-    lines, f = cl.judge([gate_row("k", "CHANGED")], {"k": kept}, {"k": kept}, accept=["^k$"])
-    ok(len(f) == 1 and "matched no kernel" in f[0], f"a stale --accept (no loss to waive) fails ({f})")
+    ok(row("k", BACKEDGE)["covers"] == [3], f"V6: a load retired in the next iteration counts that iteration's MMAs "
+       f"({row('k', BACKEDGE)['covers']})")
+    ok(row("k", DEEP)["covers"] == [6], f"V6: a load retired two iterations later by vmcnt(2) gets its full cover ({row('k', DEEP)['covers']})")
+
+    # the state table: rows = loss kinds, columns = no pin / exact pin / pin for another loss / pin matching nothing
+    other = {("spill", "0", "9")}
+    for name, (c, bx, want) in KINDS.items():
+        b = dict(BASE, **bx)
+        got = set(cl.losses(gate_row("k", "CHANGED"), b, c))
+        ok(got == want, f"state table {name}: the loss is {want} ({got})")
+        run = lambda pins: cl.judge([gate_row("k", "CHANGED"), gate_row("z", "CHANGED")], {"k": b, "z": BASE}, {"k": c, "z": BASE}, pins)[1]
+        ok(run(None) != [], f"state table {name} x no pin: FAIL")
+        ok(run(pin("k", want)) == [], f"state table {name} x exact pin: PASS ({run(pin('k', want))})")
+        ok(run(pin("k", other)) != [], f"state table {name} x pin for another loss: FAIL")
+        ok(run(pin("k", want | other)) != [], f"state table {name} x its pin plus another: FAIL")
+        ok(run({**pin("k", want), **pin("z", want)}) != [], f"state table {name} x a pin matching nothing (kernel z, no loss): FAIL")
+    g = dict(gate_row("k", "CHANGED"), base={"scratch": 0}, cand={"scratch": 64})
+    ok(cl.judge([g], {"k": BASE}, {"k": BASE}, pin("k", {("scratch", "0", "64")}))[1] == [], "state table scratch x exact pin: PASS")
+    ok(cl.judge([g], {"k": BASE}, {"k": BASE}, pin("k", {("scratch", "0", "32")}))[1] != [], "state table scratch x another value: FAIL")
+    n = dict(gate_row("n", "NEW"), cand={"scratch": 64})
+    ok(any("scratch new->64" in x for x in cl.judge([n], {}, {"n": BASE})[1]), "V13: a NEW kernel with scratch fails")
+    ok(cl.judge([n], {}, {"n": BASE}, pin("n", {("scratch", "new", "64")}))[1] == [], "state table NEW scratch x exact pin: PASS")
+    ok(cl.judge([dict(gate_row("n", "NEW"), cand={"scratch": 0})], {}, {"n": BASE})[1] == [], "a NEW kernel without scratch: not judged")
+    two = dict(BASE, pf="drain", covers=[0, 0, 4])
+    both = {("pf", "kept", "drain"), ("exposed", "1", "2")}
+    ok(cl.judge([gate_row("k", "CHANGED")], {"k": BASE}, {"k": two}, pin("k", {("exposed", "1", "2")}))[1] != [],
+       "V1: two losses, one pinned (E520's clash with E521's pin): FAIL")
+    ok(cl.judge([gate_row("k", "CHANGED")], {"k": BASE}, {"k": two}, pin("k", both))[1] == [], "two losses, both pinned: PASS")
+    ok(cl.judge([gate_row("k", "CHANGED")], {"k": BASE}, {"k": dict(BASE, covers=[0, 0, 0])}, pin("k", {("exposed", "1", "2")}))[1] != [],
+       "a pin of exposed 1->2 does not pass exposed 1->3")
+    ok(any("PINNED" in x for x in cl.judge([gate_row("k", "CHANGED")], {"k": BASE}, {"k": two}, pin("k", both))[0]), "a pinned kernel is printed PINNED")
+    for bad in (".", "flash2", "^g_attention_flash2_partial(_f16o)?$", "k:exposed:1", "k:foo:1->2", "k.*:exposed:1->3", "k:exposed:1->3 x"):
+        try:
+            cl.parse_pins([bad])
+            ok(False, f"V1: malformed pin {bad!r} refused")
+        except ValueError:
+            ok(True, f"V1: malformed pin {bad!r} refused")
+    import subprocess
+    r = subprocess.run([sys.executable, os.path.join(HERE, "..", "common", "cand_lint.py"), "check", "/nonexistent/a", "/nonexistent/b",
+                        "--out", os.devnull, "--accept", "."], capture_output=True, text=True)
+    ok(r.returncode == 2 and "malformed pin" in r.stderr, f"V1: the CLI refuses a malformed pin before the gate runs, exit 2 ({r.returncode})")
+    ok(cl.parse_pins(["a:exposed:1->3,b:pf:kept->drain"]) == {"a": {("exposed", "1", "3")}, "b": {("pf", "kept", "drain")}},
+       "pins are comma-separated")
     lines, f = cl.judge([gate_row("t", "text-only")], {}, {})
     ok(f == [] and any("text" in x and " t:" in x for x in lines), f"review F3: a text-only kernel is printed (nothing to lint) ({lines})")
 

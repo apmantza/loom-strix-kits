@@ -175,11 +175,21 @@ def check_declared(new_cases, declared, defined):
         raise SystemExit(f"make_kernel_tests: kt_section({sorted(declared)}) also tests {sorted(extra)}: add them to its declaration")
 
 
+def cmd_sha(pkg):
+    """sha256 of PKG.cmd, None without one (the digest common/cand_lint.py cmd_sha stores in verdict.json)"""
+    import hashlib
+    try:
+        with open(os.path.realpath(pkg) + ".cmd", "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def changed_kernels(path, cand=None, base=None):
     """the kernels binary_gate's rows (a --json file) report CHANGED, NEW or text-only; ValueError when the changed set is unknown.
     CAND / BASE (package dirs): the gate must have been run for them: verdict.json beside the rows (common/cand_lint.py check)
     names its base and cand, and each given one must be the same directory (review F5: a copied path selected another package's
-    kernels)."""
+    kernels); the cand's .cmd must hash as it did when the gate ran (verify r2: a gate dir outside PKG.lint outlived a rebuild)."""
     import json
     try:
         with open(path) as fh:
@@ -202,6 +212,8 @@ def changed_kernels(path, cand=None, base=None):
         for side, want in (("cand", cand), ("base", base)):
             if want is not None and os.path.realpath(ids[side]) != os.path.realpath(want):
                 raise ValueError(f"{path} was made for {side} {ids[side]}, not {want}")
+        if cand is not None and (v.get("cand_cmd_sha") is None or v.get("cand_cmd_sha") != cmd_sha(cand)):
+            raise ValueError(f"{path} was made for another build of {cand} (its .cmd changed since, or no .cmd)")
     return sorted(r["kernel"] for r in rows if r["verdict"] in SELECTED_VERDICTS)
 
 

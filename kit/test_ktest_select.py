@@ -86,6 +86,10 @@ class Select(unittest.TestCase):
         self.assertEqual(ks.kernel_of("ktm_plane_g_attention_flash2_partial", PKG), ("copy", "g_attention_flash2_partial"))
         self.assertEqual(ks.kernel_of("ktz_newtag_g_attention_flash2", PKG), ("copy", "g_attention_flash2"))   # a prefix nobody listed
         self.assertEqual(ks.kernel_of("kt_fa_poke", PKG), ("helper", None))
+        # verify r2 V8: when one package kernel's name is a '_'-suffix of another's, a copy maps to the longest
+        pair = PKG | {"attention_flash2_partial"}
+        self.assertEqual(ks.kernel_of("ktn_g_attention_flash2_partial", pair), ("copy", "g_attention_flash2_partial"))
+        self.assertEqual(ks.kernel_of("ktn_x_attention_flash2_partial", pair), ("copy", "attention_flash2_partial"))
         self.assertEqual(ks.kernel_of("g_attention_flash2", PKG), ("pkg", "g_attention_flash2"))
 
     def test_unknown_launch_kept(self):   # fail closed: a launched name nothing places keeps its case
@@ -156,12 +160,30 @@ class Changed(unittest.TestCase):
         json.dump(rows(("b", "CHANGED")), open(p, "w"))
         with self.assertRaises(ValueError):
             ks.changed_kernels(p, cand="/w/pkg-x")                        # no verdict.json: identity unknown
-        json.dump({"base": "/w/pkg-e480", "cand": "/w/pkg-x"}, open(os.path.join(d, "verdict.json"), "w"))
-        self.assertEqual(ks.changed_kernels(p, cand="/w/pkg-x", base="/w/pkg-e480"), ["b"])
+        x, y = os.path.join(d, "pkg-x"), os.path.join(d, "pkg-y")
+        for q in (x, y):
+            with open(q + ".cmd", "w") as fh:
+                fh.write("env A=1 kit/build.py c " + q + "\n")
+        with open(os.path.join(d, "verdict.json"), "w") as fh:
+            json.dump({"base": "/w/pkg-e480", "cand": x, "cand_cmd_sha": ks.cmd_sha(x)}, fh)
+        self.assertEqual(ks.changed_kernels(p, cand=x, base="/w/pkg-e480"), ["b"])
+        with open(os.path.join(d, "verdict.json"), "w") as fh:          # a gate dir written before the hash existed (r2)
+            json.dump({"base": "/w/pkg-e480", "cand": x}, fh)
         with self.assertRaises(ValueError):
-            ks.changed_kernels(p, cand="/w/pkg-y")
+            ks.changed_kernels(p, cand=x)
+        with open(os.path.join(d, "verdict.json"), "w") as fh:
+            json.dump({"base": "/w/pkg-e480", "cand": x, "cand_cmd_sha": ks.cmd_sha(x)}, fh)
         with self.assertRaises(ValueError):
-            ks.changed_kernels(p, cand="/w/pkg-x", base="/w/pkg-other")
+            ks.changed_kernels(p, cand=y)
+        with self.assertRaises(ValueError):
+            ks.changed_kernels(p, cand=x, base="/w/pkg-other")
+        with open(x + ".cmd", "a") as fh:                              # verify r2: PKG rebuilt with other switches
+            fh.write("env B=1 kit/build.py c " + x + "\n")
+        with self.assertRaises(ValueError):
+            ks.changed_kernels(p, cand=x)
+        os.remove(x + ".cmd")
+        with self.assertRaises(ValueError):                             # no .cmd: identity unknown
+            ks.changed_kernels(p, cand=x)
 
     def test_nothing_changed_is_empty_not_unknown(self):   # the smoke set alone then runs
         self.assertEqual(ks.changed_kernels(self.write(rows(("a", "same"), ("b", "MISSING")))), [])
