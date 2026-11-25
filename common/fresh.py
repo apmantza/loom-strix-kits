@@ -16,15 +16,18 @@ that are new or removed against the cached snapshot of the same version (or, on 
 and between the installed and the next venv. Loom 0.2.0 shipped an LDS race sanitizer and a one-function profiling filter
 that went unused here until a survey found them (HRX-like E530). The diff sees help text only: an option accepted but not
 listed (loom-compile 0.2.0 accepts `--sanitizer=race` while its help lists access / value / operation) is invisible to it;
-changed description lines are counted per tool.
+changed help lines are printed (capped per change; one block for the same change in several tools). A tool whose help
+fails keeps its last good snapshot of that version, so a failed run never reads as removed flags.
 usage: fresh.py KIT [--venv DIR] [--venv-next DIR] [--hrx-system CHECKOUT] [--surface-cache DIR]"""
 import argparse
 import concurrent.futures
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -79,26 +82,41 @@ def installed_version(venv):
 
 TOOL = re.compile(r"^(loom-|iree-|amdf-)")
 FLAG = re.compile(r"(?<![\w-])(--[A-Za-z0-9][-A-Za-z0-9_.]*)")
-SUBCOMMANDS = re.compile(r"^usage: \S+ .*?\{([\w,-]+)\}", re.M)   # argparse's `{show,diff,suggest}`
+USAGE = re.compile(r"^usage: .*?(?=\n\s*\n|\Z)", re.S | re.M)   # the usage block, however argparse wrapped it
+SUBCOMMANDS = re.compile(r"\{([\w,-]+)\}(?=\s+\.\.\.)")              # argparse's `{show,diff,suggest} ...`, not an option's choices
+HELP_TIMEOUT = 15   # seconds per help mode
+SHOW_LINES = 8      # changed help lines printed per change group
+# argparse wraps help to the caller's COLUMNS (a narrow terminal changed every line and hid the subcommands): fix the width
+# and the locale so a run from a shell and one from a script see the same text
+CHILD_ENV = {"COLUMNS": "80", "LC_ALL": "C", "LANG": "C"}
 
 
-def help_text(argv, timeout=15):
+def help_text(argv):
     """(mode, text, error) for one tool: --help=all, else --help; error is None when one of them exits 0"""
     err = None
     for mode in ("--help=all", "--help"):
-        try:
-            r = subprocess.run(argv + [mode], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout)
-        except (OSError, subprocess.SubprocessError) as e:
+        try:   # own session: a timeout kills the tool's whole process group, not only the child
+            p = subprocess.Popen(argv + [mode], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                 text=True, env={**os.environ, **CHILD_ENV}, start_new_session=True)
+        except OSError as e:
             err = f"{mode}: {e}"
             continue
-        if r.returncode == 0:
-            return mode, r.stdout + r.stderr, None
-        err = f"{mode}: exit {r.returncode}: {((r.stderr or r.stdout).strip().splitlines() or [''])[0][:120]}"
+        try:
+            out, eout = p.communicate(timeout=HELP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.communicate()
+            err = f"{mode}: timed out after {HELP_TIMEOUT} s"
+            continue
+        if p.returncode == 0:
+            return mode, out + eout, None
+        err = f"{mode}: exit {p.returncode}: {((eout or out).strip().splitlines() or [''])[0][:120]}"
     return None, "", err
 
 
 def snapshot(bin_dir, version, hrx=None):
-    """{version, tools: {name: {mode, flags, lines, error}}, workflows: [...] | None, workflows_note} for one venv's bin/"""
+    """{version, tools: {name: {mode, flags, lines, error}}, workflows: [...] | None, workflows_note} for one venv's bin/;
+    a subcommand's name is 'TOOL SUB'"""
     names = sorted(n for n in os.listdir(bin_dir) if TOOL.match(n) and os.access(os.path.join(bin_dir, n), os.X_OK))
     tools = {}
 
@@ -109,7 +127,7 @@ def snapshot(bin_dir, version, hrx=None):
 
     with concurrent.futures.ThreadPoolExecutor(8) as ex:
         texts = dict(zip(names, ex.map(lambda n: one([os.path.join(bin_dir, n)], n), names)))
-        subs = [(n, s) for n in names for m in SUBCOMMANDS.findall(texts[n])[:1] for s in m.split(",")]
+        subs = [(n, s) for n in names for u in USAGE.findall(texts[n])[:1] for m in SUBCOMMANDS.findall(u)[:1] for s in m.split(",")]
         list(ex.map(lambda ns: one([os.path.join(bin_dir, ns[0]), ns[1]], f"{ns[0]} {ns[1]}"), subs))
     wf, note = None, "not checked (no hrx-system checkout given)"
     if hrx:
@@ -123,21 +141,31 @@ def snapshot(bin_dir, version, hrx=None):
 
 
 def surface_diff(old, new):
-    """lines naming new / removed binaries, flags, workflows, and changed help lines, old -> new"""
-    out = []
+    """lines naming new / removed binaries, subcommands, flags, workflows and changed help lines, old -> new. A tool whose
+    help failed on either side gets only its transition line: an empty failed run is not a list of removed flags."""
+    out, changes = [], {}
     ot, nt = old["tools"], new["tools"]
-    out += [f"+ binary {t}" for t in nt if t not in ot] + [f"- binary {t}" for t in ot if t not in nt]
+    kind = lambda t: "subcommand" if " " in t else "binary"   # noqa: E731
+    out += [f"+ {kind(t)} {t}" for t in nt if t not in ot] + [f"- {kind(t)} {t}" for t in ot if t not in nt]
     for t in nt:
         if t not in ot:
+            continue
+        if ot[t]["error"] or nt[t]["error"]:
+            if bool(ot[t]["error"]) != bool(nt[t]["error"]):
+                out.append(f"{t}: help {'now fails: ' + nt[t]['error'] if nt[t]['error'] else 'works again (flags not diffed against the failed run)'}")
             continue
         a, b = set(ot[t]["flags"]), set(nt[t]["flags"])
         if b - a or a - b:
             out.append(f"{t}: " + "; ".join(x for x in (" ".join("+" + f for f in sorted(b - a)), " ".join("-" + f for f in sorted(a - b))) if x))
         la, lb = set(ot[t]["lines"]), set(nt[t]["lines"])
-        if la != lb:
-            out.append(f"{t}: help text +{len(lb - la)} / -{len(la - lb)} lines")
-        if bool(ot[t]["error"]) != bool(nt[t]["error"]):
-            out.append(f"{t}: help {'now fails: ' + nt[t]['error'] if nt[t]['error'] else 'works again'}")
+        rem = tuple(dict.fromkeys(x for x in ot[t]["lines"] if x not in lb))
+        add = tuple(dict.fromkeys(x for x in nt[t]["lines"] if x not in la))
+        if rem or add:
+            changes.setdefault((rem, add), []).append(t)
+    for (rem, add), ts in changes.items():   # one block per distinct change: 0.3.0's parameter_mode text changed in 8 tools
+        out.append(f"{', '.join(ts)}: help text +{len(add)} / -{len(rem)} lines")
+        shown = [f"  - {x}" for x in rem] + [f"  + {x}" for x in add]
+        out += shown[:SHOW_LINES] + ([f"  (+{len(shown) - SHOW_LINES} more)"] if len(shown) > SHOW_LINES else [])
     if old["workflows"] is not None and new["workflows"] is not None:
         a, b = set(old["workflows"]), set(new["workflows"])
         out += [f"+ workflow {w}" for w in sorted(b - a)] + [f"- workflow {w}" for w in sorted(a - b)]
@@ -150,7 +178,13 @@ def default_cache():
 
 
 def vkey(v):
-    return tuple(int(x) if x.isdigit() else -1 for x in re.split(r"[.+-]", v))
+    """numeric release order, a dev / alpha / beta / rc build before its release and a post release after it"""
+    m = re.match(r"(\d+(?:\.\d+)*)(.*)", v)
+    if not m:
+        return ((), 0, v)
+    rel = tuple(int(x) for x in m.group(1).split("."))
+    suf = m.group(2).lstrip(".-_+")
+    return (rel, 2 if suf.startswith("post") else 1 if not suf else 0, suf)
 
 
 def surface(venvs, cache, hrx=None):
@@ -169,7 +203,6 @@ def surface(venvs, cache, hrx=None):
                 lines.append(f"LOOM SURFACE: {label} {venv}: hrx-loom version unknown, not snapshotted")
                 continue
             snap = snapshot(os.path.join(venv, "bin"), ver, hrx)
-            snaps.append((label, snap))
             for t, x in snap["tools"].items():
                 if x["error"]:
                     lines.append(f"LOOM SURFACE: {ver} {t}: help failed ({x['error']})")
@@ -183,12 +216,17 @@ def surface(venvs, cache, hrx=None):
                 lines.append(f"LOOM SURFACE: {label} {ver}: first snapshot ({len(snap['tools'])} tools; workflows: {snap['workflows_note']})")
             else:
                 prev = json.load(open(base))
+                if base == mine:   # a tool whose help failed this run keeps its last good entry: the next run diffs against it
+                    for t, x in snap["tools"].items():
+                        if x["error"] and t in prev["tools"] and not prev["tools"][t]["error"]:
+                            snap["tools"][t] = prev["tools"][t]
                 d = surface_diff(prev, snap)
                 what = "same version, earlier snapshot" if base == mine else f"previous release {prev['version']}"
-                lines.append(f"LOOM SURFACE: {label} {ver} vs {what}: " + (f"{len(d)} changes" if d else "no change"))
+                lines.append(f"LOOM SURFACE: {label} {ver} vs {what}: " + (f"{len(d)} lines" if d else "no change"))
                 lines += [f"LOOM SURFACE:   {x}" for x in d]
-            tmp = mine + ".tmp"
-            with open(tmp, "w") as f:
+            snaps.append((label, snap))
+            fd, tmp = tempfile.mkstemp(dir=cache, prefix=f".{ver}.", suffix=".tmp")   # unique: two runs may share the cache
+            with os.fdopen(fd, "w") as f:
                 json.dump(snap, f)
             os.replace(tmp, mine)
         except Exception as e:   # noqa: BLE001 - the surface is a report; it never fails the freshness checks
@@ -196,7 +234,7 @@ def surface(venvs, cache, hrx=None):
     if len(snaps) == 2 and snaps[0][1]["version"] != snaps[1][1]["version"]:
         (la, a), (lb, b) = snaps
         d = surface_diff(a, b)
-        lines.append(f"LOOM SURFACE: {lb} {b['version']} vs {la} {a['version']}: {len(d)} changes")
+        lines.append(f"LOOM SURFACE: {lb} {b['version']} vs {la} {a['version']}: {len(d)} lines")
         lines += [f"LOOM SURFACE:   {x}" for x in d]
     if snaps:
         lines.append(f"LOOM SURFACE: snapshots in {cache}/<version>.json (help text per tool under .tools[NAME].lines)")
