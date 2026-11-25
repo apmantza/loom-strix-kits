@@ -1,7 +1,7 @@
 """KV8 prefill flash2: keep the K/V loads in flight (HRX-like LEDGER E109/E110).
 
 Runs on the generated program after gen_llm.kv8_readers, on every gfx11 prefill flash kernel whose loop carries the next
-tile's K (prefetch_split + FLASH2_PF11_CARRY: g_attention_flash2, g_attention_flash2_partial). Two switches, both off by
+tile's K (FLASH2_PF11's prefetch_split: g_attention_flash2, g_attention_flash2_partial). Two switches, both off by
 default (output unchanged):
 
 FLASH2_KV8_KCARRY=1  the loop carries K(kt+1) as its raw codes + f32 scale instead of the dequantized f16 vector, and the

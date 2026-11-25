@@ -740,9 +740,9 @@ if SPLITK:
             "  %sk_hi = index.min %sk_hi_raw, %key_tiles : index\n  %klo_t = index.div %key_low_raw, %ckt : index\n"
             "  %sk_lo_w = index.max %sk_lo, %klo_t : index\n")
 R4 =os.environ.get("FLASH2_ARCH") == "rdna4"   # the gfx12 twin (flash2_rdna4.py); FLASH2_ARCH unset: the gfx11 kernel
-# FLASH2_PF11=1 (gfx11 kernel, experiment, L18): the next K/V tile's loads behind the first barrier (flash2_prefetch.py, the gfx12
-# twin's FLASH2_PF pass on the gfx11 text). E52: the kernel is bound by exposed K/V load latency (no-load ablation 0.57x). Needs the
-# register room of FLASH2_KT256=16 (198 vs 241 VGPRs, E53). Not in the split-K kernel (its loop runs a key split, no prologue tile 0).
+# FLASH2_PF11=1 (gfx11 kernel, L18; HRX-like E54 / E55 / E57): the next tile's K loads in flight during this tile's softmax and PV,
+# V(kt)'s during the S MMAs (flash2_prefetch.prefetch_split). E52: the kernel is bound by exposed K/V load latency (no-load ablation
+# 0.57x). Not in the split-K kernel (its loop runs a key split, no prologue tile 0).
 # The split-K kernel (L17 vsplit) has no prefetch (its loop runs a key split [sk_lo, sk_hi), no prologue tile 0): opt-in
 # FLASH2_VS_KVH=1 (kvhoist).
 if not R4 and os.environ.get("FLASH2_SXH", "0") == "1" and os.environ.get("FLASH2_SX11", "0") != "1":   # gfx11 only, like SX11
@@ -766,14 +766,11 @@ if SPLITK and not R4 and B_MODE != "2":
 if SPLITK and os.environ.get("FLASH2_VSPLIT_PH", "0") == "1" and (R4 or B_MODE == "2"):
     raise SystemExit("FLASH2_VSPLIT_PH: the gfx11 split-K kernel without FLASH2_B=2 only")
 if not R4 and os.environ.get("FLASH2_PF11", "0") == "1" and B_MODE != "2" and not SPLITK:
-    from flash2_prefetch import prefetch_uncond, prefetch_split
+    from flash2_prefetch import prefetch_split
     if os.environ.get("FLASH2_KVH11", "0") == "1":   # the row's page-map pointer loaded once before the loop (flash2_trim.kvhoist): one dependent load fewer per tile
         from flash2_trim import kvhoist
         text = kvhoist(text)
-    if os.environ.get("FLASH2_PF11_SPLIT", "0") == "1":   # K and V loaded at different times (E55)
-        text = prefetch_split(text)
-    else:
-        text = prefetch_uncond(text)
+    text = prefetch_split(text)   # K and V loaded at different times, V at K's offset, stores without scf.if (E55 / E57)
 if R4:
     from flash2_rdna4 import to_rdna4, twin_names
     text = to_rdna4(text)
