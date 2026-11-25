@@ -14,7 +14,8 @@ check BASE_PKG CAND_PKG --out DIR: common/binary_gate.py between the packages (i
       followed across the back-edge into later iterations), capped at FULL = min(the base's best cover,
       the candidate loop's MMAs), sorted and compared rank by rank (tolerance 0 MMAs): a rank the base covered fully and the
       candidate does not is 'exposed a->b' (counts of ranks below FULL); a rank already below FULL in the base that drops further
-      is 'coverR a->b' (verify r2 V2); a changed load count ('loads') or loop MMA count ('mma') cannot be paired and is a loss;
+      is 'coverR a->b' (verify r2 V2); a changed load count ('loads') or loop MMA count ('mma') is a loss of its own, and the
+      ranks still pair from the lowest up across a load-count change (fail closed);
     - a new spill in the hot loop (kernel_lint scratch, 'spill') or new scratch bytes (binary_gate, 'scratch'; a NEW kernel's too).
   Pins (--accept 'KERNEL:KIND:FROM->TO' quoted, or KERNEL:KIND:FROM:TO; comma-separated; build.sh LINT_ACCEPT): a ledger-accepted loss. A kernel passes only when
   its pins equal its loss set exactly; any other or extra loss fails, a pin that does not equal its kernel's loss set fails, and a
@@ -147,9 +148,10 @@ def losses(gate_row, b, c):
         if c.get("covers"):
             ne, ce, full = exposed(b, c)
             # ranks of the sorted capped covers; a rank fully covered in the base and not in the candidate is exactly a rise in the
-            # exposed count (both sorted, same length), so ranks only add the decay of loads the base already exposed (verify r2 V2)
+            # exposed count at equal lengths, so ranks add the decay of loads the base already exposed (verify r2 V2); across a
+            # load-count change the sorted covers still pair from the lowest up, which can only add losses (coordinator r4: fail closed)
             cap = lambda v: sorted(min(x, full) for x in v)
-            for r, (x, y) in enumerate(zip(cap(b["covers"]), cap(c["covers"])) if same_n else ()):   # ranks pair only at equal counts
+            for r, (x, y) in enumerate(zip(cap(b["covers"]), cap(c["covers"]))):   # from the lowest up, whatever the load counts
                 if x < full and y < x:
                     out.append((f"cover{r}", str(x), str(y)))
             if ce > ne:                       # counts need no pairing: compared at any load count (verify r3 A)

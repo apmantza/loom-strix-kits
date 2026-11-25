@@ -191,11 +191,12 @@ def main():
     ok(cl.judge([gate_row("k", "CHANGED")], {"k": a_b}, {"k": a_c}, pin("k", {("loads", "1", "2")}))[1] != [],
        "verify r3 A: pinning k:loads:1->2 alone FAILS")
     ok(cl.judge([gate_row("k", "CHANGED")], {"k": a_b}, {"k": a_c}, pin("k", la))[1] == [], "both losses pinned: PASS")
-    # ranks do not pair across a load-count change (the prescribed r4 rule: counts, not ranks); a pairing of sorted prefixes would
-    # report cover0 3->0 here. Consequence (residual, HANDOFF r4): an already-exposed load's decay beside an added load is visible
-    # only as 'loads 2->3', so a loads pin accepts it
+    # coordinator r4 decision (fail closed): sorted covers pair from the lowest up whatever the load counts, so an already-exposed
+    # load's decay beside an added load is a loss of its own (cover0 3->0), not hidden behind a 'loads 2->3' pin
     lc = set(cl.losses(gate_row("k", "CHANGED"), dict(BASE, covers=[3, 4]), dict(BASE, covers=[0, 4, 4])))
-    ok(lc == {("loads", "2", "3")}, f"ranks pair only at equal load counts ({lc})")
+    ok(lc == {("loads", "2", "3"), ("cover0", "3", "0")}, f"ranks pair from the lowest up across a load-count change ({lc})")
+    ok(cl.judge([gate_row("k", "CHANGED")], {"k": dict(BASE, covers=[3, 4])}, {"k": dict(BASE, covers=[0, 4, 4])},
+                pin("k", {("loads", "2", "3")}))[1] != [], "a loads pin alone no longer accepts the decay")
     for name, op, want in (("spill load", "scratch_load_b32 v60, off, s0 offset:16", [0]),
                            ("flat load", "flat_load_b32 v60, v[2:3]", [0]),
                            ("returning atomic", "global_atomic_add_u32 v60, v2, v3, s[0:1] glc", [0]),
