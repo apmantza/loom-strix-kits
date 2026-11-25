@@ -770,6 +770,11 @@ if SPLITK and not R4 and B_MODE != "2":
         if os.environ.get("FLASH2_SXH", "0") == "1":   # the exchange as [w][2][2 halves][32][4]: no LDS bank conflicts (flash2_trim.sxh, E462)
             from flash2_trim import sxh
             text = sxh(text)
+    if os.environ.get("FLASH2_VSPLIT_PH", "0") == "1":   # vsplit: P^T from f16, packed exchange (flash2_smx2.vsplit_ph: FLASH2_SMX's PH alone, no fold)
+        from flash2_smx2 import vsplit_ph
+        text = vsplit_ph(text)
+if SPLITK and os.environ.get("FLASH2_VSPLIT_PH", "0") == "1" and (R4 or B_MODE == "2"):
+    raise SystemExit("FLASH2_VSPLIT_PH: the gfx11 split-K kernel without FLASH2_B=2 only")
 if not R4 and os.environ.get("FLASH2_PF11", "0") == "1" and B_MODE != "2" and not SPLITK:
     from flash2_prefetch import prefetch, prefetch_uncond, prefetch_split
     if os.environ.get("FLASH2_KVH11", "0") == "1":   # the row's page-map pointer loaded once before the loop (flash2_trim.kvhoist): one dependent load fewer per tile
