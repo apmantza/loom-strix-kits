@@ -38,7 +38,7 @@ def select(lib, cases, arch=None, rdna4=None):
     gfx11_only = set(RDNA3_ONLY.findall(lib)) - {k[:-len(dual_target.SUFFIX)] for k in defined if k.endswith(dual_target.SUFFIX)}
     gfx12_only = {k for k in RDNA4_ONLY.findall(lib) if k.endswith(dual_target.SUFFIX) and k[:-len(dual_target.SUFFIX)] not in defined}   # K_rdna4 with no K (f16o fusions)
     keep, skipped = [], []
-    for b in re.split(r'(?m)^(?=check\.case )', cases):
+    for b in re.split(r'(?m)^(?=check\.case |kernel\.def )', cases):
         if not b.startswith("check.case"):
             keep.append(b)
             continue
@@ -127,7 +127,7 @@ def by_kernels(cases, kernels, smoke=SMOKE, defined=None):
     kernels = set(kernels)
     dfn = set(defined) if defined is not None else kernels
     keep, names, sm, covered, unknown = [], [], [], set(), {}
-    for b in re.split(r'(?m)^(?=check\.case )', cases):
+    for b in re.split(r'(?m)^(?=check\.case |kernel\.def )', cases):
         m = CASE.match(b)
         if not m:
             keep.append(b)

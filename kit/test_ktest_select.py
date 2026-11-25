@@ -104,6 +104,23 @@ class Select(unittest.TestCase):
         self.assertEqual(names, smoke)
         self.assertIn('export("test_copy_rows")', text)
 
+    def test_helper_after_an_unselected_case_kept(self):   # E613 / q213: test_copy_rows sat after flash_prefill's case and left
+        # with it, so a selected weq_ case launched a helper the build no longer defined (SKIP: kernel(s) not in this build)
+        cases = case("flash_prefill", "g_attention_flash2") + HELPER + case("weq_mv_q4_k", "g_mv_q4_k_k5120", "test_copy_rows")
+        text, names, _, _ = ks.by_kernels(cases, ["g_mv_q4_k_k5120"], defined=PKG)
+        self.assertEqual(names, ["weq_mv_q4_k"])
+        self.assertIn('export("test_copy_rows")', text)
+        self.assertNotIn("@flash_prefill ", text)
+
+    def test_select_keeps_a_helper_after_a_skipped_case(self):   # E613, the run-time filter: a case skipped for a kernel this
+        # build lacks took the helper glued after it, and the next case was then skipped too
+        lib = "kernel.def export(\"g_embed\") @g_embed(%t: index) {\n}\n"
+        cases = case("gone", "g_not_built") + HELPER + case("uses_helper", "g_embed", "test_copy_rows")
+        text, skipped = ks.select(lib, cases, arch="gfx1151", rdna4=False)
+        self.assertIn('export("test_copy_rows")', text)
+        self.assertIn("@uses_helper ", text)
+        self.assertEqual([x.split(":")[0] for x in skipped], ["SKIP gone"])
+
     def test_kt_copy_counts_as_its_kernel(self):
         _, names, _, _ = ks.by_kernels(CASES, ["g_silu_mul"], defined=PKG)
         self.assertIn("silu_copy", names)
