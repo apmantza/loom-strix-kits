@@ -235,6 +235,8 @@ def main():
         ok("workgroup_slots" in o.get("why", ""), "a fixed limit below the next tier blocks it (named)", o)
         ok(lc.occupancy(lc.report_limit(report(os.path.join(t, "b.json"), 128, 16, [SG, vgpr(24, 16, False)]))[4], 4) is None,
            "at the wave cap: no occupancy lever", "")
+        ok(lc.occupancy(lc.report_limit(report(os.path.join(t, "z.json"), 256, 16, [SG, vgpr(24, 16, False), lds(0, 16, False)]))[4], 4) is None,
+           "a kernel using no LDS (0 B) is at the best tier, not 'unverified' (live: every g_deq16_*)", "")
         ok(lc.occupancy(None, 4) == {"why": "no compile report"}, "no compile report: said, not dropped", "")
         json.dump({"target_resources": {"limiting_resource": "amdgpu.lds", "residency": {"current_tier": 4}}}, open(js, "w"))
         ok(lc.report_limit(js)[0] == "lds" and lc.report_limit(js)[3] == [], "no residency rows: the summary's one limit, no rows",

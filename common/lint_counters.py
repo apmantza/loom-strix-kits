@@ -174,10 +174,11 @@ def occupancy(occ, simds):
             pool, gran, units, scope = int(r["pool_units"]), int(r["allocation_granularity"]), int(r["units"]), r["allocation_scope"]
         except (KeyError, TypeError, ValueError):
             return {"why": f"tier unverified: {name} ({kind}) lacks pool, granularity, units or scope"}
-        if kind != "pooled_resource" or scope not in ("subgroup", "workgroup") or gran <= 0 or units <= 0:
-            return {"why": f"tier unverified: {name}: kind {kind!r}, scope {scope!r} not modelled"}
+        if kind != "pooled_resource" or scope not in ("subgroup", "workgroup") or gran <= 0 or units < 0:
+            return {"why": f"tier unverified: {name}: kind {kind!r}, scope {scope!r}, granularity {gran}, units {units} not modelled"}
         ru = -(-units // gran) * gran
-        got = min(cap, pool // ru if scope == "subgroup" else pool // ru * q)   # the report caps each tier at the wave cap
+        # the report caps each tier at the wave cap; a resource the kernel does not use (0 B of LDS) never limits
+        got = cap if ru == 0 else min(cap, pool // ru if scope == "subgroup" else pool // ru * q)
         if got != r.get("independent_tier"):
             return {"why": f"tier unverified: {name} computes to tier {got}, the report says {r.get('independent_tier')}"}
         pooled.append((name, units, r.get("unit") or "", pool, gran, scope, got))
