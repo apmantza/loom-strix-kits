@@ -163,6 +163,13 @@ more bytes than Strata's' after checking only Strata's file; our generator's doc
   should be harmless (the same weights at another verify width or batch: t1 vs t8). GGUF-level changes: common/quant_eval.sh (llama.cpp
   --kl-divergence); a kernel change needs the serving engine's logits. A pass still needs the long-context gate and the owner.
 
+- **A switch is a test fixture, not a product.** An env switch in a generator exists to A/B one change, and it leaves when its
+  verdict lands: adopted (live, or exact and not slower) -> make the on path unconditional, delete the off path and the switch, and
+  rebase the unchanged-path tests on every kit the generator serves; refuted -> delete its code (the ledger row keeps the commit for
+  reference). A switch stays only while its A/B is open or a kit's recipe needs the off path, and its comment says which. Every off
+  path is a branch each later generator change, compile and kernel test must carry: the 11-25 census found 220 env names read under
+  kit/, with 9 switches on top of live's recipe (HRX-like E497 follow-up).
+
 ## 5. Measurement hygiene
 
 - Compare within one interleaved A/B (ABBA) on one server; absolute numbers drift between sessions (the same package measured 21.5 and 26-34 tok/s on two harnesses).
