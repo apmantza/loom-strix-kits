@@ -640,38 +640,25 @@ POS8 = KVH * D
 SP8 = 2 * cfg.get("kv_layers", cfg["layers"])
 _lib8 = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "program", "llm.loom")
 KV8_LIVE = os.path.exists(_lib8) and "func.def inline @g_kv8_scale_offset(" in open(_lib8).read()
-# the package's scale layout, read from its own helper: page-local (v3, E80) splits the slot offset with masks; v2 does not
+# the package's scale layout, read from its own helper: v2 (gen_llm.py's only layout since the switch census 11-25). A package
+# built with the retired page-local layout 3 (E80; its helper splits the slot offset with masks) is refused, not tested as v2.
 import re  # noqa: E402
 _h8 = re.search(r"func\.def inline @g_kv8_scale_offset\(.*?\n\}", open(_lib8).read(), re.S) if KV8_LIVE else None
-KV8_V3 = bool(_h8 and "scalar.andi" in _h8.group(0))
+if _h8 and "scalar.andi" in _h8.group(0):
+    sys.exit("make_kernel_tests: the package uses the retired KV8 layout 3 (page-local); test it with a kit before the 11-25 fold")
 
 
 def kv8_scale_at(plane, slot):
     """byte offset of (plane 0 = K / 1 = V of layer 0, physical slot)'s KVH f32 scales inside the scale plane"""
-    return (slot // 16) * 16 * POS8 + (plane * 16 + slot % 16) * KVH * 4 if KV8_V3 else slot * POS8 + plane * KVH * 4
-KT_SCALE_ADDR = ("""  // page-local scale address computed from the position (independent of @g_kv8_scale_offset's mask arithmetic):
-  // (SP x pool + page x 16) x POS + (plane x 16 + p mod 16) x KVH x 4
-  %spl = index.constant {SP8} : index
-  %c16 = index.constant 16 : index
-  %page = index.div %p, %c16 : index
-  %inp = index.rem %p, %c16 : index
-  %sp_row = index.mul %spl, %pool : index
-  %page16 = index.mul %page, %c16 : index
-  %sp_pos = index.add %sp_row, %page16 : index
-  %pblock = index.scale %sp_pos, %posb : index, offset -> offset
-  %recb = index.constant {KVH4} : offset
-  %inpb = index.scale %inp, %recb : index, offset -> offset
-  %s_slot = index.add %pblock, %inpb : offset
-  %k_rec = index.constant 0 : offset
-  %v_rec = index.constant {KVH64} : offset
-""" if KV8_V3 else """  // v2: the position's slot in the scale plane, then the plane's record
+    return slot * POS8 + plane * KVH * 4
+KT_SCALE_ADDR = ("""  // v2: the position's slot in the scale plane, then the plane's record
   %spl = index.constant {SP8} : index
   %sp_row = index.mul %spl, %pool : index
   %sp_pos = index.add %sp_row, %p : index
   %s_slot = index.scale %sp_pos, %posb : index, offset -> offset
   %k_rec = index.constant 0 : offset
   %v_rec = index.constant {KVH4} : offset
-""").replace("{SP8}", str(SP8)).replace("{KVH4}", str(KVH * 4)).replace("{KVH64}", str(16 * KVH * 4))
+""").replace("{SP8}", str(SP8)).replace("{KVH4}", str(KVH * 4))
 KV8_READ = f"""
 // Test helper: dequantized K and the raw V slot bytes (codes, then the head's f32 scale) of each token's KV8 slot
 // (identity page map, layer 0).
@@ -5075,7 +5062,7 @@ def split_vzero_cases():
         has it, g_attention_combine), 4 rows below 2,048 visible keys: decode at 64 and 1040 (page-first), a 4-token verify span
         400-403 (400 page-first), decode at 100 (mid-page), 25 dead padding tokens.
     The rows share physical pages for their full (written) pages and own the page of their last position; spare pages are
-    unwritten. Expected: FAIL on kernels without the switch (pkg-e379), PASS with KV8_SPLIT_VZERO=1."""
+    unwritten. Expected: FAIL on kernels without the guard (pkg-e379), PASS with it (KV8, or KV8_SPLIT_VZERO=1 on f16 KV)."""
     def layout(last, spare, seed):
         R = len(last); r_ = np.random.default_rng(seed)
         nsh = max(p // 16 for p in last); npg = nsh + R + spare; blocks = nsh + 2
@@ -5208,10 +5195,10 @@ for h in sorted(set(cfg.get("layer_heads") or []) - {QH}):
 # Known defects (run_kernel_tests.sh reads known_defects.json beside the cases): a tagged case may fail on an expectation ('KNOWN-FAIL
 # (id)') without failing the run; one that passes fails the run ('KNOWN-DEFECT NOW PASSES'), so a tag cannot outlive its defect.
 # E444 (HRX-like E441 / E444): the split kernels multiply the V of unwritten slots after a token's last key by p = +0; the poison
-# fills that are non-finite after dequant (nan, inf; negzero stays finite and passes) fail on a package built without
-# KV8_SPLIT_VZERO=1 and are required with it (the generator runs with the package's switches, common/ktest.sh). Negative controls
-# are never tagged (the runner keeps their must-fail rule anyway).
-KNOWN_DEFECTS = {"E444": ("" if os.environ.get("KV8_SPLIT_VZERO", "0") == "1" else
+# fills that are non-finite after dequant (nan, inf; negzero stays finite and passes) fail on a package built without the guard
+# (KV8: always on since the switch census 11-25; f16 KV: KV8_SPLIT_VZERO=1) and are required with it (the generator runs with the
+# package's switches, common/ktest.sh). Negative controls are never tagged (the runner keeps their must-fail rule anyway).
+KNOWN_DEFECTS = {"E444": ("" if os.environ.get("KV8", "0") == "1" or os.environ.get("KV8_SPLIT_VZERO", "0") == "1" else
                           "stale_kv_flash_nan stale_kv_flash_inf stale_kv_split_listed_nan stale_kv_split_listed_inf "
                           "stale_kv_split_decode_nan stale_kv_split_decode_inf").split()}
 if not KS:

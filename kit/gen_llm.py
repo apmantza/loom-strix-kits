@@ -95,38 +95,32 @@ KV8 = os.environ.get("KV8", "0") == "1"
 KV_CODE_BYTES = KVH * D                   # KV8: the codes of one position (the scales follow)
 # KV8 layout (E73/E74): code slots of KVH x D bytes per position and plane (16 x 1024 = 16384-B pages, a power of two:
 # loom 0.2.0's elastic backing faulted the GPU on 16 x 1040-B pages) and ONE extra plane (index KV8_SCALE_PLANE, after
-# the 2 x layers code planes) holding the scales. Page-local (E80: one scale line per key was the whole KV8 prefill
-# penalty): the scale plane's page block (KV8_PAGE positions x POS_BYTES) holds [(2 x layer + kv)][position in page][head]
-# f32, so one plane's scales for a page's 16 positions are 16 x KVH x 4 contiguous bytes. @g_kv8_scale_offset derives
-# page and position from the code slot's byte offset with masks (power-of-two sizes asserted below).
+# the 2 x layers code planes) holding the scales: layout v2, every scale of a position in that position's slot of the
+# scale plane, record (2 x layer + kv) x KVH f32 (@g_kv8_scale_offset). The page-local layout 3 (E80) was retired: it
+# measured +5 % served prefill flash2 (E95) and its 8x fewer scale lines changed nothing (E109).
 POS_BYTES = KVH * D if KV8 else KVH * D * 2   # K (or V) code bytes per position (and the scale plane's slot)
 KV_LAYERS = CFG.get("kv_layers", CFG["layers"])
 KV8_SCALE_PLANE = 2 * KV_LAYERS
-KV8_PAGE = 16
-# KV8_LAYOUT=2: the v2 placement (every scale of a position in that position's slot of the scale plane); default 3 =
-# page-local (E80/E87/E88: page-local is faster in the isolated decode kernel but measured slower in serving, unexplained)
-KV8_LAYOUT = int(os.environ.get("KV8_LAYOUT", "3"))
-assert KV8_LAYOUT in (2, 3), "KV8_LAYOUT is 2 or 3"
-KV8_SHIFT = (POS_BYTES // (KVH * 4)).bit_length() - 1
 if KV8:
-    assert POS_BYTES & (POS_BYTES - 1) == 0 and (KVH * 4) & (KVH * 4 - 1) == 0, "KV8 page-local scales need power-of-two slots"
+    assert POS_BYTES & (POS_BYTES - 1) == 0 and (KVH * 4) & (KVH * 4 - 1) == 0, "KV8 needs power-of-two slots (E73 / E74)"
     assert 2 * KV_LAYERS * KVH * 4 <= POS_BYTES, "KV8: the planes' scale records do not fit one page block"
 if KV8:   # the flash kernels (gen_flash2.py / gen_flash2s.py subprocesses) address KV slots with FLASH2_POS_BYTES
     os.environ["FLASH2_POS_BYTES"] = str(POS_BYTES)
-# KV8_SPLIT_VZERO=1 (HRX-like E441 / E444): the split decode / fallback attention bodies (attention_text's paged branch,
+# Split V zero (HRX-like E441 / E444): the split decode / fallback attention bodies (attention_text's paged branch,
 # gqa_split, multi_token_split, gqa_span) select only the SCORE of a key outside the token's range [lo, hi); its V was
 # still loaded and multiplied by p = +0, so NaN / Inf bytes in the unwritten slots of a ragged last page reached the
-# output (0 x NaN = NaN). The switch keeps such a V finite:
-#   KV8 (live): the key's V scale is selected to 0.0 before the dequant multiply (kv8_readers; +4 instructions per
-#     16-key block, VGPRs unchanged, W/static-1124/nanleak/FINDING.md section 6), so its V is code x 0 = +-0;
-#   f16 KV: the key's V slot is clamped to the block's first key j (written: lo_al <= j < hi, j <= the position), as the
-#     non-paged branch already clamps the key; the switch's name is kept for both formats.
+# output (0 x NaN = NaN). The guard keeps such a V finite:
+#   KV8 (always on with KV8; the switch census 11-25 folded KV8_SPLIT_VZERO=1 into it): the key's V scale is selected
+#     to 0.0 before the dequant multiply (kv8_readers; +4 instructions per 16-key block, VGPRs unchanged,
+#     W/static-1124/nanleak/FINDING.md section 6), so its V is code x 0 = +-0;
+#   f16 KV (KV8_SPLIT_VZERO=1, off by default: no f16 kit has measured it): the key's V slot is clamped to the block's
+#     first key j (written: lo_al <= j < hi, j <= the position), as the non-paged branch already clamps the key.
 # Exact for finite KV, both variants: for an out-of-range key s = -3e38 (%neg_big) and the running max is finite (every
 # split's first block holds key lo < hi), so p = expf(s - max) is exactly +0; the accumulator starts +0, is only scaled
 # by alpha > 0 and summed, so it is never -0 (round to nearest: x + (-x) = +0), hence fmaf(+0, V, acc) == acc bitwise for
-# any finite V. Old and new outputs differ only where the old stale V was NaN / Inf. Off (default): unchanged program.
-SPLIT_VZERO = os.environ.get("KV8_SPLIT_VZERO", "0") == "1"
-SPLIT_VCLAMP = SPLIT_VZERO and not KV8   # the f16 variant (the slot clamp in the text generators)
+# any finite V. Old and new outputs differ only where the old stale V was NaN / Inf.
+SPLIT_VCLAMP = not KV8 and os.environ.get("KV8_SPLIT_VZERO", "0") == "1"   # the f16 variant (the slot clamp in the text generators)
+SPLIT_VZERO = KV8 or SPLIT_VCLAMP
 WINDOW = CFG.get("sliding_window") or 0   # keys kept by sliding layers (0: none)
 GATE = CFG.get("attn_gate", False)       # True: separate attn_gate tensor; "fused_q": attn_q packs [q | gate] per head
 FUSED_Q = GATE == "fused_q"
@@ -280,35 +274,6 @@ func.def inline @g_kv8_scale_offset(%slot: offset, %layer: index, %kv: index, %p
   %recoff = index.scale %plane, %rec : index, offset -> offset
   %a = index.add %slot, %jump : offset
   %b = index.add %a, %recoff : offset
-  func.return %b : offset
-}}
-""" if KV8_LAYOUT == 2 else f"""
-// KV8: the byte offset of the f32 scale of (KV layer `layer`, kv 0 = K / 1 = V) for the position whose code slot is at
-// `slot` (in plane 2 * layer + kv): the same position's slot in the scale plane, then its record.
-func.def inline @g_kv8_scale_offset(%slot: offset, %layer: index, %kv: index, %pool: index) -> (offset) {{
-  %two = index.constant 2 : index
-  %l2 = index.mul %layer, %two : index
-  %plane = index.add %l2, %kv : index
-  %posb = index.constant {POS_BYTES} : offset
-  %pstride = index.scale %pool, %posb : index, offset -> offset
-  %pbase = index.scale %plane, %pstride : index, offset -> offset
-  %sp = index.constant {KV8_SCALE_PLANE} : index
-  %sbase = index.scale %sp, %pstride : index, offset -> offset
-  %rec = index.constant {KV8_PAGE * KVH * 4} : offset
-  %prec = index.scale %plane, %rec : index, offset -> offset
-  %slot64 = index.cast %slot : offset to i64
-  %pbase64 = index.cast %pbase : offset to i64
-  %rel = scalar.subi %slot64, %pbase64 : i64
-  %bmask = scalar.constant {KV8_PAGE * POS_BYTES - 1} : i64
-  %within = scalar.andi %rel, %bmask : i64
-  %pagebytes = scalar.subi %rel, %within : i64
-  %shift = scalar.constant {KV8_SHIFT} : i64
-  %inpage = scalar.shrui %within, %shift : i64
-  %local = scalar.addi %pagebytes, %inpage : i64
-  %local_b = scalar.assume %local [range(%local, 0, 9223372036854775807)] : i64
-  %localo = index.cast %local_b : i64 to offset
-  %a = index.add %sbase, %prec : offset
-  %b = index.add %a, %localo : offset
   func.return %b : offset
 }}
 """)) + r"""
@@ -2617,7 +2582,7 @@ def kv_of(name):
 
 
 class _SplitVZero:
-    """KV8_SPLIT_VZERO (HRX-like E441 / E444) inside kv8_readers: for each decode-shape V load (KVH x 32 x n view) the
+    """Split V zero (HRX-like E441 / E444) inside kv8_readers: for each decode-shape V load (KVH x 32 x n view) the
     key-in-range bit that zeroes its scale, found in the load's own kernel by its exact known-good definition. A V load in
     a kernel that clamps the key already (the non-paged branch) needs none. Any other V load is unrecognized: recorded and
     refused after the pass (fail closed), so a new split body cannot ship with its V unguarded."""
@@ -2661,9 +2626,9 @@ class _SplitVZero:
 
     def check(self):
         if self.bad:
-            sys.exit("KV8_SPLIT_VZERO: V loads with no recognized key-in-range bit (and no clamped key): " + ", ".join(self.bad[:12]))
+            sys.exit("KV8 split V zero: V loads with no recognized key-in-range bit (and no clamped key): " + ", ".join(self.bad[:12]))
         if not self.guarded:
-            sys.exit("KV8_SPLIT_VZERO: no split-kernel V load found to guard")
+            sys.exit("KV8 split V zero: no split-kernel V load found to guard")
         print("KV8_SPLIT_VZERO: V scale guarded " + ", ".join(f"{k} {v}" for k, v in sorted(self.guarded.items()))
               + ("; clamped already: " + ", ".join(f"{k} {v}" for k, v in sorted(self.clean.items())) if self.clean else ""),
               file=sys.stderr)
@@ -2673,15 +2638,15 @@ def kv8_readers(text):
     """KV8 (HRX-like DESIGN-KV8.md): the decode attention kernels' K/V loads (view a slot as KVH x 32 x n f16, load a
     lane's n values, extend to f32) become: view the codes as i8, load, convert, times the slot's scale for this KV head
     (the f32 after the KVH x D codes). The values the rest of the kernel sees are the dequantized K/V, so scores,
-    softmax and the V sum are unchanged. Then a kernel that still views the arena as f16 is refused (KV8_PARTIAL=1 only
-    warns, for building a reader at a time): a reader left on f16 would read codes as halves.
-    KV8_SPLIT_VZERO=1: a decode-shape V load's scale is selected to 0.0 for a key outside the token's range (_SplitVZero)."""
-    vz = _SplitVZero() if SPLIT_VZERO else None
+    softmax and the V sum are unchanged. Then a kernel that still views the arena as f16 is refused: a reader left on f16
+    would read codes as halves. A decode-shape V load's scale is selected to 0.0 for a key outside the token's range
+    (_SplitVZero)."""
+    vz = _SplitVZero()
 
     def sub(m):
         ind, p, i, off, H, n, _h, ext = m.groups()
         t = f"{p}{i}"
-        g = vz.guard(m, t) if vz and kv_of(p) == 1 else None
+        g = vz.guard(m, t) if kv_of(p) == 1 else None
         return (f"{ind}%{p}c{i} = buffer.view %arena[%{off}] : buffer -> view<{H}x32x{n}xi8>\n"
                 f"{ind}%{t}_k8q = vector.load %{p}c{i}[%kv_head, %lane, %c0] : view<{H}x32x{n}xi8> -> vector<{n}xi8>\n"
                 f"{ind}%{t}_k8o = index.constant {kv_of(p)} : index\n"
@@ -2692,7 +2657,7 @@ def kv8_readers(text):
                 # exactness: prefill flash vs decode split vs vsplit); f16 arithmetic is exact here because the scale
                 # is f16-representable (E77)
                 f"{ind}%{t}_k8f = vector.sitofp %{t}_k8q : vector<{n}xi8> to vector<{n}xf16>\n"
-                # KV8_SPLIT_VZERO: an out-of-range key's scale -> 0.0, so its V is code x 0 = +-0 (finite) whatever the slot held
+                # split V zero: an out-of-range key's scale -> 0.0, so its V is code x 0 = +-0 (finite) whatever the slot held
                 + (f"{ind}%{t}_k8z = scf.select {g}, %{t}_k8s, %zero_f : f32\n" if g else "")
                 + f"{ind}%{t}_k8sh = scalar.fptrunc %{t}_{'k8z' if g else 'k8s'} : f32 to f16\n"
                 f"{ind}%{t}_k8ss = vector.splat %{t}_k8sh : vector<{n}xf16>\n"
@@ -2734,7 +2699,7 @@ def kv8_readers(text):
     def sub3(m):
         ind, dst, src, N = m.groups()
         off = views3[src]
-        g = vz.guard(m, dst) if vz and kv_of(dst) == 1 else None
+        g = vz.guard(m, dst) if kv_of(dst) == 1 else None
         return (f"{ind}%{dst}_k8q = vector.load %{src}[%kv_head, %lane, %c0] : view<{KVH}x32x{N}xi8> -> vector<{N}xi8>\n"
                 f"{ind}%{dst}_k8o = index.constant {kv_of(dst)} : index\n"
                 f"{ind}%{dst}_k8so = func.call @g_kv8_scale_offset(%{off}, %layer, %{dst}_k8o, %pool) : (offset, index, index, index) -> (offset)\n"
@@ -2750,14 +2715,13 @@ def kv8_readers(text):
                           + f"{KVH}" + r"x32x(\d+)xf16> -> vector<\d+xf16>$")
         text, n3 = pat3.subn(sub3, text)
         n += n3
-    if vz:
-        vz.check()
+    vz.check()
     left = sorted({re.search(r'export\("([^"]+)"\)', blk).group(1) for blk in re.split(r"(?m)^(?=kernel\.def )", text)
                    if blk.startswith("kernel.def") and 'export("' in blk.split("\n", 1)[0]
                    and re.search(r"buffer\.view %arena\[[^\]]*\] : buffer -> view<[^>]*xf16>", blk)})
     print(f"KV8: {n} K/V loads rewritten" + (f"; still f16 on the arena: {', '.join(left)}" if left else ""), file=sys.stderr)
-    if left and os.environ.get("KV8_PARTIAL") != "1":
-        sys.exit(f"KV8: these kernels still read the arena as f16: {', '.join(left)} (KV8_PARTIAL=1 to build anyway)")
+    if left:
+        sys.exit(f"KV8: these kernels still read the arena as f16: {', '.join(left)}")
     return text
 
 
@@ -6648,8 +6612,9 @@ if __name__ == "__main__":
     text = pf16_pad.apply(text)   # PF16_PAD (HRX-like E167); unset: unchanged
     if KV8:
         text = kv8_readers(text)
-        import kv8_late   # FLASH2_KV8_KCARRY / FLASH2_KV8_VLATE (HRX-like E109/E110); both off: unchanged
-        text = kv8_late.apply(text)
+        if os.environ.get("FLASH2_PF11", "0") == "1":   # the prefill flash loop carries K(kt+1): keep its KV8 loads in flight
+            import kv8_late   # HRX-like E109 / E110 / E144 (the census 11-25 folded FLASH2_KV8_KCARRY=1 FLASH2_KV8_VLATE=2 into KV8)
+            text = kv8_late.apply(text)
     import f16o11   # F16O11=1 (HRX-like E180): the f16 swiglu GEMM writes the row-scaled f16 copy itself; unset: unchanged
     text = f16o11.apply(text, L)
     import f16o_o   # F16O_O=1 (HRX-like E375): the attention / GDN output producers write %o16 (and %s_o) themselves; unset: unchanged

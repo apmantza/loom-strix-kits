@@ -43,10 +43,9 @@ Each switch is read in the file named (under `kit/`). Unset, a switch leaves the
 |---|---|---|
 | PREFILL_F16_SCRATCH | gen_llm.py, gen_gemm.py | prefill chunks of 2048+ rows dequantize each weight once into an f16 scratch, then run f16 WMMA GEMMs |
 | PF16_PAD=64 | pf16_pad.py | pads f16 operand rows so that no row stride is a multiple of 4 KB (memory channel camping) |
-| KV8=1 KV8_LAYOUT=2 | gen_llm.py | 8-bit KV cache (int8 codes + scales). It changes numerics; it passed our needle and 26k/81k/130k continuation gate against f16 |
+| KV8=1 | gen_llm.py, kv8_late.py | 8-bit KV cache (int8 codes + scales). It changes numerics; it passed our needle and 26k/81k/130k continuation gate against f16. With FLASH2_PF11, its prefill attention carries raw K across iterations and fences V loads |
 | ATTN_L17_VS, FLASH2_VS_KVH, FLASH2_SPLITK_ANY | gen_llm.py, gen_flash2s.py | verify attention for the 8-token speculative step (split over keys, KV-head hoist, blocks that straddle pages) |
 | FLASH2_PF11, FLASH2_KVH11 | gen_flash2s.py, flash2_prefetch.py | prefill flash attention prefetch and carry scheduling |
-| FLASH2_KV8_KCARRY, FLASH2_KV8_VLATE=2 | kv8_late.py | KV8 prefill attention: carry raw K across iterations, fence V loads |
 | GDN_FOLD, GDN_AB_R | gen_gdn.py, gen_llm.py | Gated DeltaNet decode state fold; alpha/beta projection rows |
 | DFL_SPLIT_W, DRAFT_MM_FROM=17 | draft/gen_dflash.py, gen_llm.py | DFlash2 drafter weight split and matmul threshold |
 
