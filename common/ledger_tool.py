@@ -51,18 +51,24 @@ Subcommands and verdict lines (exit 0 ok, 1 refused / outside / owed, 2 usage or
                             saved; or a directory holding exactly one such file) of the built package and of the base: every kernel
                             the regex fully matches, present in both tables, must read FROM in BASE and TO in BUILT: exact for
                             vgpr, waves, scratch, in_flight, selects; otherwise BASE within the band of FROM, BUILT within half the
-                            predicted delta of TO, having moved at least half of it in its direction (built == FROM is ABSENT); FROM == TO: both within an
+                            predicted delta of TO, having moved at least half of it in its direction; FROM == TO: both within an
                             absolute band (counts 2, per-MMA ratios 0.05). Every alternative of every '|' and every capturing
-                            group must match a kernel present in both tables (a claimed branch nothing checks: ABSENT). A regex matching no kernel, a kernel in one table only, a '-' value, a table with
+                            group must match a kernel (a claimed branch nothing checks: ABSENT). A character class is not split:
+                            'k[xy]' checks only the kernels that exist (kx), so name each claimed kernel by an alternative
+                            ('k(x|y)') when it must exist. A regex matching no kernel, a kernel in one table only, a '-' value, a table with
                             a kernel twice (two builds mixed) or without kernel_lint's header: ABSENT / error. Recurrence: E520's
                             three-lever flash2 build lost the V-tile prefetch (cover 58 -> 23) while its loop count moved as
                             predicted; the delta a hypothesis predicts is checked before any GPU minute (E110, E230, E318).
   verdict STEP [RESULT]     VERDICT: INSIDE | OUTSIDE                 RESULT: a file (the header's result regex, last match) or a
                             number; default the header's result-file. OUTSIDE: debug the measurement before believing it.
   owed                      OWED: N                                   kept wins with targets no later row marked ported / dropped
---grandfather N: steps whose name carries a number <= N (first digit run of the basename) pass with a note (written before the check).
+--grandfather-list FILE (preflight, probe-card): steps written before the checks, pinned by content, in sha256sum format
+('<sha256>  <step file name>', one per line; '#' comments). A step passes with a note only when its file name is listed and its
+content still hashes to the listed sha256: a listed step rewritten in place is checked like a new one (HRX-like C16 verify r3: a
+digit-run cut let 'q1_flash.sh' skip both checks). A list that cannot be read or has a malformed line: exit 2, never a skip.
 usage: ledger_tool.py [--ledger LOG.md [--ledger ARCHIVE.md]] [--id REGEX] [--result-from K] {preflight,probe-card check,compiler-check,verdict,owed} ..."""
 import argparse
+import hashlib
 import os
 import re
 import sys
@@ -180,16 +186,28 @@ def switches_of_file(path):
     return {n for n, _ in SWITCH.findall(open(path).read().split("#")[0])}
 
 
-def grandfathered(step, cut):
-    m = re.search(r"(\d+)", os.path.basename(step))
-    return cut is not None and m is not None and int(m.group(1)) <= cut
+def grandfathered(step, listfile):
+    """True when STEP's file name is in LISTFILE (sha256sum format) with the sha256 of its current content; None LISTFILE:
+    False. Raises ValueError on a malformed line (OSError on an unreadable list): fail closed, never a skip"""
+    if listfile is None:
+        return False
+    want = {}
+    for n, line in enumerate(open(listfile), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.fullmatch(r"([0-9a-f]{64}) [ *](\S+)\s*", line)
+        if not m or "/" in m.group(2):
+            raise ValueError(f"{listfile}:{n}: not '<sha256>  <file name>': {line.strip()[:80]!r}")
+        want[m.group(2)] = m.group(1)
+    name = os.path.basename(step)
+    return name in want and hashlib.sha256(open(step, "rb").read()).hexdigest() == want[name]
 
 
 def preflight(step, log, exclude=frozenset(), exclude_note=None, grandfather=None, switch_var="EXTRA"):
     """(problems, notes) for one step against the log"""
     name = os.path.basename(step)
     if grandfathered(step, grandfather):
-        return [], [f"{name}: grandfathered (number <= {grandfather}, written before this check)"]
+        return [], [f"{name}: grandfathered (listed with its sha256 in {os.path.basename(grandfather)}, written before this check)"]
     text = open(step).read()
     hd = header(text)
     rows, idr = log.rows, log.id_re
@@ -543,7 +561,7 @@ def compiler_check(step, built, base):
                 moved, rule = a == frm and b == to, "exact"
             else:
                 h = abs(d) / 2
-                moved = abs(a - frm) <= band and abs(b - to) <= h and b != frm and (b - a) * d > 0 and abs(b - a) >= h
+                moved = abs(a - frm) <= band and abs(b - to) <= h and (b - a) * d > 0 and abs(b - a) >= h
                 rule = f"base within {band:g} of FROM, built within {h:g} of TO, moved >= {h:g} in its direction"
             out.append(f"  {k} {metric}: base {a:g} built {b:g} (predicted {frm:g} -> {to:g}): {'ok' if moved else 'ABSENT'}")
             if not moved:
@@ -562,13 +580,13 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("preflight")
     p.add_argument("step")
-    p.add_argument("--grandfather", type=int)
+    p.add_argument("--grandfather-list", dest="grandfather", help="steps written before the check, pinned by sha256")
     p.add_argument("--switch-var", default="EXTRA")
     p.add_argument("--exclude-switches-from", help="a build command file: its NAME=value switches are not re-litigated")
     p = sub.add_parser("probe-card")
     p.add_argument("action", choices=["check"])
     p.add_argument("step")
-    p.add_argument("--grandfather", type=int)
+    p.add_argument("--grandfather-list", dest="grandfather", help="steps written before the check, pinned by sha256")
     p = sub.add_parser("compiler-check")
     p.add_argument("step")
     p.add_argument("built", help="kernel_lint's saved stdout for the built package (or a directory holding exactly one)")
@@ -582,7 +600,7 @@ def main(argv=None):
         if a.cmd == "probe-card":
             name = os.path.basename(a.step)
             if grandfathered(a.step, a.grandfather):
-                print(f"PROBE: OK ({name}: grandfathered, number <= {a.grandfather})")
+                print(f"PROBE: OK ({name}: grandfathered, listed with its sha256 in {a.grandfather})")
                 return 0
             f, probs = card(a.step)
             probs += chains(open(a.step).read())
@@ -625,7 +643,7 @@ def main(argv=None):
             print("OWED PROBLEM " + x)
         print(f"OWED: {len(items)}")
         return 2 if probs else (1 if items else 0)
-    except OSError as e:
+    except (OSError, ValueError) as e:     # ValueError: a malformed grandfather list (fail closed)
         print(f"LEDGER: ERROR {e}")
         return 2
 

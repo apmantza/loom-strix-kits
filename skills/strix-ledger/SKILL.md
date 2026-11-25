@@ -54,8 +54,9 @@ duplicate, but the project's own check should refuse it).
   header's result-file. OUTSIDE prints `debug the measurement before believing it` and exits 1: first check the harness
   reproduces a known figure, the configuration matches what is served, the clocks and power state; only then the lever.
   A regex that matches nothing is an error (exit 2), never a pass.
-- `--grandfather N` on preflight and probe-card: steps whose name carries a number <= N pass with a note (written before the
-  check was adopted). Exit codes everywhere: 0 ok, 1 refused / missing / outside / owed, 2 usage or unreadable input.
+- `--grandfather-list FILE` on preflight and probe-card: steps written before the check was adopted, pinned by content
+  (sha256sum format, `sha256sum q*.sh > FILE` once when the check is adopted); a listed step passes with a note only while its
+  content still hashes to its row, so a rewrite in place is checked like a new step. Never a number cut. Exit codes everywhere: 0 ok, 1 refused / missing / outside / owed, 2 usage or unreadable input.
 
 ## Owed ports
 A kept win on one target is often owed to others: the same kernel change for a sibling quant format, a win on one model to the
