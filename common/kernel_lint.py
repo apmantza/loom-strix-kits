@@ -70,6 +70,36 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
             count / size, a workgroup reduce, constants and kernel arguments, and arithmetic, views and plain loads of those;
             everything else (ids, lanes, shuffles, scans, fragments, mma, atomics, volatile loads, unlisted ops, a loop's values
             under a non-uniform trip count) may differ. Fire 11-25 on pkg-e480: none.
+  [rounds]  a NOTE (with --package / --program / --source: launch sites and launch configs; C18, user 11-25): every launch site's grid
+            (workgroups(...) evaluated from index constants and arithmetic; a runtime size such as tokens or spans taken at 1, its
+            one-round bound searched up to ROUNDS_MAX) fits in one round of resident workgroups at the reachable tier (tier_state()'s
+            workgroups per WGP x the device file's WGPs), with >= 2 workgroups: their traversal order cannot matter (E539: a worker's
+            study established it by hand for g_gdn_recurrence_pf, 384 one-wave workgroups at spans = 1 against 720 resident). A
+            site whose grid is empty at size 1 (a prefill tile count) is 'grid: runtime' and keeps the note off; an op it does not
+            model is unknown, never a figure. Fire 11-25 on pkg-e480: 18 kernels (g_gdn_recurrence_pf, the decode matvecs at t = 1,
+            g_attention_combine, dflash helpers); llama.cpp: not applicable (no Loom text).
+  [ldswait] a NOTE (C18; a hypothesis until SQ_WAIT_INST_LDS / SQ_WAVE_CYCLES prices it, E534): the hot loop's ds_loads (>= LDSWAIT_MIN)
+            are retired a median <= LDSWAIT instructions after issue and no lgkmcnt wait leaves one in flight (lds_waits(): one
+            in-order LGKM queue of DS ops and scalar loads, the body run twice). E534: the m256 GEMMs wait lgkmcnt(0) 1-7 after each
+            ds_load_b128 pair (median 2.5, none kept); hipBLASLt's gfx1151 f16 kernels keep up to 16 across their waits. The 11-23
+            'ldsser' note (WMMAs right after an lgkmcnt(0)) was removed after its lever never gained on these GEMMs (E293 / E309 / E335 /
+            E340): this note restates the shape against hipBLASLt's contrast, not a priced lever. Fire 11-25 on pkg-e480: the 14 m256
+            GEMMs, nothing else (flash2 keeps 10 across a wait); llama.cpp 0 of 8,374.
+  [guardwait] a NOTE (C18): a vmcnt wait inside a conditional block of a loop (loop_census.guarded's regions, minus an exit test that
+            leaves or enters a loop) that retires vector loads issued before the branch whose registers the block never reads: the
+            guard drains loads only the code after the join needs. Recurrence E520: STAGE_LIVE x FLATADDR, the carried K scale's
+            vmcnt(0) inside the K guard retired V(kt)'s prefetch (cover 166-203 -> 23-25); C10 catches it only against a base. Fire
+            11-25: pkg-cmb-sf all four flash2 kernels; pkg-cmb2 (the E521 fix) only the two partial kernels (E521's known residue);
+            pkg-cmb-sn / -nf and live none of flash2; live pkg-e480 g_gdn_recurrence_pf / _rec (a wait before a guarded state store);
+            llama.cpp 129 of 8,374.
+  [vopd]    a NOTE (C18 from C5, E551; ported from C5's isa_audit.py, operands by hand: AMD's ISA XML changed no lint row): VOPD pairs a
+            greedy pass could still form from single VALU instructions as allocated (X / Y opcode lists, VOP2 form, no modifier,
+            independent, destinations of opposite parity, SRC0 / VSRC1 of different parity: RDNA3 guide 7.6, gfx11.5 interlock) >=
+            VOPD_MIN in the hot loop; the line adds the back-edge copy block (moves, pairs inside it) and, informational only, WMMAs
+            whose accumulator was written <= 1 WMMA earlier (D -> C latency undocumented, C5 R6a). Live flash2_f16o: 56 (186
+            eligible), back-edge 65 moves -> 31 pairs, dep1 16; m256 GEMM 0, dep1 0 (C5's figures). A wasted s_delay_alu count is not a
+            rule (C5: zero cycles, 2.1 % ceiling at q202). Fire 11-25 on pkg-e480: 7 (flash2 x4, vsplit, two m256 GEMMs); llama.cpp
+            253 of 8,374.
   (potential races, two overlapping accesses with no barrier between, are computed and listed by --barriers only, never a note:
   lane- or wave-indexed staging stores are not proved disjoint (no per-invocation index model), and an author-judged sample of 10
   of the 60 on pkg-e480 (132 without r1's index lattice) found 0 real; all were `row = tid / 2, col = (tid % 2) * 32 + c` staging or per-wave rows.)
@@ -113,7 +143,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from loop_census import cover, disasm, loops, moves  # noqa: E402
+from loop_census import cover, disasm, guarded, loops, moves  # noqa: E402
 
 FLAGS = ("select", "repack", "scratch", "copies", "join", "serial")
 MM = ("v_wmma", "v_dot4", "v_dot2", "v_dot8")
@@ -382,7 +412,7 @@ def tier_state(occ, simds):
     if cur not in (tier, raw):   # raw: the report's own unrounded minimum (E533: flash2_partial, VGPR tier 5 at 3 waves per SIMD is 3)
         return {"why": f"tier unverified: computes to {tier} in whole workgroups ({raw} unrounded), the report says {cur}"}
     out = {"tier": tier, "bound": w % simds != 0, "q": w // simds if w % simds == 0 else round(w / simds, 2), "report_tier": cur,
-           "next": None, "needs": [], "blocked": None}
+           "next": None, "needs": [], "blocked": None, "wgs": n, "target": occ.get("target")}   # wgs: resident workgroups per domain
     m = n + 1
     while busiest(m) <= tier:     # 1-3-wave workgroups: n + 1 can leave the busiest SIMD's ceil unchanged (verify r2 V-F1); Loom
         m += 1                    # inverts from tier + 1 the same way (occupancy.c local_memory_budget)
@@ -644,6 +674,408 @@ def ldsbank(r, js, ins):
         r.setdefault("notes", []).append("ldsbank")
 
 
+# ---- 11-25 lesson notes (C18): ldswait, guardwait, vopd (binary); rounds (program text + residency). Notes, never flags (E251).
+LDSWAIT = 8      # median ds_load -> retiring lgkmcnt distance at or under which LDS loads are waited right after issue (E534)
+LDSWAIT_MIN = 8  # ds_loads the hot loop must hold before the median means anything
+VOPD_MIN = 16    # VOPD pairs left unformed as allocated (whole loop) at or above which the note fires (C5 / E551: flash2 56)
+DSOP = re.compile(r"ds_")
+
+
+def lds_waits(ins, t, e):
+    """(per ds_load of loop [t, e]: instructions to the lgkmcnt wait that retires it; the most ds_loads in flight at once; the most
+    left in flight across a wait). LGKM is one
+    in-order queue of every DS op (stores count too) and scalar load; the body runs twice, so a load issued before the back-edge
+    retires in the next iteration (C5's isa_audit stream). Scalar loads return out of order: a wait that leaves N > 0 pending is
+    counted as retiring the oldest, as serial_links does (HRX-like E534: the m256 GEMMs wait lgkmcnt(0) 1-7 instructions after each
+    ds_load_b128 pair and keep none across a wait; hipBLASLt's gfx1151 f16 kernels keep up to 16 across their waits, mean distance
+    8.5-41 against our 4.0: static-1125/tools-followup/B/cover.txt)"""
+    n = e - t + 1
+    q, dist, most, kept = [], [], 0, 0
+    for p in range(2 * n):
+        x = ins[t + p % n]
+        if DSOP.match(x) or SMLOAD.match(x):
+            q.append((p, x.startswith(("ds_load", "ds_read"))))
+            most = max(most, sum(1 for _, ld in q if ld))
+        w = re.search(r"lgkmcnt\((\d+)\)", x) if x.startswith("s_waitcnt") else None
+        if w:
+            while len(q) > int(w.group(1)):
+                a, ld = q.pop(0)
+                if ld and a < n:
+                    dist.append(p - a)
+            kept = max(kept, sum(1 for _, ld in q if ld))
+    return dist, most, kept
+
+
+def ldswait(r, ins):
+    """note `ldswait` when the hot loop's ds_loads (>= LDSWAIT_MIN) are retired a median <= LDSWAIT instructions after issue and no
+    wait leaves one in flight (every LDS wait drains the queue: E534's shape)"""
+    if r.get("where") != "loop":
+        return
+    d, most, kept = lds_waits(ins, *r["hot_range"])
+    r["lds_dist"], r["lds_fly"], r["lds_kept"] = (statistics.median(d) if d else None), most, kept
+    r["lds_dist_n"] = len(d)
+    if len(d) >= LDSWAIT_MIN and r["lds_dist"] <= LDSWAIT and not kept:
+        r.setdefault("notes", []).append("ldswait")
+
+
+def guard_waits(ins, addr):
+    """vmcnt waits inside a conditional block of a loop (after a forward s_cbranch_*, before its target, both in the loop, the block
+    crossing no loop boundary) that retire vector-memory loads issued before the branch whose data the block never reads: the guard's
+    wait drains loads only the code after the join needs (HRX-like E520: STAGE_LIVE x FLATADDR, the carried K scale's vmcnt(0) inside
+    the K guard retired V(kt)'s prefetch, cover 166-203 -> 23-25). Each loop's body runs twice, so loads carried over the back-edge
+    are pending at its top. Returns [(wait index, branch index, victim loads)], one per wait"""
+    L = loops(ins, addr)
+    cross = lambda b, j: any((a <= b <= z < j) or (b < a <= j - 1 < z) for a, z in L)   # leaves or enters a loop: an exit, not a guard
+    regions = sorted(set((b, hi + 1) for t, e in L for b, _, hi in guarded(ins, addr, t, e)
+                         if ins[b].startswith("s_cbranch_") and not cross(b, hi + 1)))
+    is_vm = lambda x: bool(VMLOAD.match(x)) or x.startswith("scratch_load")
+    hits, reads = {}, {}
+    for t, e in L:
+        n = e - t + 1
+        q = []
+        for p in range(2 * n):
+            i = t + p % n
+            x = ins[i]
+            if is_vm(x):
+                q.append((p, i))
+            w = re.search(r"vmcnt\((\d+)\)", x) if x.startswith("s_waitcnt") else None
+            if not w:
+                continue
+            gone = []
+            while len(q) > int(w.group(1)):
+                gone.append(q.pop(0))
+            if p < n or not gone:
+                continue
+            for b, j in regions:
+                if not (t <= b < i < j <= e):
+                    continue
+                pb = p - (i - b)                                # the branch's position in this stream
+                if (b, j) not in reads:
+                    reads[(b, j)] = set().union(*[defs_uses(ins[y])[1] for y in range(b + 1, j)])
+                victims = [g for g in gone if g[0] < pb and not (defs_uses(ins[g[1]])[0] & reads[(b, j)])]
+                if victims and i not in hits:
+                    hits[i] = (i, b, len(victims))
+    return sorted(hits.values())
+
+
+def guardwait(r, ins, addr):
+    """note `guardwait` on any guard_waits() hit"""
+    r["guard_waits"] = guard_waits(ins, addr)
+    if r["guard_waits"]:
+        r.setdefault("notes", []).append("guardwait")
+
+
+VOPD_X = {"fmac_f32", "fmaak_f32", "fmamk_f32", "mul_f32", "add_f32", "sub_f32", "subrev_f32", "mul_dx9_zero_f32", "mov_b32",
+          "cndmask_b32", "max_f32", "min_f32", "dot2acc_f32_f16", "dot2acc_f32_bf16"}
+VOPD_Y = VOPD_X | {"add_nc_u32", "lshlrev_b32", "and_b32"}
+VOPD_MODS = re.compile(r"\||neg\(|abs\(|clamp|op_sel|dpp|row_|quad_perm|\s-[vs]|,\s*-")   # isa_audit.py's: a modifier VOPD lacks
+
+
+def vnum(tok):
+    m = re.match(r"v(\d+)$", tok or "")
+    return int(m.group(1)) if m else None
+
+
+def vopd_eligible(x):
+    """('XY' | 'Y', operands) for a single VALU instruction VOPD could carry (RDNA3 guide 7.6 / tables 91-92, C5's R5 / R5b), else
+    None: an X or Y opcode, the VOP2 / VOP1 form (_e32 or unsuffixed), no modifier, VSRC1 a VGPR, a cndmask on VCC (port of C5's
+    static-1125/isa/tools/isa_audit.py eligible(), with operands split by hand instead of AMD's ISA XML: C5 found the XML changes no
+    lint row, E551)"""
+    if "::" in x:
+        return None
+    mn, _, rest = x.partition(" ")
+    m = re.match(r"v_(\w+?)(?:_(e32|e64|dpp|sdwa))?$", mn)
+    if not m or m.group(2) not in (None, "e32") or m.group(1) not in VOPD_Y or VOPD_MODS.search(rest):
+        return None
+    ops = [o.strip() for o in re.split(r",(?![^\[]*\])", rest)] if rest.strip() else []
+    n = m.group(1)
+    if n == "cndmask_b32" and (len(ops) < 4 or ops[3] not in ("vcc_lo", "vcc")):
+        return None
+    if n != "mov_b32" and len(ops) >= 3 and vnum(ops[2]) is None and vnum(ops[1]) is None:
+        return None
+    return ("X" if n in VOPD_X else "") + "Y", ops
+
+
+def vopd_pairs(body, lo=0, hi=None, win=8):
+    """VOPD pairs a greedy pass could form from eligible singles in body[lo..hi] as allocated (C5 isa_audit greedy(strict)): an X with
+    a Y within WIN instructions, independent (no def / use overlap, nothing between that writes their sources or reads / writes their
+    destinations, no wait, barrier or branch between), destinations of opposite parity, SRC0 / VSRC1 of different parity (gfx11.5
+    VOPD interlock, R5a; Loom's SOURCE_PARITY). Defs / uses from defs_uses (first operand = destination; C5: SCC / carry-out gaps
+    change no lint row)"""
+    hi = len(body) - 1 if hi is None else hi
+    el = {i: v for i in range(lo, hi + 1) for v in [vopd_eligible(body[i])] if v}
+    du = {}
+    f = lambda k: du.setdefault(k, defs_uses(body[k]))
+    def can(i, j):
+        (ri, oi), (rj, oj) = el[i], el[j]
+        if not (("X" in ri and "Y" in rj) or ("Y" in ri and "X" in rj)):
+            return False
+        (di, ui), (dj, uj) = f(i), f(j)
+        if di & uj or dj & ui or di & dj:
+            return False
+        for k in range(i + 1, j):
+            if body[k].startswith(("s_waitcnt", "s_barrier", "s_cbranch", "s_branch", "s_setprio")):
+                return False
+            dk, uk = f(k)
+            if dk & (uj | dj) or uk & dj:
+                return False
+        a, b = vnum(oi[0]), vnum(oj[0])
+        if a is None or b is None or (a & 1) == (b & 1):
+            return False
+        for k in (1, 2):
+            a = vnum(oi[k]) if len(oi) > k else None
+            b = vnum(oj[k]) if len(oj) > k else None
+            if a is not None and b is not None and a != b and (a & 1) == (b & 1):
+                return False
+        return True
+    used, n = set(), 0
+    for i in sorted(el):
+        if i in used:
+            continue
+        for j in sorted(el):
+            if j > i and j not in used and j - i <= win and can(i, j):
+                used |= {i, j}
+                n += 1
+                break
+    return n, len(el)
+
+
+def backedge_block(body):
+    """(first, last) of the register-copy run (moves at most 3 apart) whose last move sits within 8 instructions of the loop's end, or
+    None: the allocator's back-edge copies (E179 / #3542; C5: flash2's +882..+946, 65 v_mov)"""
+    mv = [j for j, x in enumerate(body) if copy_moves(x)]
+    if not mv or len(body) - 1 - mv[-1] > 8:
+        return None
+    a = len(mv) - 1
+    while a > 0 and mv[a] - mv[a - 1] <= 3:
+        a -= 1
+    return mv[a], mv[-1]
+
+
+def wmma_dep1(body):
+    """WMMAs whose accumulator C was written by a WMMA at most one WMMA earlier (D -> C gap 0 or 1), the body run twice so the
+    back-edge counts: informational, the D -> C latency is undocumented (C5 R6a; flash2's QK^T 2-accumulator chains: 16)"""
+    stream = body + body
+    wm = [i for i, x in enumerate(stream) if x.startswith("v_wmma")]
+    ops = {i: [regs(o) for o in re.split(r",(?![^\[]*\])", stream[i].partition(" ")[2])[:4]] for i in wm}
+    n = 0
+    for k, i in enumerate(wm):
+        if i < len(body):
+            continue
+        for m in range(k - 1, -1, -1):
+            if ops[wm[m]][0] & ops[i][3]:
+                n += k - m - 1 <= 1
+                break
+    return n
+
+
+def vopd(r, ins):
+    """the hot loop's unformed VOPD pairs as allocated, its back-edge copy block (moves, pairs inside it) and WMMA D -> C gap <= 1
+    count; note `vopd` at >= VOPD_MIN unformed pairs (C5 / E551: flash2 56, back-edge 65 moves -> 31 pairs; GEMM m256 0)"""
+    if r.get("where") != "loop":
+        return
+    t, e = r["hot_range"]
+    body = ins[t:e + 1]
+    r["vopd_pairs"], r["vopd_eligible"] = vopd_pairs(body)
+    bb = backedge_block(body)
+    r["backedge"] = (sum(copy_moves(x) for x in body[bb[0]:bb[1] + 1]), vopd_pairs(body, *bb)[0], bb) if bb else None
+    r["wmma_dep1"] = wmma_dep1(body)
+    if r["vopd_pairs"] >= VOPD_MIN:
+        r.setdefault("notes", []).append("vopd")
+
+
+IDX_OPS = {"index.add": lambda a, b: a + b, "index.sub": lambda a, b: a - b, "index.mul": lambda a, b: a * b,
+           "index.div": lambda a, b: a // b if b else None, "index.ceildiv": lambda a, b: -(-a // b) if b else None,
+           "index.rem": lambda a, b: a % b if b else None, "index.min": min, "index.max": max}
+ROUNDS_MAX = 8192    # the largest runtime size searched for the one-round bound (Loom's index.assume ranges on tokens / spans)
+
+
+def idx_eval(lines, env, other="conflict"):
+    """%name -> value over index.constant / index.assume / IDX_OPS lines, starting from ENV: an int, 'runtime' (a size known only at
+    run time), ('op', name, a, b), or 'conflict' (unknown). A name defined by any other op, or twice with different text, gets OTHER:
+    'conflict' in a kernel's launch config (fail closed), 'runtime' in the launching definition (config.get, arguments, loop values)"""
+    seen, env = {}, dict(env)
+    for line in lines:
+        m = re.match(r"\s*(%\w+)\s*=\s*([\w.]+)\s+(.*)$", line)
+        if not m:
+            continue
+        name, op, rest = m.groups()
+        if name in seen and seen[name] != (op, rest):
+            env[name] = other
+            continue
+        seen[name] = (op, rest)
+        args = re.findall(r"%\w+", rest.split("[", 1)[0].split(":", 1)[0])
+        if op == "index.constant":
+            c = re.match(r"(-?\d+)\s*:\s*index", rest)
+            env[name] = int(c.group(1)) if c else other
+        elif op == "index.assume" and args and args[0] in env:
+            env[name] = env[args[0]]
+        elif op in IDX_OPS and len(args) == 2 and all(a in env for a in args):
+            env[name] = ("op", op, env[args[0]], env[args[1]])
+        else:
+            env[name] = other
+    return env
+
+
+def idx_value(v, size):
+    """an idx_eval() value at runtime size SIZE (every runtime size the same), or None"""
+    if isinstance(v, int):
+        return v
+    if v == "runtime":
+        return size
+    if isinstance(v, tuple):
+        a, b = idx_value(v[2], size), idx_value(v[3], size)
+        return None if a is None or b is None else IDX_OPS[v[1]](a, b)
+    return None
+
+
+def uses_runtime(v):
+    return v == "runtime" or (isinstance(v, tuple) and (uses_runtime(v[2]) or uses_runtime(v[3])))
+
+
+def launch_grids(texts):
+    """kernel -> [one value per workgroup axis, per launch site]: each site's grid operands resolved in the definition that launches
+    it (through dual-target selectors to the template.apply's arguments) and fed to the kernel's kernel.launch.config workgroups(...).
+    A value is an int, 'runtime' arithmetic (config.get, a kernel argument, a loop value: anything not an index constant; idx_value
+    evaluates it at a runtime size), or 'conflict' (unknown: a name defined twice, an op idx_eval does not model)"""
+    blocks = []
+    for t in texts:
+        starts = [m.start() for m in re.finditer(r"(?m)^[a-z]\w*\.def\b", t)] + [len(t)]
+        blocks += [t[a:b] for a, b in zip(starts, starts[1:])]
+    configs, sels = {}, {}
+    for b in blocks:
+        m = re.match(r'kernel\.def (?:target\(@\w+\) )?export\("(\w+)"\) @\w+\(([^)]*)\)\s*\{', b)
+        if m:
+            head = b[m.end():b.find("} launch(")]
+            configs[m.group(1)] = ([x.split(":")[0].strip() for x in m.group(2).split(",") if x.strip()], head)
+        m = re.match(r"template\.def<@(sel\d+_\w+)> target\(@rdna3\) @\w+\(([^)]*)\)", b)
+        if m:
+            g = re.search(r"kernel\.launch @(\w+)\[([^\]]*)\]", b)
+            if g:
+                sels[m.group(1)] = ([x.split(":")[0].strip() for x in m.group(2).split(",")], g.group(1),
+                                    [x.strip() for x in g.group(2).split(",")])
+    out = collections.defaultdict(list)
+    for b in blocks:
+        if b.startswith("template.def"):
+            continue
+        sites = [(m.group(1), [x.strip() for x in m.group(2).split(",")]) for m in re.finditer(r"kernel\.launch @(\w+)\[([^\]]*)\]", b)]
+        for m in re.finditer(r"template\.apply<@(sel\d+_\w+)>\(([^)]*)\)", b):
+            if m.group(1) in sels:
+                params, k, grid = sels[m.group(1)]
+                args = dict(zip(params, [x.strip() for x in m.group(2).split(",")]))
+                sites.append((k, [args.get(g, "?") for g in grid]))
+        if not sites:
+            continue
+        lines = b.split("\n")
+        env = idx_eval(lines, {}, "runtime")
+        for k, ops in sites:
+            if k not in configs:
+                continue
+            params, head = configs[k]
+            vals = [env.get(o, "runtime") for o in ops]
+            if len(vals) != len(params):
+                out[k].append(None)
+                continue
+            cenv = idx_eval(head.split("\n"), dict(zip(params, vals)))
+            w = re.search(r"workgroups\(([^)]*)\)", head)
+            out[k].append([cenv.get(x.strip(), "conflict") for x in w.group(1).split(",")] if w else None)
+    return out
+
+
+def device_domains(target):
+    """occupancy domains (WGPs) of the device: simds / simds_per_occupancy_domain from common/devices/<target>.json, or None"""
+    f = os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices", f"{target}.json")
+    d = json.load(open(f)) if target and os.path.exists(f) else {}
+    s, p = d.get("simds"), d.get("simds_per_occupancy_domain")
+    return s // p if isinstance(s, int) and isinstance(p, int) and p and s % p == 0 else None
+
+
+def grid_rounds(sites, wgs, domains):
+    """rounds of workgroups at the reachable tier over a kernel's launch sites: {"resident", "sites": [(workgroups, rounds, runtime?,
+    largest runtime size still one round)], "runtime": sites whose grid is empty at runtime size 1 (judged nowhere: 'grid: runtime'),
+    "unknown": sites not resolved}. A constant grid gives its own figures; a runtime grid is taken at runtime size 1 (every runtime
+    size the same: tokens = spans = 1, a decode step or one prefill span) and its one-round bound is searched up to ROUNDS_MAX by
+    bisection (grids grow with the size through add / mul / div / ceildiv; a grid that shrinks is unknown). HRX-like E539:
+    g_gdn_recurrence_pf's 384 one-wave workgroups at spans = 1 run in one round (720 resident); two spans need 768"""
+    res = wgs * domains
+    out, rt0, unk = [], 0, 0
+    for s in sites:
+        if not s or any(v == "conflict" for v in s):
+            unk += 1
+            continue
+        vals = lambda v: [idx_value(x, v) for x in s]
+        total = lambda v: math.prod(vals(v)) if None not in vals(v) else None
+        g1, rt = total(1), any(uses_runtime(x) for x in s)
+        if g1 is None or (rt and (total(ROUNDS_MAX) is None or total(ROUNDS_MAX) < g1)) or (g1 <= 0 and not rt):
+            unk += 1
+            continue
+        if g1 <= 0:
+            rt0 += 1
+            continue
+        upto = None
+        if rt and g1 <= res:
+            lo, hi = 1, ROUNDS_MAX
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                lo, hi = (mid, hi) if total(mid) <= res else (lo, mid - 1)
+            upto = lo
+        out.append((g1, -(-g1 // res), rt, upto))
+    return {"resident": res, "sites": out, "runtime": rt0, "unknown": unk}
+
+
+def rounds(rows, texts):
+    """note `rounds` on a kernel whose every launch site resolves to one round (a constant grid, or a runtime grid at size 1) with
+    >= 2 workgroups at its largest: all its workgroups are resident together, so their traversal order cannot matter (E539: a
+    study established it by hand for the GDN recurrence). r['rounds'] keeps the figures for every kernel with launch sites"""
+    grids = launch_grids(texts)
+    for r in rows:
+        o = r.get("occ")
+        if not o or "why" in o or r["kernel"] not in grids:
+            continue
+        dom = device_domains(o.get("target"))
+        if not dom:
+            continue
+        g = grid_rounds(grids[r["kernel"]], o["wgs"], dom)
+        r["rounds"] = g
+        if g["sites"] and not g["unknown"] and not g["runtime"] and all(x[1] == 1 for x in g["sites"]) and \
+                max(x[0] for x in g["sites"]) >= 2:
+            r.setdefault("notes", []).append("rounds")
+
+
+def rounds_text(r):
+    """the rounds line of a kernel"""
+    g, o = r["rounds"], r["occ"]
+    ws = sorted(set(x[0] for x in g["sites"]))
+    rt = [x for x in g["sites"] if x[2]]
+    return (f"rounds {r['kernel']}: {'/'.join(map(str, ws[:4]))}{' ...' if len(ws) > 4 else ''} workgroups over {len(g['sites'])} launch "
+            f"site(s){' (runtime grids at size 1)' if rt else ''}, {g['resident']} resident ({o['wgs']} per WGP at {tier_text(o)} "
+            f"waves/SIMD{', a bound' if o['bound'] else ''}): 1 round, traversal order irrelevant"
+            + (f"; runtime grids stay one round up to size {min(x[3] for x in rt)}" if rt else ""))
+
+
+def lesson_lines(rows):
+    """the lines of the C18 notes (rounds, ldswait, guardwait, vopd), by kernel"""
+    out = []
+    for r in sorted(rows, key=lambda r: r["kernel"]):
+        n = r.get("notes", [])
+        if "rounds" in n:
+            out.append(rounds_text(r))
+        if "ldswait" in n:
+            out.append(f"ldswait {r['kernel']}: hot-loop ds_loads ({r['lds_dist_n']}) retired a median {r['lds_dist']} instructions after "
+                       f"issue, up to {r['lds_fly']} in flight, none kept across a wait (E534: hipBLASLt keeps up to 16; a hypothesis "
+                       f"until SQ_WAIT_INST_LDS prices it)")
+        if "guardwait" in n:
+            i, b, v = r["guard_waits"][0]
+            out.append(f"guardwait {r['kernel']}: {len(r['guard_waits'])} vmcnt wait(s) inside a conditional block retire loads issued "
+                       f"before its branch that the block never reads (first: instruction {i}, branch at {b}, {v} load(s); E520)")
+        if "vopd" in n:
+            be = r.get("backedge")
+            out.append(f"vopd {r['kernel']}: {r['vopd_pairs']} VOPD pairs unformed as allocated ({r['vopd_eligible']} eligible single VALU)"
+                       + (f"; back-edge copy block {be[0]} moves -> {be[1]} pairs" if be else "")
+                       + f"; WMMA D->C gap <= 1: {r.get('wmma_dep1')} (latency undocumented; C5 / E551)")
+    return out
+
+
 def lint_listing(name, ins, addr, res=(None, None)):
     """the lint of one kernel's decoded listing (instructions, byte addresses), as lint() reports it"""
     r = {"kernel": name, "instr": len(ins), "flags": []}
@@ -695,6 +1127,9 @@ def lint_listing(name, ins, addr, res=(None, None)):
     r["join"] = join_runs(ins)
     if r["join"] >= JOIN_RUN:
         r["flags"].append("join")
+    ldswait(r, ins)
+    guardwait(r, ins, addr)
+    vopd(r, ins)
     r["pf"] = "-"
     loads = [j for j, x in enumerate(full) if re.match(r"(global|buffer)_load_", x)]
     w = [j for j, x in enumerate(full) if x.startswith("v_wmma")]
@@ -1478,6 +1913,7 @@ def main():
         rows = [r for rs in ex.map(lambda f: lint_file(f, rga), files) for r in rs]
     outl = outliers(rows)
     tiny(rows, stats)
+    rounds(rows, texts)
     barriers(rows, kernel_texts(texts), func_texts(texts), a.roots, a.barriers)
     mv = {k: c for k, t in kernel_texts(texts).items() if (a.roots is None or re.search(a.roots, k)) for c in [masked_v(t)] if c}
     for r in rows:
@@ -1537,6 +1973,8 @@ def main():
     for r in sorted(rows, key=lambda r: r["kernel"]):
         for line in barrier_report(r, starts.get(r["kernel"]), a.barriers):
             print(line)
+    for line in lesson_lines(rows):
+        print(line)
     for k, c in sorted(mv.items()):
         print(f"maskedv {k}: {len(c)} key-valid bits ({' '.join(c[:3])}{' ...' if len(c) > 3 else ''}) mask only the score: no value "
               f"outside the score chain is zeroed and no compared key is clamped (E444: V of a masked key times p = +0)")
