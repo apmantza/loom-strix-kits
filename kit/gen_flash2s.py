@@ -80,8 +80,8 @@ if HEADPACK:
                        ((WPH, KT, KB, NG, GW) != (2, 32, 2, 1, 6), f"2 waves x 128 dims per head, 32-key tiles, one head group (have WPH {WPH}, KT {KT}, NG {NG})"),
                        (bool(os.environ.get("FLASH2_KT256")), "no FLASH2_KT256"),
                        (bool(_c.get("sliding_window")), "no sliding window (the window edge's cut invariance is not argued for packing)"),
-                       (os.environ.get("FLASH2_SPLITK_SELF", "1") != "1" or os.environ.get("FLASH2_SPLITK_ANY", "0") != "1",
-                        "needs FLASH2_SPLITK_ANY=1 (self-listing, off = 0: its leader grid is what limits a tile to 8 tokens)"),
+                       (os.environ.get("FLASH2_SPLITK_ANY", "0") != "1",
+                        "needs FLASH2_SPLITK_ANY=1 (off = 0: its leader grid is what limits a tile to 8 tokens)"),
                        (os.environ.get("FLASH2_EDGE_ZERO", "0") == "1", "no FLASH2_EDGE_ZERO")):
         if _bad:
             sys.exit(f"FLASH2_HEADPACK: {_why}")
@@ -664,13 +664,13 @@ if SPLITK:
   %pos0_32 = scalar.subi %posf_32, %off32 : i32
   %off = index.cast %off32 : i32 to index
 """
-    if os.environ.get("FLASH2_SPLITK_SELF", "1") == "1":
-        assert text.count(LISTED) == 1
-        text = text.replace(LISTED, SELF, 1)
-        text = text.replace("  %tile = index.assume %tile_id [lt(%tile_id, %tile_count4)] : index", "  %tile = index.assume %tile_id [lt(%tile_id, %tokens)] : index\n  %c2s = index.constant 2 : index", 1)
-        text = text.replace("kernel.launch.config workgroups(%tiles4, %ckv, %csk_w)", "kernel.launch.config workgroups(%tokens, %ckv, %csk_w)", 1)
-        text = text.replace("%tokens = index.assume %tokens_arg [range(%tokens_arg, 16, 8192), multiple_of(%tokens_arg, 16)] : index",
-                            "%tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index")
+    # self-listing, unconditional (the switch census 11-25 folded FLASH2_SPLITK_SELF: no recipe set its default 1 off; FLASH2_SPLITK_ANY needs it)
+    assert text.count(LISTED) == 1
+    text = text.replace(LISTED, SELF, 1)
+    text = text.replace("  %tile = index.assume %tile_id [lt(%tile_id, %tile_count4)] : index", "  %tile = index.assume %tile_id [lt(%tile_id, %tokens)] : index\n  %c2s = index.constant 2 : index", 1)
+    text = text.replace("kernel.launch.config workgroups(%tiles4, %ckv, %csk_w)", "kernel.launch.config workgroups(%tokens, %ckv, %csk_w)", 1)
+    text = text.replace("%tokens = index.assume %tokens_arg [range(%tokens_arg, 16, 8192), multiple_of(%tokens_arg, 16)] : index",
+                        "%tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index")
     # FLASH2_SPLITK_ANY=1 (HRX-like E141/E143): a tile starts at its leader's position, not at the leader's 16-position block.
     # Served verify spans (8 tokens) start anywhere, and half of them straddled a block: two leaders, each walking the whole
     # context (1.62 vs 3.01 ms served). Here a token leads when it starts a run, sits on the 16-token grid of the launch
@@ -682,7 +682,6 @@ if SPLITK:
     # after exp), m = max(m, -big) = m and alpha = exp(0) = 1 keep its state, and a split wholly past its position leaves
     # (-big, 0, 0), the neutral partial an empty split stores.
     if os.environ.get("FLASH2_SPLITK_ANY", "0") == "1":
-        assert os.environ.get("FLASH2_SPLITK_SELF", "1") == "1", "FLASH2_SPLITK_ANY needs the self-listing kernel"
         BK = int(os.environ.get("FLASH2_SPLITK_BUCKET", "4096"))
         assert BK & (BK - 1) == 0 and BK % KT == 0 and BK >= 16, "FLASH2_SPLITK_BUCKET: a power of two of whole key tiles"
 
