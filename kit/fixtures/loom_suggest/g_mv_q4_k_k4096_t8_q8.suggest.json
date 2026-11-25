@@ -1,0 +1,57 @@
+{
+ "finding_count": 4,
+ "findings": [
+  {
+   "action": "WARNING: g_mv_q4_k_k4096_t8_q8 vector.shrui: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_mv_q4_k_k4096_t8_q8",
+   "evidence": {
+    "source_low.selection_summaries.rows[20].maximum_emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_mv_q4_k_k4096_t8_q8 vector.andi: up to 17 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_mv_q4_k_k4096_t8_q8",
+   "evidence": {
+    "source_low.selection_summaries.rows[21].maximum_emitted_low_op_count": 17
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: source_to_low: up to 28 Low operations per source operation. Capture --compile-report=details to identify the source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "<report>",
+   "evidence": {
+    "source_low.unkeyed_maximum_emitted_op_count": 28
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "Reduce amdgpu.vgpr by at least 16 registers/subgroup (to at most 96). Recompile and benchmark the modeled transition 12 -> 16 subgroups/SIMD; higher modeled residency is not a throughput guarantee.",
+   "confidence": "high",
+   "entry": "g_mv_q4_k_k4096_t8_q8",
+   "evidence": {
+    "entries.rows[0].target_resources.residency.current_tier": 12,
+    "entries.rows[0].target_resources.residency.next_better_tier": 16,
+    "residency_constraints.rows[1].allocation_scope": "subgroup",
+    "residency_constraints.rows[1].name": "amdgpu.vgpr",
+    "residency_constraints.rows[1].reduction_units_to_next_better_tier": 16,
+    "residency_constraints.rows[1].unit": "registers",
+    "residency_constraints.rows[1].units": 112
+   },
+   "id": "amdgpu.residency_cliff"
+  }
+ ],
+ "guidance": "Static compiler findings; order and confidence do not rank performance benefit. Optimization requires a known-good oracle's native instruction mix, controlled measurement on the intended machine, and data reuse policy, plus an end-to-end opportunity bound. An unexplained large oracle gap stops local tuning; small gains over our own baseline do not qualify the execution shape.",
+ "kind": "loom.compile_report.suggest",
+ "provider": "source+amdgpu",
+ "schema_version": 0,
+ "source": "g_mv_q4_k_k4096_t8_q8.report.json",
+ "status": "available",
+ "target": {
+  "family": "amdgpu",
+  "key": "gfx1151"
+ }
+}

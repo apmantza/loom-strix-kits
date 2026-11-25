@@ -1,0 +1,224 @@
+{
+ "finding_count": 22,
+ "findings": [
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.fptrunc: up to 57 Low operations per source operation (12 source operations summarized) via amdgpu.vector_16bit_float_conversion.strategy.f32_to_packed_f16. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[9].maximum_emitted_low_op_count": 57
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o scalar.xori: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[10].maximum_emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.mulf: up to 33 Low operations per source operation (4 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[23].maximum_emitted_low_op_count": 33
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.addf: up to 25 Low operations per source operation (12 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[26].maximum_emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.addi: up to 25 Low operations per source operation (4 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[27].maximum_emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.ori: up to 25 Low operations per source operation (4 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[28].maximum_emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.andi: up to 25 Low operations per source operation (4 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[29].maximum_emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.reduce: up to 16 Low operations per source operation (4 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[30].maximum_emitted_low_op_count": 16
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.subf: up to 25 Low operations per source operation (4 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[36].maximum_emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.mulf: up to 17 Low operations per source operation (4 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[37].maximum_emitted_low_op_count": 17
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.exp2f: up to 17 Low operations per source operation (12 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[38].maximum_emitted_low_op_count": 17
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.reduce: up to 16 Low operations per source operation (4 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[39].maximum_emitted_low_op_count": 16
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.mulf: up to 25 Low operations per source operation (40 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[42].maximum_emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o scalar.xori: up to 6 Low operations per source operation (2 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[44].maximum_emitted_low_op_count": 6
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o scalar.andi: up to 6 Low operations per source operation (4 source operations summarized). Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[45].maximum_emitted_low_op_count": 6
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o scalar.divf: up to 11 Low operations per source operation via amdgpu.scalar_divf.strategy.exact_fixup. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[48].maximum_emitted_low_op_count": 11
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.divf: up to 42 Low operations per source operation (8 source operations summarized) via amdgpu.vector_divf.strategy.arcp_rcp_mul. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[49].maximum_emitted_low_op_count": 42
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_attention_flash2_f16o vector.fragment.store: up to 43 Low operations per source operation (8 source operations summarized) via scalar_f16_store. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "source_low.selection_summaries.rows[50].maximum_emitted_low_op_count": 43
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: source_to_low: up to 63 Low operations per source operation. Capture --compile-report=details to identify the source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "<report>",
+   "evidence": {
+    "source_low.unkeyed_maximum_emitted_op_count": 63
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: math_legalization: up to 8 source IR operations per source operation. Capture --compile-report=details to identify the source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "<report>",
+   "evidence": {
+    "math_legalization.maximum_created_op_count": 8
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: target_legalization: up to 17 source IR operations per source operation. Capture --compile-report=details to identify the source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "<report>",
+   "evidence": {
+    "target_legalization.maximum_created_op_count": 17
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "Reduce amdgpu.vgpr by at least 24 registers/subgroup (to at most 216) and amdgpu.lds by at least 18,944 bytes/workgroup (to at most 43,008) together; reducing only one leaves another limiter. Recompile and benchmark the modeled transition 6 -> 7 subgroups/SIMD; higher modeled residency is not a throughput guarantee.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "entries.rows[0].target_resources.residency.current_tier": 6,
+    "entries.rows[0].target_resources.residency.next_better_tier": 7,
+    "residency_constraints.rows[1].allocation_scope": "subgroup",
+    "residency_constraints.rows[1].name": "amdgpu.vgpr",
+    "residency_constraints.rows[1].reduction_units_to_next_better_tier": 24,
+    "residency_constraints.rows[1].unit": "registers",
+    "residency_constraints.rows[1].units": 240,
+    "residency_constraints.rows[2].allocation_scope": "workgroup",
+    "residency_constraints.rows[2].name": "amdgpu.lds",
+    "residency_constraints.rows[2].reduction_units_to_next_better_tier": 18944,
+    "residency_constraints.rows[2].unit": "bytes",
+    "residency_constraints.rows[2].units": 61952
+   },
+   "id": "amdgpu.residency_cliff"
+  }
+ ],
+ "guidance": "Static compiler findings; order and confidence do not rank performance benefit. Optimization requires a known-good oracle's native instruction mix, controlled measurement on the intended machine, and data reuse policy, plus an end-to-end opportunity bound. An unexplained large oracle gap stops local tuning; small gains over our own baseline do not qualify the execution shape.",
+ "kind": "loom.compile_report.suggest",
+ "provider": "source+amdgpu",
+ "schema_version": 0,
+ "source": "g_attention_flash2_f16o.report.json",
+ "status": "available",
+ "target": {
+  "family": "amdgpu",
+  "key": "gfx1151"
+ }
+}

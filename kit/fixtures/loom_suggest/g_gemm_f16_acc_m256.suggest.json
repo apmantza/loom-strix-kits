@@ -1,0 +1,962 @@
+{
+ "finding_count": 103,
+ "findings": [
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 kernel.workgroup.reduce: up to 31 Low operations per source operation via amdgpu.workgroup_reduce.publication.redundant_subgroup. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[42].emitted_low_op_count": 31
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 index.madd: up to 13 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[70].emitted_low_op_count": 13
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.splatf: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[72].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 index.add: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[78].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 27 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[80].emitted_low_op_count": 27
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 index.add: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[82].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 27 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[84].emitted_low_op_count": 27
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[85].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 16 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[86].emitted_low_op_count": 16
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.store: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[93].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.store: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[94].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 12 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[105].emitted_low_op_count": 12
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 12 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[106].emitted_low_op_count": 12
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 8 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[111].emitted_low_op_count": 8
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 8 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[112].emitted_low_op_count": 8
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[113].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[117].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[118].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[119].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[120].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[141].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[142].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[143].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[144].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[165].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[166].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[167].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[168].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[189].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[190].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[191].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.load: up to 7 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[192].emitted_low_op_count": 7
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.store: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[216].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 12 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[218].emitted_low_op_count": 12
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[219].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[220].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 9 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[221].emitted_low_op_count": 9
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[225].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 38 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[226].emitted_low_op_count": 38
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[227].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 35 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[228].emitted_low_op_count": 35
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[230].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 38 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[231].emitted_low_op_count": 38
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[232].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 45 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[233].emitted_low_op_count": 45
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[235].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 38 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[236].emitted_low_op_count": 38
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[237].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 45 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[238].emitted_low_op_count": 45
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[240].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 38 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[241].emitted_low_op_count": 38
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[242].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 45 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[243].emitted_low_op_count": 45
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[244].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 39 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[245].emitted_low_op_count": 39
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[246].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 46 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[247].emitted_low_op_count": 46
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[248].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 49 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[249].emitted_low_op_count": 49
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[250].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[251].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[252].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 49 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[253].emitted_low_op_count": 49
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[254].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[255].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[256].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 49 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[257].emitted_low_op_count": 49
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[258].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[259].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[260].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 39 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[261].emitted_low_op_count": 39
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[262].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 46 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[263].emitted_low_op_count": 46
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[264].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 49 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[265].emitted_low_op_count": 49
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[266].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[267].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[268].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 49 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[269].emitted_low_op_count": 49
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[270].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[271].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[272].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 49 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[273].emitted_low_op_count": 49
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[274].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[275].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[276].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 39 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[277].emitted_low_op_count": 39
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[278].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 46 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[279].emitted_low_op_count": 46
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[280].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 49 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[281].emitted_low_op_count": 49
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[282].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[283].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[284].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 49 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[285].emitted_low_op_count": 49
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[286].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[287].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.mulf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[288].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.load: up to 49 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[289].emitted_low_op_count": 49
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.addf: up to 25 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[290].emitted_low_op_count": 25
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[291].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion"
+  },
+  {
+   "action": "Reduce amdgpu.lds by at least 12,320 bytes/workgroup (to at most 43,008). Recompile and benchmark the modeled transition 4 -> 5 subgroups/SIMD; higher modeled residency is not a throughput guarantee.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "entries.rows[0].target_resources.residency.current_tier": 4,
+    "entries.rows[0].target_resources.residency.next_better_tier": 5,
+    "residency_constraints.rows[2].allocation_scope": "workgroup",
+    "residency_constraints.rows[2].name": "amdgpu.lds",
+    "residency_constraints.rows[2].reduction_units_to_next_better_tier": 12320,
+    "residency_constraints.rows[2].unit": "bytes",
+    "residency_constraints.rows[2].units": 55328
+   },
+   "id": "amdgpu.residency_cliff"
+  },
+  {
+   "action": "Test a pitch or padding change for vector.store/x_stage/amdgpu.ds_write_b128: 4/12 proven instruction sites conflict, needing 96 service rounds versus 48 uncontended (2.00x; 48 extra). These are static counts, not cycles or a runtime ranking. Update producer and consumer views together and recheck the current 16 B/lane instruction width. LDS is 55,328 B/workgroup; with launch and other resources fixed, up to 10,208 B of growth stays below the recorded 4 -> 2 subgroups/SIMD cliff at 65,537 B. Recompile, compare all access directions, check spill or occupancy regressions, and select only from hardware timing.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "entries.rows[0].target_resources.residency.current_tier": 4,
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.name": "amdgpu.lds",
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.next_worse.additional_units": 10209,
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.next_worse.cliff_units": 65537,
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.next_worse.tier": 2,
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.units": 55328,
+    "source_low.memory.bank_service_groups[0].model.evidence": "silicon-calibrated-vendor-model",
+    "source_low.memory.bank_service_groups[0].model.packet_bytes": 16,
+    "source_low.memory.bank_service_groups[0].model.revision": "AMD:CK-LDS-2025-07-25;ROCm-guide-7.2.3:6.3.3",
+    "source_low.memory.bank_service_groups[0].summary.exact_packet_count": 12,
+    "source_low.memory.bank_service_groups[0].summary.structural.conflicted_packet_count": 4,
+    "source_low.memory.bank_service_groups[0].summary.structural.extra_round_count": 48,
+    "source_low.memory.bank_service_groups[0].summary.structural.maximum_request_multiplicity": 4,
+    "source_low.memory.bank_service_groups[0].summary.structural.required_round_count": 96,
+    "source_low.memory.bank_service_groups[0].summary.structural.uncontended_round_count": 48
+   },
+   "id": "amdgpu.lds_bank_service"
+  }
+ ],
+ "guidance": "Static compiler findings; order and confidence do not rank performance benefit. Optimization requires a known-good oracle's native instruction mix, controlled measurement on the intended machine, and data reuse policy, plus an end-to-end opportunity bound. An unexplained large oracle gap stops local tuning; small gains over our own baseline do not qualify the execution shape.",
+ "kind": "loom.compile_report.suggest",
+ "provider": "source+amdgpu",
+ "schema_version": 0,
+ "source": "g_gemm_f16_acc_m256.report.json",
+ "status": "available",
+ "target": {
+  "family": "amdgpu",
+  "key": "gfx1151"
+ }
+}

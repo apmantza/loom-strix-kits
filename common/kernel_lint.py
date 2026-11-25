@@ -1211,6 +1211,12 @@ def main():
     ap.add_argument("--barriers", action="store_true", help="print every barrier of every analysed kernel with the hazard pairs it "
                     "orders and the potential races (computed only then), not only the kernels with a barrier that orders nothing or "
                     "that the check could not model")
+    ap.add_argument("--suggest", action="store_true", help="run `loom-compile-report suggest` (common/loom_suggest.py) on each kernel's "
+                    "compile report: its findings as loom:<id> notes (never flags) and one 'loom KERNEL:' line per finding kind; a failed "
+                    "run is a printed 'unknown (...)' and the table stays complete")
+    ap.add_argument("--suggest-tool", help="with --suggest: the loom-compile-report (default: loom_suggest.tool())")
+    ap.add_argument("--device", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices", "gfx1151.json"),
+                    help="with --suggest: the device file whose simds_per_occupancy_domain judges Loom's residency cliffs")
     ap.add_argument("--flagged", action="store_true", help="print flagged kernels only")
     ap.add_argument("--strict", action="store_true", help="exit 1 when any kernel is flagged")
     a = ap.parse_args()
@@ -1249,6 +1255,21 @@ def main():
             b = os.path.join(a.baseline, r["kernel"] + ".hsaco")
             if os.path.exists(b):
                 r["flags"] += ["regress:" + x for x in regressions(r, lint(b))]
+    loom_lines = []
+    if a.suggest:
+        import lint_counters
+        import loom_suggest
+        simds = json.load(open(a.device)).get("simds_per_occupancy_domain")
+        reps = {}
+        for f in files:
+            if f.endswith(".hsaco"):
+                reps[os.path.basename(f)[:-6]] = f[:-6] + ".json"
+        sug = loom_suggest.survey({r["kernel"]: reps.get(r["kernel"], "") for r in rows}, loom_suggest.tool(a.suggest_tool),
+                                  lambda js: lint_counters.occupancy(lint_counters.report_limit(js)[4], simds), a.jobs)
+        for r in rows:
+            x = sug[r["kernel"]]
+            r.setdefault("notes", []).extend(n for n in x["notes"] if n not in r["notes"])
+            loom_lines += [f"loom {r['kernel']}: {ln}" for ln in x["lines"] if ln != "no findings"]
     rows.sort(key=lambda r: (-bool(r["flags"]), -ms.get(r["kernel"], 0), -len(r["flags"]), -(sites or {}).get(r["kernel"], 0), r["kernel"]))
     print(f"{'kernel':42s} {'where':>6s} {'loop':>5s} {'comm':>5s} {'mm':>4s} {'other/op':>8s} {'sel':>4s} {'pk':>3s} {'bfe':>4s} {'scr':>4s} {'mov':>4s} "
           f"{'run':>4s} {'vgpr':>4s} {'w/S':>3s} {'next':>4s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
@@ -1262,6 +1283,9 @@ def main():
               f"{f(r['lds_waits_per_op']):>5s} {f(r['cover_min']):>4s} {r['in_flight']:3d} {f(r.get('bank_extra')):>5s} "
               f"{('%.1f' % ms[r['kernel']]) if r['kernel'] in ms else '-':>8s}  "
               f"{' '.join(r['flags'])}{('  [' + ' '.join(r['notes']) + ']') if r.get('notes') else ''}")
+    if a.suggest:
+        print(loom_suggest.ADVICE + ":")
+        print("\n".join(sorted(loom_lines)))
     for k, (v, med, n) in sorted(outl.items()):
         print(f"outlier {k}: {v} non-MMA instructions per MMA vs a median of {med} over {n} peers")
     for r in rows:

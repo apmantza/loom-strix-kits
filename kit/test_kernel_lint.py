@@ -105,6 +105,33 @@ def main():
            f"a two-kernel object gives two rows equal to the kernel alone ({[(x['kernel'], x['select'], x['loop']) for x in rows]} vs {r['select']}, {r['loop']})")
         r = compile_lint(lc, t, "iq4_new", qv + new, "g_deq16_iq4_nl")
         ok(not r["flags"], f"IQ4 dequant with the byte mask: no flag ({r['select']} of {r['common']}, flags {r['flags']})")
+        # --suggest (common/loom_suggest.py): lintloom-1125's review found every suggest failure killed the lint run (a missing tool
+        # FileNotFoundError, exit 0 with non-JSON JSONDecodeError, a JSON list AttributeError). Each must print 'unknown (...)', note
+        # loom:unknown and leave the table complete; a working tool's findings become loom:<id> notes, never flags.
+        import shutil
+        import stat
+        sg = os.path.join(t, "sg"); os.makedirs(sg)
+        shutil.copy(os.path.join(t, "iq4_new.hsaco"), os.path.join(sg, "g_deq16_iq4_nl.hsaco"))
+        shutil.copy(os.path.join(HERE, "fixtures", "loom_suggest", "g_gemm_f16_acc_m256.report.json"), os.path.join(sg, "g_deq16_iq4_nl.json"))
+        tools = {"missing": os.path.join(t, "no-such-tool"), "garbage": "echo hello", "list": "echo '[1]'", "crash": "echo boom >&2; exit 2",
+                 "good": "cat " + os.path.join(HERE, "fixtures", "loom_suggest", "g_gemm_f16_acc_m256.suggest.json")}
+        klp = os.path.join(HERE, "..", "common", "kernel_lint.py")
+        for name, body in tools.items():
+            tp = body
+            if name != "missing":
+                tp = os.path.join(t, "tool-" + name)
+                open(tp, "w").write("#!/bin/sh\n" + body + "\n")
+                os.chmod(tp, os.stat(tp).st_mode | stat.S_IXUSR)
+            p = subprocess.run([sys.executable, klp, sg, "--suggest", "--suggest-tool", tp], capture_output=True, text=True, timeout=300)
+            row = [x for x in p.stdout.splitlines() if x.startswith("g_deq16_iq4_nl ")]
+            if name == "good":
+                ok(p.returncode == 0 and row and "loom:lds_bank_service" in row[0] and "loom g_deq16_iq4_nl: residency cliff: Loom next tier 5: phantom (E533)" in p.stdout
+                   and "kernel_lint: 1 kernels, 0 flagged" in p.stdout,
+                   f"--suggest: findings are notes, the cliff judged in whole workgroups, no flag (rc {p.returncode}, {row}, {p.stderr[-200:]})")
+            else:
+                ok(p.returncode == 0 and row and "loom:unknown" in row[0] and "loom g_deq16_iq4_nl: unknown (" in p.stdout
+                   and "kernel_lint: 1 kernels" in p.stdout,
+                   f"--suggest with a {name} tool: 'unknown', table complete (rc {p.returncode}, {row}, {p.stderr[-300:]})")
         r = compile_lint(lc, t, "q6_old", q6_old + kernel("g_q6_k_icodes", False), "t_g_q6_k_icodes")
         ok("repack" in r["flags"], f"pre-E233 q6_k codes flag repack (pk {r['pk']}, bfe {r['bfe']})")
         r = compile_lint(lc, t, "q6_new", q6_new + kernel("g_q6_k_icodes", False), "t_g_q6_k_icodes")
