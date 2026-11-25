@@ -846,7 +846,7 @@ if _dr.get("kind") == "dflash" and 'export("g_dfl_kv_store")' in _lib_d:
     if "func.def inline @g_dfl_kv8_scale_offset(" in _lib_d:
         td, ctxd = 4, 64; bld = ctxd // 16; posd = np.array([0, 3, 17, 40])
         vd = (rng.standard_normal((td, DKVH, DD)) * 1.5).astype(np.float32)
-        vd[1, 2, 70] = 30.0; vd[2, 3] = 0.0; vd[3, 5, :64] = 0.0   # an outlier in a wave's upper half, a zero head, a half-zero head
+        vd[1, 2, 70] = 30.0; vd[2, 3] = 0.0; vd[3, 5 % DKVH, :64] = 0.0   # an outlier in a wave's upper half, a zero head, a half-zero head (5 % DKVH: drafters with 4 KV heads, HRX-like q199)
         kd_ = rng.standard_normal((td, DKVH, DD)).astype(np.float32)
         slots = np.zeros((td, DPOS8), np.int8); slots_neg = np.zeros((td, DPOS8), np.int8)
         for ti in range(td):
