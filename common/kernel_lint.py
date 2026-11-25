@@ -853,7 +853,7 @@ def barrier_check(text, funcs=None, races=False):
             t = funcs.get(name)
             if t is None:
                 return f"func {name}: text not found"
-            if re.search(r"kernel\.barrier|kernel\.workgroup\.(?!id)\w+|kernel\.(?:async|tensor)\.|kernel\.exit|"
+            if re.search(r"kernel\.barrier|kernel\.workgroup\.(?!id)\w+|kernel\.(?:async|tensor)\.|"
                          r"\.alloca(?:\.\w+)*(?![\w.])(?!<(?:private|global)>)", t):
                 return f"func {name} synchronises, allocates workgroup memory or copies asynchronously"
             for c in re.findall(r"func\.call(?:\s+\w+)?\s+@(\w+)", t):

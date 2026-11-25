@@ -389,6 +389,16 @@ def main():
             "  %hi = buffer.view %t[%c0] : buffer -> view<32xf32>\n  %r = view.load %hi[%c0] : view<32xf32> -> f32\n"),),
         "F3 a callee writing the region and returning a view": (bk(st + bar + rd +
             "  %w2 = func.call @fill(%tv, %v) : (view<64xf32>, f32) -> view<64xf32>\n"),),
+        "P5c an offset name constant in one arm, computed in the other (a rebinding drops the constant)": (bk(
+            "  %u = index.cmp ult, %n, %c32 : index\n  scf.if %u {\n  %off = index.constant 128 : index\n  } else {\n"
+            "  %off = index.add %tid, %c0 : index\n  %lo = buffer.view %t[%off] : buffer -> view<32xf32>\n"
+            "  view.store %v, %lo[%c0] : f32, view<32xf32>\n  }\n" + bar +
+            "  %hi = buffer.view %t[%c0] : buffer -> view<32xf32>\n  %r = view.load %hi[%c0] : view<32xf32> -> f32\n"),),
+        "P5d a view name at a constant offset in one arm, a lane offset in the other (a rebinding drops the extent)": (bk(
+            "  %u = index.cmp ult, %n, %c32 : index\n  scf.if %u {\n  %lo = buffer.view %t[%c0] : buffer -> view<32xf32>\n  } else {\n"
+            "  %lo = buffer.view %t[%tid] : buffer -> view<32xf32>\n  view.store %v, %lo[%c0] : f32, view<32xf32>\n  }\n" + bar +
+            "  %c128 = index.constant 128 : index\n  %hi = buffer.view %t[%c128] : buffer -> view<32xf32>\n"
+            "  %r = view.load %hi[%c0] : view<32xf32> -> f32\n"),),
     }
     fill = {"fill": "func.def @fill(%w: view<64xf32>, %val: f32) -> view<64xf32> {\n  %c3 = index.constant 3 : index\n"
                     "  view.store %val, %w[%c3] : f32, view<64xf32>\n  func.return %w : view<64xf32>\n}\n"}
@@ -409,10 +419,19 @@ def main():
                                       "  scf.yield %tv : view<64xf32>\n  } else {\n  scf.yield %tv : view<64xf32>\n  }\n" + nb),
         "a callee that synchronises": bk(st + bar + "  func.call @sync() : () -> ()\n" + nb),
         "a callee calling one that synchronises": bk(st + bar + "  func.call @outer() : () -> ()\n" + nb),
+        "a callee with a workgroup collective": bk(st + bar + "  func.call @wred() : () -> ()\n" + nb),
+        "a callee allocating workgroup memory (view.alloca)": bk(st + bar + "  func.call @lds() : () -> ()\n" + nb),
+        "a callee copying asynchronously": bk(st + bar + "  func.call @acopy() : () -> ()\n" + nb),
+        "an op line the parser does not read": bk(st + bar + '  "unknown.op"() : () -> ()\n' + nb),
+        "an scf.if whose condition is not a name": bk(st + bar + "  scf.if true {\n  }\n" + nb),
         "a conditional kernel.exit (later barriers not reached by all)": bk(st + "  %u = index.cmp ult, %n, %c32 : index\n  kernel.exit %u\n" + bar + nb),
     }
     cal = {"sync": "func.def @sync() {\n" + bar + "  func.return\n}\n",
-           "outer": "func.def @outer() {\n  func.call @sync() : () -> ()\n  func.return\n}\n"}
+           "outer": "func.def @outer() {\n  func.call @sync() : () -> ()\n  func.return\n}\n",
+           "wred": "func.def @wred() {\n  %a = scalar.constant 1.0 : f32\n  %r = kernel.workgroup.reduce<addf> %a : f32\n  func.return\n}\n",
+           "lds": "func.def @lds() {\n  %s = view.alloca<workgroup> align(16) : view<8xf32>\n  func.return\n}\n",
+           "acopy": "func.def @acopy(%a: view<8xf32>, %b: view<8xf32>) {\n  %c0 = index.constant 0 : index\n"
+                    "  %tok = kernel.async.copy %a[%c0], %b[%c0] : view<8xf32>, view<8xf32> -> kernel.async.token\n  func.return\n}\n"}
     for k, t in NA.items():
         b = kl.barrier_check(t, cal)
         ok(b["status"].startswith("not analysed"), f"barrier: {k} is 'not analysed' ({b['status']})")
@@ -438,6 +457,15 @@ def main():
     b = kl.barrier_check(bk(st + "  scf.for %i = [%c0 to %n step %c1] {\n" + bar + "  }\n" + bar + nb))
     ok(wanted(b) == ["orders nothing", "orders"], f"barrier: a barrier after a loop holding a barrier still orders the store before the loop "
        f"(the loop may run zero times) ({wanted(b)})")
+    b = kl.barrier_check(bk(st + bar + "  %u = index.cmp ult, %n, %c32 : index\n  scf.if %u {\n  %w = buffer.view %t[%c0] : buffer -> "
+                            "view<64xf32>\n  } else {\n  %w = view.load %xv[%c0] : view<64xf32> -> f32\n  %q = scalar.addf %w, %w : f32\n  }\n"))
+    ok(wanted(b) == ["orders nothing"], f"barrier: a data value reusing a view's name in a sibling arm is not an access ({wanted(b)})")
+    shift = {"shift": "func.def @shift(%b: buffer) -> buffer {\n  func.return %b : buffer\n}\n"}
+    b = kl.barrier_check(bk("  %b2 = func.call @shift(%t) : (buffer) -> buffer\n" + bar + "  %lo = buffer.view %b2[%c0] : buffer -> "
+                            "view<32xf32>\n  view.store %v, %lo[%c0] : f32, view<32xf32>\n" + bar + "  %c128 = index.constant 128 : index\n"
+                            "  %hi = buffer.view %t[%c128] : buffer -> view<32xf32>\n  %r = view.load %hi[%c0] : view<32xf32> -> f32\n"), shift)
+    ok(wanted(b) == ["orders", "orders"], f"barrier: a buffer a callee returns has no known base: a view of it overlaps every view "
+       f"of the region ({wanted(b)})")
     row = {"kernel": "g_b", "s_barrier": 3}
     kl.barriers([row], {"g_b": bk(st + "  %s = kernel.workgroup.reduce<maxnumf> %v : f32\n" + bar + nb)}, {})
     ok(row["barrier"]["status"] == "analysed", f"barrier: a workgroup reduce is two s_barriers in the binary (GEMM: 3 + 2) "
