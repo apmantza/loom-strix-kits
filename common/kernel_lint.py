@@ -80,6 +80,13 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   a text whose implied s_barrier count (two per workgroup reduce, times constant unrolls) is not the binary's. Two exports of one
   name in the texts: the last wins (kernel_texts); the s_barrier cross-check refuses it only when the counts differ. Another
   engine's code objects carry no Loom text: the check does not apply to them.
+  [loom:ID] a NOTE (with --suggest): Loom's own `loom-compile-report suggest` on the kernel's compile report found ID (user 11-25:
+            use Loom's tools where we lack them). Fire 11-25 on live pkg-e480 (259 kernels): lds_ssa_use_serialization 14 (LDS results
+            consumed after full lgkmcnt drains: the t16 matvecs, split attention; 2 also flag serial), inspect_native_fastmath 22 (the
+            norms and q8 quantizer have native forms under more fast-math), compare_componentwise_bank_state 6 (the q4_k / q5_k /
+            iq4_xs m256 GEMMs carry a loop bank a whole-value use keeps unsplit), lds_bank_service 15 (the same 15 the bank column
+            shows). Not notes: reduce_expansion (256 of 259 kernels: one 'loom expand' line each, count and worst source op) and
+            residency_cliff (the 'next' column; a line where Loom's tier is unreachable in whole workgroups: 58 of 108).
   regress:  (with --baseline) worse than the same kernel in another build: a new spill, the prefetch now drained, fewer
             waves per SIMD, or the hot loop / its longest move run >= 10 % longer (E226: Loom 0.3.0's vmcnt(0) + 32-move shift;
             E230: a rewrite's spill; E236: a variant's residency drop).
@@ -94,7 +101,7 @@ back-edge (E109), the extra LDS bank-service rounds of Loom's gfx1151 bank model
 bank_service_groups before acting; E249: the f16 GEMMs' 48 extra rounds were the epilogue's once-per-tile store), and with --profile
 each kernel's served ms.
 A code object holding many kernels (another engine's build: *.co / *.hsaco) is linted kernel by kernel (lint_object).
-usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--profile RUN] [--source PKG_OR_LOOM] [--barriers] [--flagged] [--strict]
+usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--profile RUN] [--source PKG_OR_LOOM] [--barriers] [--suggest] [--flagged] [--strict]
        kernel_lint.py --package PKG | --program FILE.loom ... --out DIR [--loom-compile PATH] [--roots REGEX] [--jobs N] [...]
          (compiles every gfx11 kernel root into DIR first; two compilers: run twice with --loom-compile and pass the first
           run's DIR as --baseline of the second; --strict: exit 1 when anything is flagged)"""
@@ -417,20 +424,137 @@ def lint_object(path):
     return rows
 
 
-def lint_file(path):
-    """the rows of one code object: one kernel (a Loom compile) or several (another engine's build)"""
+def lint_file(path, rga=None):
+    """the rows of one code object: one kernel (a Loom compile) or several (another engine's build); RGA: live registers (--livereg)"""
     syms = kernel_symbols(path)
     if len(syms) == 1 and syms[0][0] == os.path.basename(path).rsplit(".", 1)[0]:
-        return [lint(path)]
-    return lint_object(path)
+        return [lint(path, rga)]
+    rows = lint_object(path)
+    for r in rows:
+        if rga is not None:
+            r["live"] = {"error": "rga: a multi-kernel object is not analysed"}
+    return rows
 
 
-def lint(path):
+LIVE_ROW = re.compile(r"^\s*\d+ \|\s*(\d+) \|[^|]*\| (?:label_\d+:\s*)?(.*)$")   # Line | Rn | register map | instruction
+
+
+def rga_tool(explicit=None):
+    """RGA (Radeon GPU Analyzer, `rga -s bin`): --rga, else RGA from the environment or the machine env file; None when absent"""
+    p = explicit or os.environ.get("RGA")
+    if not p:
+        f = os.environ.get("LSK_ENV") or os.path.expanduser("~/.config/loom-strix-kits/env")
+        m = re.search(r"(?m)^RGA=(\S+)", open(f).read()) if os.path.exists(f) else None
+        p = m.group(1) if m else None
+    return p if p and os.access(p, os.X_OK) else None
+
+
+def live_rows(text):
+    """(live VGPRs, instruction) per instruction of an RGA --livereg file, in program order"""
+    return [(int(m.group(1)), m.group(2).strip()) for m in map(LIVE_ROW.match, text.split("\n")) if m]
+
+
+def live(rows, ins, addr, budget):
+    """live-register figures of one kernel from RGA's rows matched to our listing (E527 / E531 / E533): {peak, loop_peak, at (offset
+    in the hot loop, mnemonic), floor (the loop's minimum: the carried values no schedule frees), over (loop instructions with more
+    live VGPRs than BUDGET, the next reachable tier's), loop}; {error} when the rows are not our instructions one for one (fail closed)"""
+    mn = lambda x: re.sub(r"_e(?:32|64)$", "", x.split()[0]) if x.split() else ""
+    if len(rows) != len(ins):
+        return {"error": f"rga: {len(rows)} rows for {len(ins)} instructions"}
+    j = next((j for j, (x, (_, y)) in enumerate(zip(ins, rows)) if mn(x) != mn(y)), None)
+    if j is not None:
+        return {"error": f"rga: instruction {j} is {rows[j][1].split()[0]!r}, ours {ins[j].split()[0]!r}"}
+    out = {"peak": max((n for n, _ in rows), default=0)}
+    h = hot(ins, addr)
+    if h:
+        seg = [n for n, _ in rows[h[0]:h[1] + 1]]
+        k = max(range(len(seg)), key=seg.__getitem__)
+        out.update(loop=(h[0], h[1]), loop_peak=seg[k], at=(k, ins[h[0] + k].split()[0]), floor=min(seg),
+                   over=None if budget is None else sum(1 for n in seg if n > budget))
+    return out
+
+
+def rga_live(path, rga):
+    """RGA's live VGPR rows for one code object (a temporary dir per call), or {error}"""
+    import tempfile
+    if not rga:
+        return {"error": "rga: not found (--rga, or RGA in the environment / machine env file)"}
+    with tempfile.TemporaryDirectory(prefix="kl_rga.") as d:
+        p = subprocess.run([rga, "-s", "bin", "--isa", f"{d}/k.isa", "--livereg", f"{d}/k.live", "--co", path],
+                           capture_output=True, text=True)
+        fs = glob.glob(f"{d}/*.live")
+        if p.returncode or len(fs) != 1:
+            why = [x for x in (p.stdout + p.stderr).split("\n") if "rror" in x or "failed" in x]
+            return {"error": "rga: " + ((why[-1].strip() if why else f"exit {p.returncode}, {len(fs)} .live files")[:160])}
+        return live_rows(open(fs[0]).read())
+
+
+def live_text(r):
+    """the 'live' column: peak/floor/over (the kernel's peak live VGPRs, the hot loop's minimum, its instructions over the next tier's
+    VGPR budget); '-' without --livereg; 'unknown' when RGA failed (the line says why)"""
+    x = r.get("live")
+    if x is None:
+        return "-"
+    if "error" in x:
+        return "unknown"
+    return f"{x['peak']}/{x.get('floor', '-')}/{'-' if x.get('over') is None else x['over']}"
+
+
+def lint(path, rga=None):
     ins, addr = disasm(path)
     r = lint_listing(os.path.basename(path)[:-6], ins, addr, residency(path[:-6] + ".json"))
+    if rga is not None:
+        rows = rga_live(path, rga)
+        need = r.get("to_next")
+        budget = None if need is None or r.get("next_tier") is None or r.get("vgpr") is None else r["vgpr"] - need.get("vgpr", 0)
+        r["live"] = rows if isinstance(rows, dict) else live(rows, ins, addr, budget)
+        r["live_budget"] = budget
     r["bank_conf"], r["bank_extra"] = bank(path[:-6] + ".json")
     ldsbank(r, path[:-6] + ".json", ins)
+    if os.path.exists(path[:-6] + ".json"):
+        r["report"] = path[:-6] + ".json"
     return r
+
+
+def loom_suggest(js, tool):
+    """the findings of `loom-compile-report suggest` on a compile report (Loom's own static advice), or {'error': first line}"""
+    p = subprocess.run([tool, "suggest", js, "--format=json"], capture_output=True, text=True)
+    if p.returncode:
+        return {"error": ((p.stderr or p.stdout).strip().split("\n") or [""])[-1][:200]}
+    return json.loads(p.stdout).get("findings") or []
+
+
+EXPAND = "lowering.reduce_expansion"     # fires on 258 of live's 261 kernels: printed as a count and the worst op, never a note
+CLIFF = "amdgpu.residency_cliff"         # the 'next' column says it in whole workgroups; a line only where Loom's tier is unreachable (E533)
+
+
+def suggest_notes(r, found):
+    """note `loom:<id>` per kind of `suggest` finding on row R (never a flag: suggest's order and confidence do not rank benefit),
+    except EXPAND and CLIFF; returns the lines to print: expansions (count, worst source op), residency cliffs whole workgroups
+    cannot reach, a failed run"""
+    if isinstance(found, dict):
+        return [f"loom suggest {r['kernel']}: failed: {found['error']}"]
+    out, xp = [], []
+    for x in found:
+        i = x.get("id", "?")
+        if i == EXPAND:
+            m = re.match(r"WARNING: (?:\S+ )?(\S+?): up to (\d+) ", x.get("action", ""))
+            xp.append((int(m.group(2)), m.group(1)) if m else (0, x.get("action", "")[:60]))
+            continue
+        if i == CLIFF:
+            ev = x.get("evidence") or {}
+            nt = next((v for k, v in ev.items() if k.endswith("residency.next_better_tier")), None)
+            if nt != r.get("next_tier"):
+                out.append(f"loom residency_cliff {r['kernel']}: Loom's next tier {nt} is not reachable in whole workgroups; next "
+                           f"{next_text(r)} (E533)")
+            continue
+        n = "loom:" + i.split(".", 1)[-1]
+        if n not in r.setdefault("notes", []):
+            r["notes"].append(n)
+    if xp:
+        xp.sort(reverse=True)
+        out.append(f"loom expand {r['kernel']}: {len(xp)} source ops expand past 5 Low ops; worst {xp[0][1]} x{xp[0][0]}")
+    return out
 
 
 LDSBANK = 2.0   # % of the hot loop's modelled LDS rounds that are conflict rounds (11-25: flash2 10.0 / vsplit 7.1 fire, SXH and GEMMs 0)
@@ -1265,6 +1389,11 @@ def main():
     ap.add_argument("--barriers", action="store_true", help="print every barrier of every analysed kernel with the hazard pairs it "
                     "orders and the potential races (computed only then), not only the kernels with a barrier that orders nothing or "
                     "that the check could not model")
+    ap.add_argument("--suggest", action="store_true", help="run `loom-compile-report suggest` (beside loom-compile) on each kernel's "
+                    "compile report: its findings as loom:<id> notes, expansions and unreachable residency cliffs as lines")
+    ap.add_argument("--livereg", action="store_true", help="RGA's live VGPRs per instruction (rga -s bin --livereg): the 'live' "
+                    "column peak/floor/over and a line per kernel whose loop floor exceeds the next tier's VGPR budget")
+    ap.add_argument("--rga", help="with --livereg: the rga binary (default: RGA from the environment or the machine env file)")
     ap.add_argument("--flagged", action="store_true", help="print flagged kernels only")
     ap.add_argument("--strict", action="store_true", help="exit 1 when any kernel is flagged")
     a = ap.parse_args()
@@ -1282,6 +1411,9 @@ def main():
         srcs += sorted(glob.glob(os.path.join(x, "program", "*.loom"))) if os.path.isdir(x) else [x]
     texts += [open(x).read() for x in srcs]
     starts = kernel_starts(progs + srcs)
+    rga = None
+    if a.livereg:
+        rga = rga_tool(a.rga) or ""                       # "" : every kernel reports unknown (rga: not found), never a number
     stats, prompt = served_stats(a.profile) if a.profile else ({}, None)
     ms = collections.Counter({k: v[0] for k, v in stats.items()})
     files = []
@@ -1290,7 +1422,7 @@ def main():
     if not files:
         sys.exit("kernel_lint: no code objects")
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
-        rows = [r for rs in ex.map(lint_file, files) for r in rs]
+        rows = [r for rs in ex.map(lambda f: lint_file(f, rga), files) for r in rs]
     outl = outliers(rows)
     tiny(rows, stats)
     barriers(rows, kernel_texts(texts), func_texts(texts), a.roots, a.barriers)
@@ -1303,19 +1435,37 @@ def main():
             b = os.path.join(a.baseline, r["kernel"] + ".hsaco")
             if os.path.exists(b):
                 r["flags"] += ["regress:" + x for x in regressions(r, lint(b))]
+    loom_lines = []
+    if a.suggest:
+        tool = os.path.join(os.path.dirname(a.loom_compile or loom_compile()), "loom-compile-report")
+        have = [r for r in rows if r.get("report")]
+        with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
+            for r, found in zip(have, ex.map(lambda r: loom_suggest(r["report"], tool), have)):
+                loom_lines += suggest_notes(r, found)
+        loom_lines += [f"loom suggest {r['kernel']}: no compile report" for r in rows if not r.get("report")]
     rows.sort(key=lambda r: (-bool(r["flags"]), -ms.get(r["kernel"], 0), -len(r["flags"]), -(sites or {}).get(r["kernel"], 0), r["kernel"]))
     print(f"{'kernel':42s} {'where':>6s} {'loop':>5s} {'comm':>5s} {'mm':>4s} {'other/op':>8s} {'sel':>4s} {'pk':>3s} {'bfe':>4s} {'scr':>4s} {'mov':>4s} "
-          f"{'run':>4s} {'vgpr':>4s} {'w/S':>3s} {'next':>11s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
+          f"{'run':>4s} {'vgpr':>4s} {'w/S':>3s} {'next':>11s} {'live':>11s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
     for r in rows:
         if a.flagged and not r["flags"]:
             continue
         f = lambda v: "-" if v is None else str(v)
         s = "-" if sites is None else str(sites.get(r["kernel"], 0))
         print(f"{r['kernel']:42s} {r['where']:>6s} {r['loop']:5d} {r['common']:5d} {r['wmma'] or r['dot']:4d} {f(r['other_per_op']):>8s} {r['select']:4d} {r['pk']:3d} "
-              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {f(r['waves']):>3s} {next_text(r):>11s} {r['pf']:>5s} {s:>5s} "
+              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {f(r['waves']):>3s} {next_text(r):>11s} {live_text(r):>11s} {r['pf']:>5s} {s:>5s} "
               f"{f(r['lds_waits_per_op']):>5s} {f(r['cover_min']):>4s} {r['in_flight']:3d} {f(r.get('bank_extra')):>5s} "
               f"{('%.1f' % ms[r['kernel']]) if r['kernel'] in ms else '-':>8s}  "
               f"{' '.join(r['flags'])}{('  [' + ' '.join(r['notes']) + ']') if r.get('notes') else ''}")
+    for line in sorted(loom_lines):
+        print(line)
+    for r in sorted(rows, key=lambda r: r["kernel"]):
+        x = r.get("live")
+        if x and "error" in x:
+            print(f"livereg {r['kernel']}: unknown ({x['error']})")
+        elif x and x.get("over"):
+            print(f"livereg {r['kernel']}: peak {x['peak']} live VGPRs; hot loop peak {x['loop_peak']} at +{x['at'][0]} {x['at'][1]}, floor "
+                  f"{x['floor']}; {x['over']} of {x['loop'][1] - x['loop'][0] + 1} loop instructions above the {r['live_budget']}-VGPR budget "
+                  f"of {r['next_tier']} waves/SIMD" + (" (the floor too: the carried values alone exceed it)" if x["floor"] > r["live_budget"] else ""))
     for k, (v, med, n) in sorted(outl.items()):
         print(f"outlier {k}: {v} non-MMA instructions per MMA vs a median of {med} over {n} peers")
     for r in rows:

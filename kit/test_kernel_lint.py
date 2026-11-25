@@ -49,7 +49,13 @@
     VGPRs; flash2's 384-lane workgroup = 3 waves per SIMD reported next tier 7 at -21 VGPRs): flash2's rows give 6 waves and next
     9 at -69 VGPRs and -18,944 B LDS together; a 128-lane kernel (1 wave per SIMD) keeps Loom's own figure; 5-wave
     workgroups count the busiest SIMD; LDS counts in granules; a 17-wave matvec at
-    the slot limit has no next tier, nor a kernel at a lower slot tier; an unknown resource row gives no figure (fail closed).
+    the slot limit has no next tier, nor a kernel at a lower slot tier; an unknown resource row gives no figure (fail closed);
+  - Loom's own static advice (loom-compile-report suggest, user 11-25) dropped or turned into flags: each finding kind is one
+    loom:<id> note; the expansions every kernel has (256 of 259 on live) are one line, not a note; a residency cliff the 'next'
+    column already shows is silent, one whole workgroups cannot reach is a line; a failed run is printed;
+  - live registers read by hand from RGA's .live files (E527 / E531; E533: flash2's loop never drops below 159 live VGPRs, so 168
+    needs a new organisation): flash2_f16o's RGA output gives peak 229, loop floor 159, 766 loop instructions over 168; a row
+    missing or not ours, or RGA absent, gives no number.
 usage: python3 kit/test_kernel_lint.py   (needs loom-compile: VENV from the environment or the machine env file)"""
 import os
 import subprocess
@@ -126,6 +132,52 @@ def residency_tiers():
        kl.next_text({"next_tier": None, "to_next": {}}) == "cap" and kl.next_text({"to_next": None}) == "-", "residency: the next column")
 
 
+def suggest_findings():
+    """loom-compile-report suggest findings as notes and lines (pure: findings in the shape suggest --format=json prints, live
+    pkg-e480's texts)"""
+    def f(i, action="", **ev):
+        return {"id": i, "confidence": "high", "entry": "k", "action": action, "evidence": ev}
+    ser = f("amdgpu.lds_ssa_use_serialization", "Repeated LDS or DS results are consumed after full counter drains.")
+    xp = [f("lowering.reduce_expansion", "WARNING: k scalar.xori: up to 9 Low operations per source operation."),
+          f("lowering.reduce_expansion", "WARNING: k vector.fptrunc: up to 57 Low operations per source operation"),
+          f("lowering.reduce_expansion", "WARNING: source_to_low: up to 129 Low operations per source operation. Capture")]
+    cliff = lambda nt: f("amdgpu.residency_cliff", **{"entries.rows[0].target_resources.residency.next_better_tier": nt})
+    r = {"kernel": "k", "next_tier": 9, "to_next": {"vgpr": 69, "lds": 18944}}
+    lines = kl.suggest_notes(r, [ser, ser] + xp + [cliff(7)])
+    ok(r.get("notes") == ["loom:lds_ssa_use_serialization"], f"suggest: a finding kind is one note, never a flag ({r.get('notes')})")
+    ok(lines == ["loom residency_cliff k: Loom's next tier 7 is not reachable in whole workgroups; next 9:v69+l18944 (E533)",
+                 "loom expand k: 3 source ops expand past 5 Low ops; worst source_to_low x129"],
+       f"suggest: expansions are one line (count, worst op), an unreachable cliff is a line, neither a note ({lines})")
+    r = {"kernel": "k", "next_tier": 9, "to_next": {"vgpr": 69}}
+    ok(kl.suggest_notes(r, [cliff(9)]) == [] and not r.get("notes"), "suggest: a cliff 'next' already shows: no line, no note")
+    r = {"kernel": "k"}
+    ok(kl.suggest_notes(r, {"error": "boom"}) == ["loom suggest k: failed: boom"], "suggest: a failed run is printed, never dropped")
+
+
+def livereg():
+    """RGA live registers (E527 / E531 / E533) on pkg-cmb2's flash2_f16o: its listing (address, instruction: loop_census.disasm of the
+    code object) and RGA 2.15's --livereg output (register map blanked) in fixtures/ (text: the export check refuses binaries)"""
+    rows = kl.live_rows(open(os.path.join(HERE, "fixtures", "flash2_f16o_cmb2.live")).read())
+    lst = [x.split("\t", 1) for x in open(os.path.join(HERE, "fixtures", "flash2_f16o_cmb2.listing")).read().split("\n") if x]
+    ins, addr = [i for _, i in lst], [int(a, 16) for a, _ in lst]
+    x = kl.live(rows, ins, addr, 168)
+    ok(len(rows) == len(ins) == 4692 and x.get("peak") == 229 and x.get("floor") == 159 and x.get("loop") == (617, 1519),
+       f"livereg: flash2_f16o peaks at 229 live VGPRs (RGA's 'Maximum # VGPR used'), its hot loop never drops below 159 "
+       f"({len(rows)} rows, {len(ins)} instructions, {dict((k, v) for k, v in x.items() if k != 'at')})")
+    ok(x.get("loop_peak") == 229 and x.get("over") == 766, f"livereg: 766 of the loop's 903 instructions above the 168-VGPR budget "
+       f"of 9 waves/SIMD ({x.get('over')}, peak at {x.get('at')})")
+    ok(rows[81] == (5, "s_delay_alu instid0(VALU_DEP_1) | instid1(VALU_DEP_2)") and rows[617][1].startswith("s_cmp_lt_i32"),
+       f"livereg: an instruction holding '|' and a labelled one parse whole ({rows[81]}, {rows[617]})")
+    y = kl.live(rows[:-1], ins, addr, 168)                                # the last row missing: every other one still pairs
+    ok("error" in y, f"livereg: a row missing (the last) gives no figure ({y})")
+    z = kl.live(rows[:5] + [(rows[5][0], "v_nop")] + rows[6:], ins, addr, 168)
+    ok("error" in z, f"livereg: a row that is not our instruction gives no figure ({z})")
+    ok(kl.live_text({"live": {"error": "rga: x"}}) == "unknown" and kl.live_text({}) == "-" and
+       kl.live_text({"live": x}) == "229/159/766", f"livereg: the live column ({kl.live_text({'live': x})})")
+    ok(kl.rga_live("/nonexistent.hsaco", "") == {"error": "rga: not found (--rga, or RGA in the environment / machine env file)"},
+       "livereg: no RGA is 'unknown (rga: not found)', never a number")
+
+
 def main():
     lc = loom_compile()
     qv = open(os.path.join(HERE, "quant_values.loom")).read()
@@ -158,6 +210,14 @@ def main():
         ok("repack" in r["flags"], f"pre-E233 q6_k codes flag repack (pk {r['pk']}, bfe {r['bfe']})")
         r = compile_lint(lc, t, "q6_new", q6_new + kernel("g_q6_k_icodes", False), "t_g_q6_k_icodes")
         ok(not r["flags"], f"q6_k codes on words: no flag (pk {r['pk']}, bfe {r['bfe']}, flags {r['flags']})")
+        rp = subprocess.run([lc, os.path.join(t, "q6_old.loom"), "--target=amdgpu:gfx1151", "--root=t_g_q6_k_icodes",
+                             f"--output={t}/q6r.hsaco", "--compile-report=summary", f"--compile-report-output={t}/q6r.json"],
+                            capture_output=True, text=True)
+        found = kl.loom_suggest(f"{t}/q6r.json", os.path.join(os.path.dirname(lc), "loom-compile-report")) if not rp.returncode else None
+        ok(isinstance(found, list) and all("id" in x for x in found), f"suggest: Loom's suggest runs on a summary report and returns "
+           f"findings ({sorted({x['id'] for x in found}) if isinstance(found, list) else found})")
+        r = kl.lint(f"{t}/q6r.hsaco")
+        ok(r.get("report") == f"{t}/q6r.json", "suggest: lint() keeps the report beside the code object")
     # listings: addresses 4 bytes apart; s_branch's offset counts dwords from the next instruction
     def listing(body):
         return body, [4 * i for i in range(len(body))]
@@ -273,6 +333,8 @@ def main():
     ok(kl.regressions(dict(base, waves=10), base) == ["waves12->10"], "regress: fewer waves per SIMD (E236)")
     ok(kl.regressions(dict(base), base) == [], "regress: nothing when nothing changed")
     residency_tiers()
+    suggest_findings()
+    livereg()
     prog = ("template.def<@sel1_g_k1> target(@rdna3) @sel1_g_k1_rdna3(%g0: index) {\n  kernel.launch @g_k1[%g0](%g0) : [index](index)\n}\n"
             "command.def public @c() {\n  template.apply<@sel1_g_k1>(%t) : (index)\n  template.apply<@sel1_g_k1>(%u) : (index)\n"
             "  kernel.launch @g_k2[%t](%t) : [index](index)\n  kernel.launch @g_k3(%t, %u) : (index, index)\n}\n")
