@@ -138,10 +138,26 @@ def main():
         open(os.path.join(run, "run.req.json"), "w").write(json.dumps({"requests": [{"prompt_tokens": 4096}]}) + "\n")
         lanes = os.path.join(t, "lanes.json")
         json.dump({"prefill_marker": "^g_attention_flash2", "prefill_min_tokens": 64,
-                   "lanes": [{"lane": "d", "phase": "decode", "regex": "."}, {"lane": "p", "phase": "prefill", "regex": "."}]}, open(lanes, "w"))
-        rows, total, prompt = lc.served(run, lanes)
+                   "lanes": [{"lane": "d", "phase": "decode", "regex": ".", "floor": "decode_kv"}, {"lane": "p", "phase": "prefill", "regex": "."}]}, open(lanes, "w"))
+        rows, total, prompt, steps = lc.served(run, lanes)
         ok(abs(rows[("g_k", "prefill")]["ms"] - 1.0) < 1e-9 and abs(rows[("g_k", "decode")]["ms"] - 2.0) < 1e-9 and prompt == 4096,
            "g_k split: 1 ms prefill (flash2 submission), 2 ms decode", {k: v["ms"] for k, v in rows.items()})
+        ok(rows[("g_k", "prefill")]["lanes"] == {"p": 1.0} and rows[("g_k", "decode")]["lanes"] == {"d": 2.0} and steps == 1,
+           "per-lane ms on each row; verify steps = decode submissions in the decode_kv lane (events_summary's count)",
+           (rows[("g_k", "prefill")]["lanes"], steps))
+        # a kit whose lanes.json has no verify-attention (decode_kv) lane served before (d) existed: it must still run
+        json.dump({"prefill_marker": "^g_attention_flash2", "lanes": [{"lane": "d", "phase": "decode", "regex": "."},
+                                                                       {"lane": "p", "phase": "prefill", "regex": "."}]}, open(lanes + "2", "w"))
+        ok(lc.served(run, lanes + "2")[3] is None, "no decode_kv lane: verify steps None, not a crash", "")
+        nf = os.path.join(t, "nf.json")
+        json.dump({"d": 1.5}, open(nf, "w"))
+        ok(lc.lane_noise(nf, json.load(open(lanes))) == {"d": 1.5}, "noise floor keys resolve to lane names", "")
+        json.dump({"x": 1.5}, open(nf, "w"))
+        try:
+            lc.lane_noise(nf, json.load(open(lanes)))
+            ok(False, "a noise key matching no lane must stop", "passed")
+        except SystemExit:
+            ok(True, "a noise key matching no lane stops", "")
         ok(rows[("g_attention_flash2", "prefill")]["shapes"] == {128}, "shape = workgroups product", rows[("g_attention_flash2", "prefill")]["shapes"])
 
     # counters.sh writes one CSV per preset, each numbering dispatches from 1, and SQ_WAVE_CYCLES sits in several presets: summed
@@ -162,6 +178,104 @@ def main():
         ok(abs(m["vmem"] - 40) < 1e-6 and abs(m["any"] - 80) < 1e-6 and abs(m["issue"] - 30) < 1e-6,
            "counters.sh presets: a counter in two presets is not summed twice (vmem 40, any 80, issue 30)",
            {k: round(m[k], 1) for k in ("vmem", "any", "issue")})
+
+    # ------------------------------------------------------------ section (d): levers (user 11-25: 'make the linter rank, not
+    # just flag'). Recurrences: flash2 sat at 6 waves held by VGPR and LDS at once while (a) showed one 'limit', so an occupancy
+    # lever that trims registers alone looked open (both must move); a lever without a lint flag never appeared; levers were
+    # priced against served share only, never against the lane's floor or the A/B noise floor (rules 2: price before building).
+    with tempfile.TemporaryDirectory() as t:
+        js = os.path.join(t, "k.json")
+        json.dump({"target_resources": {"limiting_resource": "amdgpu.vgpr", "residency": {"current_tier": 6, "best_tier": 16,
+                                                                                         "next_better_tier": 7},
+                                        "vector": {"final": {"register_count": 240}}},
+                   "residency_constraints": {"rows": [
+                       {"name": "amdgpu.sgpr", "unit": "registers", "units": 90, "independent_tier": 16, "limiting": False},
+                       {"name": "amdgpu.vgpr", "unit": "registers", "units": 240, "independent_tier": 6, "limiting": True,
+                        "reduction_units_to_next_better_tier": 24},
+                       {"name": "amdgpu.lds", "unit": "bytes", "units": 61952, "independent_tier": 6, "limiting": True,
+                        "reduction_units_to_next_better_tier": 18944},
+                       {"name": "amdgpu.workgroup_slots", "independent_tier": 15, "limiting": False}]}}, open(js, "w"))
+        lim, tier, vg, lims, nt = lc.report_limit(js)
+        ok(lim == "vgpr+lds" and tier == 6 and vg == 240 and nt == 7 and [(x["name"], x["reduction"]) for x in lims] == [("vgpr", 24), ("lds", 18944)],
+           "compile report: both limiting resources with their reductions (flash2: VGPR and LDS)", (lim, tier, vg, lims))
+        json.dump({"target_resources": {"limiting_resource": "amdgpu.lds", "residency": {"current_tier": 4}}}, open(js, "w"))
+        ok(lc.report_limit(js)[0] == "lds" and lc.report_limit(js)[3] == [], "no residency rows: the summary's one limit, no rows",
+           lc.report_limit(js))
+
+        # lanes: decode weights 2.4 GB at 240 GB/s = 10 ms/step x 2 steps = 20 ms floor; prefill 2 x 1e9 params x 4096 tokens at
+        # 8.192 TFLOP/s = 1.0 s; a lane without a floor is judged against 0 (ceiling.py)
+        d = {"model": {"decode_weight_bytes": 2.4e9, "linear_params": 1e9}, "prefill_marker": "^g_fl",
+             "lanes": [{"lane": "dec w", "phase": "decode", "regex": "^g_mv", "floor": "decode_weights"},
+                       {"lane": "dec other", "phase": "decode", "regex": ".", "floor": None},
+                       {"lane": "pre gemm", "phase": "prefill", "regex": "^g_gemm", "floor": "prefill_linear"},
+                       {"lane": "pre attn", "phase": "prefill", "regex": "^g_fl", "floor": "prefill_attn"},
+                       {"lane": "pre other", "phase": "prefill", "regex": ".", "floor": None}]}
+        hw = {"bw_practical_gbs": 240, "wmma_f16_tflops": 8.192}
+        srv = {("g_mv_a", "decode"): {"ms": 30.0, "lanes": {"dec w": 30.0}}, ("g_mv_b", "decode"): {"ms": 20.0, "lanes": {"dec w": 20.0}},
+               ("g_x", "decode"): {"ms": 4.0, "lanes": {"dec other": 4.0}},
+               ("g_gemm_a", "prefill"): {"ms": 1500.0, "lanes": {"pre gemm": 1500.0}},
+               ("g_fl", "prefill"): {"ms": 100.0, "lanes": {"pre attn": 100.0}}}
+        heads = lc.lane_headroom(srv, 2, 4096, d, hw)
+        h = {k: (round(v["floor_ms"], 6) if v["floor_ms"] is not None else None, round(v["headroom_ms"], 6) if v["headroom_ms"] is not None
+                 else None) for k, v in heads.items()}
+        ok(h["dec w"] == (20.0, 30.0) and h["pre gemm"] == (1000.0, 500.0) and h["dec other"] == (0.0, 4.0),
+           "lane headroom: served - floor (decode floor x verify steps; no floor = 0)", h)
+        ok(h["pre attn"] == (None, None) and "attn_layers" in heads["pre attn"]["why"], "a floor missing a model constant: unknown, named",
+           heads["pre attn"]["why"])
+        ok(lc.lane_headroom(srv, 0, 4096, d, hw)["dec w"]["headroom_ms"] is None, "no verify steps: decode headroom unknown, not 0", "")
+        ok(lc.lane_headroom({("g_mv_a", "decode"): {"ms": 15.0, "lanes": {"dec w": 15.0}}}, 2, 4096, d, hw)["dec w"]["headroom_ms"] == 0.0,
+           "served below its floor: headroom 0", "")
+
+        # levers: g_mv_a holds 30 / 50 of its lane's 30 ms headroom = 18 ms; a backed 'copies' (issue 40 %) prices 30 x 0.4 = 12 ms;
+        # g_mv_b's 'join' has no counters (static only: the attribution 12 ms is its bound); g_x has no flag (no evidence)
+        codes = os.path.join(t, "codes"); os.makedirs(codes)
+        open(os.path.join(codes, "g_mv_a.hsaco"), "wb").write(b"a")
+        hs = os.path.join(t, "a.hsaco"); open(hs, "wb").write(b"a")
+        wl = lc.load_workloads([workload(os.path.join(t, "wa"), hs, kernel="g_mv_a", wait={"issue": 40, "vmem": 30, "lgkm": 5})], codes)
+        lint = {"g_mv_a": {"flags": ["copies", "join"]}, "g_mv_b": {"flags": ["join"], "notes": ["maskedv"]}, "g_x": {},
+                "g_gemm_a": {}, "g_fl": {"flags": ["copies"]}}
+        lv = lc.levers(lint, srv, wl, 240, heads)
+        got = {(x["kernel"], x["lever"]): (x["evidence"], x["upper_ms"] if x["upper_ms"] is None else round(x["upper_ms"], 6)) for x in lv}
+        ok(got[("g_mv_a", "copies")] == ("counter-backed", 12.0), "backed lever: min(attribution 18, price 12) = 12 ms", got)
+        ok(got[("g_mv_b", "join")] == ("static only", 12.0), "static-only lever: bounded by its headroom attribution", got)
+        ok(got[("g_x", "unnamed (no lint flag)")] == ("no evidence", 4.0), "a kernel without a flag still appears (no evidence)", got)
+        ok(got[("g_gemm_a", "unnamed (no lint flag)")] == ("no evidence", 500.0), "the whole lane's headroom on its one kernel", got)
+        ok(got[("g_fl", "copies")] == ("static only", None), "headroom unknown and no price: no bound", got)
+        ok(not any(x["lever"] == "maskedv" for x in lv), "unpriced rules (maskedv) are not speed levers", "")
+        ok([x["upper_ms"] for x in lv if x["upper_ms"] is not None] == sorted((x["upper_ms"] for x in lv if x["upper_ms"] is not None),
+                                                                              reverse=True) and lv[-1]["upper_ms"] is None,
+           "ranked by upper bound, unbounded last", [(x["kernel"], x["lever"], x["upper_ms"]) for x in lv])
+
+        # amdahl: one phase per lane, the lane's noise floor as its screen, one overlap group per kernel
+        noise = {"dec w": 50.0, "pre gemm": 0.33}
+        doc, picked, omitted = lc.amdahl_input(lv, heads, noise, 10)
+        ph = {p["phase"]: p for p in doc["phases"]}
+        ok(ph["dec w"]["screen_pct"] == 50.0 and ph["dec w"]["wall"] == 50.0 and
+           not any("screen_pct" in p for p in lc.amdahl_input(lv, heads, {}, 10)[0]["phases"]),
+           "lane = phase, wall = lane served ms, screen = the lane's noise floor (none: amdahl's default)", ph["dec w"])
+        grp = [c["overlap_group"] for c in ph["dec w"]["candidates"] if c["name"].startswith("g_mv_a")]
+        ok(len(grp) == 2 and set(grp) == {"g_mv_a"}, "two levers on one kernel share its overlap group", grp)
+        ok(not any(x["upper_ms"] is None for x in picked), "unbounded levers are not sent to amdahl", "")
+        ok(omitted and omitted[0][0] == "dec other", "a lane whose levers claim its whole time (floor 0) is left out, named", omitted)
+        out, verdicts = lc.run_amdahl(doc, os.path.join(t, "amdahl_in.json"))
+        ok(verdicts.get(("pre gemm", "g_gemm_a:unnamed (no lint flag)")) is True, "500 of 1500 ms clears a 0.33 % screen", verdicts)
+        ok(verdicts.get(("dec w", "g_mv_a:copies")) is False, "12 of 50 ms is below a 50 % screen: not worth building", verdicts)
+        ok("amdahl:" in out[-1], "amdahl's own output is in the report", out[-1:])
+        lines = lc.section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, 10, "fixture hw")
+        txt = "\n".join(lines)
+        ok("not worth building" in txt and "an attribution, not a measurement" in txt, "verdicts and the attribution caveat printed", "")
+        lint["g_fl"].update(_limits=lims, waves=6, _next_tier=7)
+        txt = "\n".join(lc.section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, 10, "fixture hw"))
+        occ = [x for x in txt.splitlines() if x.lstrip().startswith("g_fl")]
+        ok(occ and "vgpr 240 registers -24" in occ[-1] and "lds 61952 bytes -18944" in occ[-1] and "all 2" in occ[-1],
+           "occupancy lever lists every limiting resource and says it needs all of them", occ)
+        lint["g_fl"]["_limits"] = [{"name": "max_waves", "units": None, "unit": "", "reduction": None, "tier": 16}]
+        txt = "\n".join(lc.section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, 10, "fixture hw"))
+        ok(not [x for x in txt.split("(d2)")[1].splitlines() if x.lstrip().startswith("g_fl")], "a kernel at the best tier has no lever", "")
+        lint["g_mv_a"].update(_limits=lims, waves=6, _next_tier=7)
+        txt = "\n".join(lc.section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, 10, "fixture hw"))
+        occ = [x for x in txt.split("(d2)")[1].splitlines() if x.lstrip().startswith("g_mv_a")]
+        ok(occ and "35.0 %" in occ[0], "occupancy lever shows the latency-wait share (vmem 30 + lgkm 5)", occ)
 
     print(f"{'FAILED ' + str(fails) if fails else 'all ok'}")
     sys.exit(1 if fails else 0)
