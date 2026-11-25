@@ -1126,6 +1126,19 @@ def bfly_setup(TG):
 # projections keep plain slots: the permuted activation loads are uncoalesced, and that cost more than the selects
 # (down 19968x6656 t16 +9 %). MV_BFLY_PERM=0 turns it off.
 BFLY_PERM = os.environ.get("MV_BFLY_PERM", "1") == "1"
+# MV_SCHED=D:U (sched-1125, open A/B; HRX-like static-1125/sched): Loom's own read-ahead on the _mv row loop,
+# `pipeline(D) unroll(U) schedule(recurrence)` (docs workflows/tune-loop-schedules.md), instead of a hand-split prefetch (MV_PF,
+# E388). Static, 0.2.0 = 0.3.0: 2:2 keeps 2 weight loads in flight across the back-edge with no vmcnt(0) in the steady loop
+# (hand MV_PF and pipeline alone: 0 in flight, vmcnt(0) + queue copies). Exact by construction (same ops per row, same order).
+MV_SCHED = os.environ.get("MV_SCHED", "")
+if MV_SCHED:
+    _d, _u = (int(x) for x in MV_SCHED.split(":"))
+    assert _d >= 1 and _u >= 1, MV_SCHED
+    assert os.environ.get("VERIFY_FUSE", "") in ("", "0"), "MV_SCHED: gen_pstep anchors the bare row loop (ROW_LOOP)"
+    MV_SCHED_POL = f" pipeline(%mvs_d) unroll(%mvs_u) schedule(recurrence)"
+    MV_SCHED_DEF = f"  %mvs_d = index.constant {_d} : index\n  %mvs_u = index.constant {_u} : index\n"
+else:
+    MV_SCHED_POL = MV_SCHED_DEF = ""
 
 
 def bfly_slot(j, TG, base, name, perm):
@@ -1197,6 +1210,9 @@ def _mv(fmt, K, R=16, TG=1, swiglu=False, suffix="", iq=False, pair=False, chunk
     NCH = TG // CHK
     assert NCH * CHK == TG
     PERM = iq and nw == 2 and BFLY_PERM and CHK >= 8
+    # MV_SCHED: single-weight kernels with >= 8 rows only (static, sched-1125: the swiglu pair spilled / lost residency and
+    # kept no load in flight; R <= D x U leaves no steady loop)
+    sched = bool(MV_SCHED_POL) and nw == 1 and R >= 8
     wargs = "%w: buffer, %w2: buffer" if nw == 2 else "%w: buffer" + (", %ws: buffer" if fmt in SPLIT else "")
     assert not (fmt in SPLIT and nw == 2), f"{fmt}: split-plane weights have no swiglu matvec"
     yargs = "%y: buffer, %y2: buffer" if pair else "%y: buffer"
@@ -1295,7 +1311,7 @@ kernel.def export("{name}") @{name}(%n: index, %tokens: index) {{
   }}"""))
     L.append(("" if NCH > 1 else PV + "\n") + (f"""  %bt_sv = index.add %bt_idx, %chb : index
   %bt_store = index.assume %bt_sv [range(%bt_sv, 0, {TG - 1})] : index
-""" if iq else "") + f"""  scf.for %r = [%c0 to %rows_per step %c1] {{
+""" if iq else "") + (MV_SCHED_DEF if sched else "") + f"""  scf.for %r = [%c0 to %rows_per step %c1]{MV_SCHED_POL if sched else ""} {{
     %row_value = index.add %row_base, %r : index
     %row = index.assume %row_value [lt(%row_value, %n)] : index
     %ro = index.scale %row, %row_bytes : index, offset -> offset
