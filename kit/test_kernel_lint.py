@@ -44,7 +44,12 @@
     note, the same store after the loop does not, nor 1 % of the loop's rounds, nor rows that cannot be matched to the binary;
   - an attention kernel whose key-valid bit masks only the score not noted `maskedv` (E441 / E444: g_attention_split read V of
     unwritten keys, a NaN reached the output): the score-only mask fires, and so does zeroing only p; V's scale selected to 0
-    (KV8_SPLIT_VZERO), a clamped key (g_dfl_ctx_split), no softmax (g_dfl_topk) or a -1.0 fill do not.
+    (KV8_SPLIT_VZERO), a clamped key (g_dfl_ctx_split), no softmax (g_dfl_topk) or a -1.0 fill do not;
+  - a residency tier the hardware cannot reach reported (HRX-like E533: Loom 0.2.0 rounds LDS and slots to whole workgroups, not
+    VGPRs; flash2's 384-lane workgroup = 3 waves per SIMD reported next tier 7 at -21 VGPRs): flash2's rows give 6 waves and next
+    9 at -69 VGPRs and -18,944 B LDS together; a 128-lane kernel (1 wave per SIMD) keeps Loom's own figure; 5-wave
+    workgroups count the busiest SIMD; LDS counts in granules; a 17-wave matvec at
+    the slot limit has no next tier, nor a kernel at a lower slot tier; an unknown resource row gives no figure (fail closed).
 usage: python3 kit/test_kernel_lint.py   (needs loom-compile: VENV from the environment or the machine env file)"""
 import os
 import subprocess
@@ -75,6 +80,50 @@ def compile_lint(lc, t, name, text, root):
     if r.returncode:
         sys.exit(f"FAIL compile {name}: {r.stderr.strip()[:300]}")
     return kl.lint(out)
+
+
+def rep(flat, vgpr, lds, slots, extra=()):
+    """a compile report's residency fields (Loom 0.2.0 gfx1151 rows: VGPR pool 1536 in granules of 24 per SIMD, LDS 131072 per
+    WGP in granules of 1024, the slot row's tier)"""
+    up = lambda x, g: -(-x // g) * g
+    rows = [{"name": "amdgpu.sgpr", "kind": "unconstrained_resource", "allocation_scope": "subgroup", "pool_units": 2048,
+             "allocation_granularity": 128, "units": 78, "rounded_units": 128, "independent_tier": 16},
+            {"name": "amdgpu.vgpr", "kind": "pooled_resource", "allocation_scope": "subgroup", "pool_units": 1536,
+             "allocation_granularity": 24, "units": vgpr, "rounded_units": up(vgpr, 24)},
+            {"name": "amdgpu.lds", "kind": "pooled_resource", "allocation_scope": "workgroup", "pool_units": 131072,
+             "allocation_granularity": 1024, "units": lds, "rounded_units": up(lds, 1024)},
+            {"name": "amdgpu.workgroup_slots", "kind": "fixed_limit", "independent_tier": slots}] + list(extra)
+    return {"residency_constraints": {"rows": rows}, "workload": {"workgroup_size": {"flat": flat}},
+            "target_resources": {"subgroup_size": 32}}
+
+
+def residency_tiers():
+    """whole-workgroup residency (E533) on report rows; flash2's are W/static-1125/barrier-lint/cmb2/all-codes/g_attention_flash2_f16o.json's"""
+    t = kl.tiers(rep(384, 237, 61952, 15))
+    ok(t == (6, 9, {"vgpr": 69, "lds": 18944}), f"residency: flash2 (384 lanes) 6 waves, next reachable 9 at -69 VGPRs and -18,944 B "
+       f"LDS together, not Loom's 7 at -21 ({t})")
+    t = kl.tiers(rep(128, 130, 0, 16))
+    ok(t == (10, 11, {"vgpr": 10}), f"residency: a 128-lane kernel (1 wave per SIMD) keeps Loom's figure, 10 waves and next 11 at -10 VGPRs ({t})")
+    t = kl.tiers(rep(160, 100, 0, 15))
+    ok(t == (11.25, 12.5, {"vgpr": 4}), f"residency: 5-wave workgroups fit while the busiest SIMD's waves fit, 9 x 5 / 4 = 11.25, "
+       f"next 12.5 needs 13 waves on one SIMD: -4 VGPRs ({t})")
+    t = kl.tiers(rep(384, 100, 43500, 15))
+    ok(t == (6, 9, {"lds": 492}), f"residency: LDS counted in its 1,024-B granules, 3 x 43,500 B would fit unrounded ({t})")
+    t = kl.tiers(rep(544, 40, 544, 13))
+    ok(t == (12.75, None, {}), f"residency: a 17-wave matvec at the slot limit, 3 workgroups = 12.75 waves, no next tier ({t})")
+    t = kl.tiers(rep(128, 24, 0, 8))
+    ok(t == (8, None, {}), f"residency: the slot row's tier bounds the workgroups whatever the VGPRs allow ({t})")
+    t = kl.tiers(rep(160, 237, 0, 15, [{"name": "amdgpu.agpr", "kind": "pooled_resource"}]))
+    ok(t == (None, None, None), f"residency: an unknown resource row gives no figure ({t})")
+    x = rep(384, 237, 61952, 15)
+    x["residency_constraints"]["rows"][2]["allocation_scope"] = "subgroup"
+    ok(kl.tiers(x) == (None, None, None), f"residency: LDS allocated per wave (a scope it does not model) gives no figure ({kl.tiers(x)})")
+    x["residency_constraints"]["rows"].pop(2)
+    ok(kl.tiers(x) == (None, None, None), f"residency: a report without the LDS row gives no figure ({kl.tiers(x)})")
+    x = kl.residency(os.path.join(HERE, "fixtures", "flash2_f16o_residency.json"))   # pkg-cmb2's flash2_f16o report, trimmed
+    ok(tuple(x) == (237, 6, 9, {"vgpr": 69, "lds": 18944}), f"residency: pkg-cmb2's flash2_f16o report through residency() ({x})")
+    ok(kl.next_text({"next_tier": 9, "to_next": {"vgpr": 69, "lds": 18944}}) == "9:v69+l18944" and
+       kl.next_text({"next_tier": None, "to_next": {}}) == "cap" and kl.next_text({"to_next": None}) == "-", "residency: the next column")
 
 
 def main():
@@ -223,6 +272,7 @@ def main():
     ok(kl.regressions(dict(base, scratch=513, pf="drain"), base) == ["spill", "drain"], "regress: a new spill and a drained prefetch (E230)")
     ok(kl.regressions(dict(base, waves=10), base) == ["waves12->10"], "regress: fewer waves per SIMD (E236)")
     ok(kl.regressions(dict(base), base) == [], "regress: nothing when nothing changed")
+    residency_tiers()
     prog = ("template.def<@sel1_g_k1> target(@rdna3) @sel1_g_k1_rdna3(%g0: index) {\n  kernel.launch @g_k1[%g0](%g0) : [index](index)\n}\n"
             "command.def public @c() {\n  template.apply<@sel1_g_k1>(%t) : (index)\n  template.apply<@sel1_g_k1>(%u) : (index)\n"
             "  kernel.launch @g_k2[%t](%t) : [index](index)\n  kernel.launch @g_k3(%t, %u) : (index, index)\n}\n")

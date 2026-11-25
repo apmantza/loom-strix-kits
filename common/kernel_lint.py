@@ -83,8 +83,9 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   regress:  (with --baseline) worse than the same kernel in another build: a new spill, the prefetch now drained, fewer
             waves per SIMD, or the hot loop / its longest move run >= 10 % longer (E226: Loom 0.3.0's vmcnt(0) + 32-move shift;
             E230: a rewrite's spill; E236: a variant's residency drop).
-Reported, not flagged: non-MMA instructions per MMA, moves, VGPRs, waves/SIMD, VGPRs to free for the next residency tier
-(Loom's summary report beside the code object, KERNEL.json), pf ('drain' when a vmcnt(0) sits between the loop's last load and
+Reported, not flagged: non-MMA instructions per MMA, moves, VGPRs, waves/SIMD and 'next': the next reachable waves/SIMD with the
+VGPRs (v) and LDS bytes (l) to free together for it, both counted in whole workgroups from the summary report beside the code
+object, KERNEL.json (tiers(); E533: Loom 0.2.0's own tier rounds VGPRs per wave and named flash2's next tier 7, unreachable), pf ('drain' when a vmcnt(0) sits between the loop's last load and
 its first WMMA), and with --package the kernel's launch sites in the package. Calibrated on 225 served kernels (E237 / E241):
 v_mul_lo_u32 (address math) and a drain alone are not defects.
 Decoding goes through loop_census.disasm (ROCm 10.2 llvm-objdump; it refuses undecoded words).
@@ -283,15 +284,68 @@ def join_runs(ins):
     return best
 
 
-def residency(js):
-    """(VGPRs, waves/SIMD, VGPRs to free for the next better tier) from a Loom summary report, or Nones"""
-    if not os.path.exists(js):
+RES_KNOWN = {("amdgpu.vgpr", "pooled_resource", "subgroup"), ("amdgpu.lds", "pooled_resource", "workgroup"),
+             ("amdgpu.workgroup_slots", "fixed_limit", None), ("amdgpu.sgpr", "unconstrained_resource", "subgroup")}   # name, kind, scope
+
+
+def tiers(d):
+    """(waves per SIMD, next reachable waves per SIMD, {resource: units to free for it}) from a Loom report's residency_constraints,
+    counted in whole workgroups; (None, None, None) when a row is not one of RES_KNOWN (fail closed: an unknown limit is not 'none').
+    Loom 0.2.0 rounds LDS and workgroup slots to whole workgroups but not VGPRs (HRX-like E533), so its current / next tier can name
+    one the hardware cannot reach: flash2 (384 lanes = 12 waves, 3 per SIMD in WGP mode) reports next tier 7 at -21 VGPRs; the
+    reachable one is 9 (VGPRs <= 168 and LDS <= 43,008 B together). A workgroup sits on one WGP (4 SIMDs); n workgroups of w waves
+    fit when the busiest SIMD's ceil(n w / 4) waves fit the per-SIMD VGPR pool, n x rounded LDS fits the WGP's pool, and
+    ceil(n w / 4) is within the slot row's tier (it carries the 16-wave cap: on pkg-e480's 257 reports it is ceil(floor(64 / w) w / 4)). Waves per SIMD = n w / 4 (a fraction when w is not a multiple of 4:
+    balanced placement assumed; exact for w % 4 == 0). Next tier None: the slots / wave cap stop the next workgroup."""
+    rows = (d.get("residency_constraints") or {}).get("rows")
+    flat = ((d.get("workload") or {}).get("workgroup_size") or {}).get("flat")
+    sub = (d.get("target_resources") or {}).get("subgroup_size")
+    if not rows or not flat or not sub or any((x.get("name"), x.get("kind"), x.get("allocation_scope")) not in RES_KNOWN for x in rows):
         return None, None, None
-    tr = json.load(open(js)).get("target_resources") or {}
-    res = tr.get("residency") or {}
-    lim = res.get("unique_limiting_resource") or {}
-    return (((tr.get("vector") or {}).get("final") or {}).get("register_count"), res.get("current_tier"),
-            lim.get("reduction_units_to_next_better_tier"))
+    by = {x["name"]: x for x in rows}
+    v, l, s = by.get("amdgpu.vgpr"), by.get("amdgpu.lds"), by.get("amdgpu.workgroup_slots")
+    if not (v and l and s):
+        return None, None, None
+    w = -(-flat // sub)
+    busiest = lambda n: -(-n * w // 4)                                   # waves on the busiest SIMD with n workgroups
+    def fits(n):
+        b = busiest(n)
+        return (b <= s["independent_tier"] and v["rounded_units"] * b <= v["pool_units"]
+                and n * l["rounded_units"] <= l["pool_units"])
+    n = 0
+    while fits(n + 1):
+        n += 1
+    tier = lambda k: k * w // 4 if k * w % 4 == 0 else round(k * w / 4, 2)
+    m = n + 1
+    if busiest(m) > s["independent_tier"]:
+        return tier(n), None, {}
+    need = {}
+    g = v["allocation_granularity"]
+    if v["units"] > v["pool_units"] // busiest(m) // g * g:
+        need["vgpr"] = v["units"] - v["pool_units"] // busiest(m) // g * g
+    g = l["allocation_granularity"]
+    if l["units"] > l["pool_units"] // m // g * g:
+        need["lds"] = l["units"] - l["pool_units"] // m // g * g
+    return tier(n), tier(m), need
+
+
+def residency(js):
+    """(VGPRs, waves/SIMD, next reachable waves/SIMD, {resource: units to free for it}) from a Loom summary report (tiers()), or Nones"""
+    if not os.path.exists(js):
+        return None, None, None, None
+    d = json.load(open(js))
+    vg = (((d.get("target_resources") or {}).get("vector") or {}).get("final") or {}).get("register_count")
+    return (vg,) + tiers(d)
+
+
+def next_text(r):
+    """the 'next' column: the next reachable waves/SIMD and what to free for it (v VGPRs, l LDS bytes); 'cap' when the slots or the
+    wave cap stop the next workgroup; '-' unknown"""
+    if r.get("to_next") is None:
+        return "-"
+    if r.get("next_tier") is None:
+        return "cap"
+    return f"{r['next_tier']}:" + "+".join(f"{k[0]}{x}" for k, x in sorted(r["to_next"].items(), reverse=True))
 
 
 def bank(js):
@@ -355,7 +409,7 @@ def lint_object(path):
             vg = hsaco_run.kernel_meta(path, n).get(".vgpr_count")
         except SystemExit:
             vg = None
-        r = lint_listing(n, sl, sa, (vg, None, None))
+        r = lint_listing(n, sl, sa, (vg, None, None, None))
         r["family"] = re.split(r"[<(]", dn, maxsplit=1)[0].split("::")[-1].strip() or n
         r["object"] = os.path.basename(path)
         r["bank_conf"] = r["bank_extra"] = None
@@ -418,10 +472,10 @@ def ldsbank(r, js, ins):
         r.setdefault("notes", []).append("ldsbank")
 
 
-def lint_listing(name, ins, addr, res=(None, None, None)):
+def lint_listing(name, ins, addr, res=(None, None, None, None)):
     """the lint of one kernel's decoded listing (instructions, byte addresses), as lint() reports it"""
     r = {"kernel": name, "instr": len(ins), "flags": []}
-    r["vgpr"], r["waves"], r["to_next"] = res
+    r["vgpr"], r["waves"], r["next_tier"], r["to_next"] = res
     h = hot(ins, addr)
     if h is None or not any(ins[j].startswith(MM) for j in common_path(ins, h[2], h[0], h[1])):
         b = full = ins                                                # no multiply loop: the whole kernel (e.g. a dequant pass)
@@ -1251,14 +1305,14 @@ def main():
                 r["flags"] += ["regress:" + x for x in regressions(r, lint(b))]
     rows.sort(key=lambda r: (-bool(r["flags"]), -ms.get(r["kernel"], 0), -len(r["flags"]), -(sites or {}).get(r["kernel"], 0), r["kernel"]))
     print(f"{'kernel':42s} {'where':>6s} {'loop':>5s} {'comm':>5s} {'mm':>4s} {'other/op':>8s} {'sel':>4s} {'pk':>3s} {'bfe':>4s} {'scr':>4s} {'mov':>4s} "
-          f"{'run':>4s} {'vgpr':>4s} {'w/S':>3s} {'next':>4s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
+          f"{'run':>4s} {'vgpr':>4s} {'w/S':>3s} {'next':>11s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
     for r in rows:
         if a.flagged and not r["flags"]:
             continue
         f = lambda v: "-" if v is None else str(v)
         s = "-" if sites is None else str(sites.get(r["kernel"], 0))
         print(f"{r['kernel']:42s} {r['where']:>6s} {r['loop']:5d} {r['common']:5d} {r['wmma'] or r['dot']:4d} {f(r['other_per_op']):>8s} {r['select']:4d} {r['pk']:3d} "
-              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {f(r['waves']):>3s} {f(r['to_next']):>4s} {r['pf']:>5s} {s:>5s} "
+              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {f(r['waves']):>3s} {next_text(r):>11s} {r['pf']:>5s} {s:>5s} "
               f"{f(r['lds_waits_per_op']):>5s} {f(r['cover_min']):>4s} {r['in_flight']:3d} {f(r.get('bank_extra')):>5s} "
               f"{('%.1f' % ms[r['kernel']]) if r['kernel'] in ms else '-':>8s}  "
               f"{' '.join(r['flags'])}{('  [' + ' '.join(r['notes']) + ']') if r.get('notes') else ''}")
