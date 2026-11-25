@@ -222,9 +222,24 @@ def arm_checks():
     ok(hr.memory_guard(spec, rot, copies, free, 1.0, ["w"]) == base + copies * 4096, "memory guard adds an arm's own w copies")
 
 
+def arg_layout_checks():
+    # Recurrence (HRX-like E534, 11-25): with --arg-names every hipcc code object failed with KeyError '.name' in the layout check,
+    # which read the name of the hidden arguments that name_args leaves unnamed.
+    import copy
+    meta = {".args": [{".offset": 0, ".size": 8, ".value_kind": "global_buffer"}, {".offset": 8, ".size": 4, ".value_kind": "by_value"},
+                      {".offset": 16, ".size": 8, ".value_kind": "hidden_block_count_x"}], ".kernarg_segment_size": 24}
+    try:
+        lay = hr.arg_layout(hr.name_args(copy.deepcopy(meta), ["X", "M"]))
+    except KeyError as e:
+        lay = repr(e)
+    ok(lay == [("X", 0, 8, "global_buffer"), ("M", 8, 4, "by_value"), (None, 16, 8, "hidden_block_count_x")],
+       f"the layout check reads a --arg-names code object, hidden arguments unnamed ({lay})")
+
+
 def main():
     cold_cache_checks()
     arm_checks()
+    arg_layout_checks()
     if len(sys.argv) < 3:                                  # the checks below need a real program and its code objects
         print("(no PROGRAM.loom CODE_OBJECT_DIR: metadata, region and packer checks skipped)")
         sys.exit(1 if fails else 0)
