@@ -10,7 +10,12 @@ views the buffer from the uniform byte offset 2 k (k_next or the activation step
 
 The flat views' extents are padded by one load's width so Loom's bounds prover sees origin + width <= extent; every access reads exactly
 the addresses the 2-D form read (rows are padded: kx = k + 64), so nothing past the old bounds is touched.
-Fails closed: every anchor must match exactly once per kernel."""
+Fails closed: every anchor must match exactly once per kernel.
+
+apply() picks the kernels on a whole program: every gfx11 kernel named g_gemm_f16_{acc,store,swiglu}_m256 or its F16O11 copy
+(_m256_f16o); gfx12 twins (target(@rdna4)) are skipped by name; any other g_gemm_f16_*m256* kernel stops the build. The pattern
+before HRX-like E512 ended at `_m256"`, so the served swiglu GEMM (g_gemm_f16_swiglu_m256_f16o since F16O11) was never rewritten
+while the build log listed the unserved g_gemm_f16_swiglu_m256 as done."""
 import re
 
 
@@ -74,3 +79,22 @@ def flataddr(text):
         if gone in text:
             raise SystemExit(f"GEMM256_FLATADDR: {gone} still referenced after the rewrite")
     return text
+
+
+KERNEL = re.compile(r'^kernel\.def (?:target\(@(\w+)\) )?export\("(g_gemm_f16_\w*m256\w*)"\).*?\n\} launch\(.*?\n\}\n', re.S | re.M)
+REWRITE = re.compile(r"g_gemm_f16_(acc|store|swiglu)_m256(_f16o)?")
+
+
+def apply(text):
+    """rewrite every served 256-row f16 GEMM in a program; returns (text, names rewritten). Known-good forms only (above)."""
+    done, out, last = [], [], 0
+    for m in KERNEL.finditer(text):
+        target, name = m.group(1), m.group(2)
+        if target == "rdna4" and name.endswith("_rdna4"):
+            continue   # gfx12 twin: not served on gfx1151 (the rewrite's anchors are the gfx11 K-tile-64 forms)
+        if target not in (None, "rdna3") or not REWRITE.fullmatch(name):
+            raise SystemExit(f"GEMM256_FLATADDR: {name} (target {target}) is neither rewritten nor a known skip: extend apply() or skip it by name")
+        out += [text[last:m.start()], flataddr(m.group(0))]; last = m.end(); done.append(name)
+    if not done:
+        raise SystemExit("GEMM256_FLATADDR: no g_gemm_f16_*_m256 kernel in the program")
+    return "".join(out) + text[last:], done
