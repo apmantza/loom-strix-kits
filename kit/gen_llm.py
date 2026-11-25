@@ -113,6 +113,20 @@ if KV8:
     assert 2 * KV_LAYERS * KVH * 4 <= POS_BYTES, "KV8: the planes' scale records do not fit one page block"
 if KV8:   # the flash kernels (gen_flash2.py / gen_flash2s.py subprocesses) address KV slots with FLASH2_POS_BYTES
     os.environ["FLASH2_POS_BYTES"] = str(POS_BYTES)
+# KV8_SPLIT_VZERO=1 (HRX-like E441 / E444): the split decode / fallback attention bodies (attention_text's paged branch,
+# gqa_split, multi_token_split, gqa_span) select only the SCORE of a key outside the token's range [lo, hi); its V was
+# still loaded and multiplied by p = +0, so NaN / Inf bytes in the unwritten slots of a ragged last page reached the
+# output (0 x NaN = NaN). The switch keeps such a V finite:
+#   KV8 (live): the key's V scale is selected to 0.0 before the dequant multiply (kv8_readers; +4 instructions per
+#     16-key block, VGPRs unchanged, W/static-1124/nanleak/FINDING.md section 6), so its V is code x 0 = +-0;
+#   f16 KV: the key's V slot is clamped to the block's first key j (written: lo_al <= j < hi, j <= the position), as the
+#     non-paged branch already clamps the key; the switch's name is kept for both formats.
+# Exact for finite KV, both variants: for an out-of-range key s = -3e38 (%neg_big) and the running max is finite (every
+# split's first block holds key lo < hi), so p = expf(s - max) is exactly +0; the accumulator starts +0, is only scaled
+# by alpha > 0 and summed, so it is never -0 (round to nearest: x + (-x) = +0), hence fmaf(+0, V, acc) == acc bitwise for
+# any finite V. Old and new outputs differ only where the old stale V was NaN / Inf. Off (default): unchanged program.
+SPLIT_VZERO = os.environ.get("KV8_SPLIT_VZERO", "0") == "1"
+SPLIT_VCLAMP = SPLIT_VZERO and not KV8   # the f16 variant (the slot clamp in the text generators)
 WINDOW = CFG.get("sliding_window") or 0   # keys kept by sliding layers (0: none)
 GATE = CFG.get("attn_gate", False)       # True: separate attn_gate tensor; "fused_q": attn_q packs [q | gate] per head
 FUSED_Q = GATE == "fused_q"
@@ -2604,15 +2618,72 @@ def kv_of(name):
     return 0 if n[0] == "k" else 1
 
 
+class _SplitVZero:
+    """KV8_SPLIT_VZERO (HRX-like E441 / E444) inside kv8_readers: for each decode-shape V load (KVH x 32 x n view) the
+    key-in-range bit that zeroes its scale, found in the load's own kernel by its exact known-good definition. A V load in
+    a kernel that clamps the key already (the non-paged branch) needs none. Any other V load is unrecognized: recorded and
+    refused after the pass (fail closed), so a new split body cannot ship with its V unguarded."""
+    GUARD = {   # V value name without its key index -> (guard bit, the bit's known-good definition)
+        "v": ("%ok{i}", "%ok{i} = scalar.andi %okl{i}, %okh{i} : i1"),      # attention_text paged branch
+        "vh": ("%ok{i}", "%ok{i} = scalar.andi %okl{i}, %okh{i} : i1"),     # gqa_split (load and extf apart: pass 3)
+        "mv": ("%mvok{i}", "%mvok{i} = index.cmp ult, %mkey{i}, "),         # multi_token_split (union bound)
+        "sp_vh": ("%sp_vok{i}", "%sp_vok{i} = index.cmp ult, %sp_key{i}, "),  # gqa_span (union bound)
+    }
+    CLAMPED = "%key{i}_c = scf.select %ok{i}, %key{i}_raw, %j : index"   # attention_text non-paged: V of key j, written
+
+    def __init__(self):
+        self.src, self.starts, self.guarded, self.clean, self.bad = None, [], {}, {}, []
+
+    def kernel(self, s, pos):
+        import bisect
+        if s is not self.src:
+            self.src = s
+            self.starts = [m.start() for m in re.finditer(r"(?m)^kernel\.def ", s)] + [len(s)]
+        k = bisect.bisect_right(self.starts, pos) - 1
+        if k < 0 or k + 1 >= len(self.starts):
+            return "?", "", ""
+        blk = s[self.starts[k]:self.starts[k + 1]]
+        nm = re.search(r'export\("([^"]+)"\)', blk.split("\n", 1)[0])
+        return (nm.group(1) if nm else "?"), blk, s[self.starts[k]:pos]
+
+    def guard(self, m, name):
+        """The guard bit for the V load `name` (e.g. v3, vh3, sp_vh3) matched by m, or None (clamped kernel)."""
+        pi = re.fullmatch(r"(\D*?)(\d+)", name)
+        kn, blk, before = self.kernel(m.string, m.start())
+        if pi and pi.group(1) in self.GUARD:
+            g, d = (x.format(i=pi.group(2)) for x in self.GUARD[pi.group(1)])
+            if re.search(r"(?m)^\s*" + re.escape(d), before) and re.search(r"(?m)^\s*%zero_f = scalar\.constant 0\.0 : f32$", before):
+                self.guarded[kn] = self.guarded.get(kn, 0) + 1
+                return g
+            if self.CLAMPED.format(i=pi.group(2)) in blk:
+                self.clean[kn] = self.clean.get(kn, 0) + 1
+                return None
+        self.bad.append(f"{kn}:%{name}")
+        return None
+
+    def check(self):
+        if self.bad:
+            sys.exit("KV8_SPLIT_VZERO: V loads with no recognized key-in-range bit (and no clamped key): " + ", ".join(self.bad[:12]))
+        if not self.guarded:
+            sys.exit("KV8_SPLIT_VZERO: no split-kernel V load found to guard")
+        print("KV8_SPLIT_VZERO: V scale guarded " + ", ".join(f"{k} {v}" for k, v in sorted(self.guarded.items()))
+              + ("; clamped already: " + ", ".join(f"{k} {v}" for k, v in sorted(self.clean.items())) if self.clean else ""),
+              file=sys.stderr)
+
+
 def kv8_readers(text):
     """KV8 (HRX-like DESIGN-KV8.md): the decode attention kernels' K/V loads (view a slot as KVH x 32 x n f16, load a
     lane's n values, extend to f32) become: view the codes as i8, load, convert, times the slot's scale for this KV head
     (the f32 after the KVH x D codes). The values the rest of the kernel sees are the dequantized K/V, so scores,
     softmax and the V sum are unchanged. Then a kernel that still views the arena as f16 is refused (KV8_PARTIAL=1 only
-    warns, for building a reader at a time): a reader left on f16 would read codes as halves."""
+    warns, for building a reader at a time): a reader left on f16 would read codes as halves.
+    KV8_SPLIT_VZERO=1: a decode-shape V load's scale is selected to 0.0 for a key outside the token's range (_SplitVZero)."""
+    vz = _SplitVZero() if SPLIT_VZERO else None
+
     def sub(m):
         ind, p, i, off, H, n, _h, ext = m.groups()
         t = f"{p}{i}"
+        g = vz.guard(m, t) if vz and kv_of(p) == 1 else None
         return (f"{ind}%{p}c{i} = buffer.view %arena[%{off}] : buffer -> view<{H}x32x{n}xi8>\n"
                 f"{ind}%{t}_k8q = vector.load %{p}c{i}[%kv_head, %lane, %c0] : view<{H}x32x{n}xi8> -> vector<{n}xi8>\n"
                 f"{ind}%{t}_k8o = index.constant {kv_of(p)} : index\n"
@@ -2623,7 +2694,9 @@ def kv8_readers(text):
                 # exactness: prefill flash vs decode split vs vsplit); f16 arithmetic is exact here because the scale
                 # is f16-representable (E77)
                 f"{ind}%{t}_k8f = vector.sitofp %{t}_k8q : vector<{n}xi8> to vector<{n}xf16>\n"
-                f"{ind}%{t}_k8sh = scalar.fptrunc %{t}_k8s : f32 to f16\n"
+                # KV8_SPLIT_VZERO: an out-of-range key's scale -> 0.0, so its V is code x 0 = +-0 (finite) whatever the slot held
+                + (f"{ind}%{t}_k8z = scf.select {g}, %{t}_k8s, %zero_f : f32\n" if g else "")
+                + f"{ind}%{t}_k8sh = scalar.fptrunc %{t}_{'k8z' if g else 'k8s'} : f32 to f16\n"
                 f"{ind}%{t}_k8ss = vector.splat %{t}_k8sh : vector<{n}xf16>\n"
                 f"{ind}%{t}_k8h = vector.mulf %{t}_k8f, %{t}_k8ss : vector<{n}xf16>\n"
                 f"{ind}%{ext} = vector.extf %{t}_k8h : vector<{n}xf16> to vector<{n}xf32>")
@@ -2663,13 +2736,15 @@ def kv8_readers(text):
     def sub3(m):
         ind, dst, src, N = m.groups()
         off = views3[src]
+        g = vz.guard(m, dst) if vz and kv_of(dst) == 1 else None
         return (f"{ind}%{dst}_k8q = vector.load %{src}[%kv_head, %lane, %c0] : view<{KVH}x32x{N}xi8> -> vector<{N}xi8>\n"
                 f"{ind}%{dst}_k8o = index.constant {kv_of(dst)} : index\n"
                 f"{ind}%{dst}_k8so = func.call @g_kv8_scale_offset(%{off}, %layer, %{dst}_k8o, %pool) : (offset, index, index, index) -> (offset)\n"
                 f"{ind}%{dst}_k8sv = buffer.view %arena[%{dst}_k8so] : buffer -> view<{KVH}xf32>\n"
                 f"{ind}%{dst}_k8s = view.load %{dst}_k8sv[%kv_head] : view<{KVH}xf32> -> f32\n"
                 f"{ind}%{dst}_k8f = vector.sitofp %{dst}_k8q : vector<{N}xi8> to vector<{N}xf32>\n"
-                f"{ind}%{dst}_k8ss = vector.splat %{dst}_k8s : vector<{N}xf32>\n"
+                + (f"{ind}%{dst}_k8z = scf.select {g}, %{dst}_k8s, %zero_f : f32\n" if g else "")
+                + f"{ind}%{dst}_k8ss = vector.splat %{dst}_{'k8z' if g else 'k8s'} : vector<{N}xf32>\n"
                 f"{ind}%{dst}_k8m = vector.mulf %{dst}_k8f, %{dst}_k8ss : vector<{N}xf32>\n"
                 f"{ind}%{dst} = vector.fptrunc %{dst}_k8m : vector<{N}xf32> to vector<{N}xf16>")
     if views3:
@@ -2677,6 +2752,8 @@ def kv8_readers(text):
                           + f"{KVH}" + r"x32x(\d+)xf16> -> vector<\d+xf16>$")
         text, n3 = pat3.subn(sub3, text)
         n += n3
+    if vz:
+        vz.check()
     left = sorted({re.search(r'export\("([^"]+)"\)', blk).group(1) for blk in re.split(r"(?m)^(?=kernel\.def )", text)
                    if blk.startswith("kernel.def") and 'export("' in blk.split("\n", 1)[0]
                    and re.search(r"buffer\.view %arena\[[^\]]*\] : buffer -> view<[^>]*xf16>", blk)})
@@ -2900,8 +2977,10 @@ def multi_token_split(text, P, U, T, until=None):
       %mko{i} = index.add %mkb, %mkd{i} : offset
       %mkc{i} = buffer.view %arena[%mko{i}] : buffer -> view<{KVH}x32x4xf16>
       %mkh{i} = vector.load %mkc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> {ht}
-      %mk{i} = vector.extf %mkh{i} : {ht} to {vt}
-      %mvo{i} = index.add %mko{i}, %mt_plane_stride : offset
+      %mk{i} = vector.extf %mkh{i} : {ht} to {vt}""" + (f"""
+      %mvok{i} = index.cmp ult, %mkey{i}, %mt_hiu{T - 1} : index""" if SPLIT_VZERO else "") + (f"""
+      %mvb{i} = scf.select %mvok{i}, %mko{i}, %mkb : offset""" if SPLIT_VCLAMP else "") + f"""
+      %mvo{i} = index.add {"%mvb" if SPLIT_VCLAMP else "%mko"}{i}, %mt_plane_stride : offset
       %mvc{i} = buffer.view %arena[%mvo{i}] : buffer -> view<{KVH}x32x4xf16>
       %mvh{i} = vector.load %mvc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> {ht}
       %mv{i} = vector.extf %mvh{i} : {ht} to {vt}""")
@@ -3057,8 +3136,10 @@ def gqa_span(U, S, scale):
       %sp_kd{i} = index.constant {i * POS_BYTES} : offset
       %sp_ko{i} = index.add %sp_kb, %sp_kd{i} : offset
       %sp_kc{i} = buffer.view %arena[%sp_ko{i}] : buffer -> view<{KVH}x32x4xf16>
-      %sp_kh{i} = vector.load %sp_kc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>
-      %sp_vo{i} = index.add %sp_ko{i}, %plane_stride : offset
+      %sp_kh{i} = vector.load %sp_kc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>""" + (f"""
+      %sp_vok{i} = index.cmp ult, %sp_key{i}, {hi} : index""" if SPLIT_VZERO else "") + (f"""
+      %sp_vb{i} = scf.select %sp_vok{i}, %sp_ko{i}, %sp_kb : offset""" if SPLIT_VCLAMP else "") + f"""
+      %sp_vo{i} = index.add {"%sp_vb" if SPLIT_VCLAMP else "%sp_ko"}{i}, %plane_stride : offset
       %sp_vc{i} = buffer.view %arena[%sp_vo{i}] : buffer -> view<{KVH}x32x4xf16>
       %sp_vh{i} = vector.load %sp_vc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>""")
     ys = []
@@ -3183,8 +3264,9 @@ def gqa_split(text, P, S, span=False):
       %kd{i} = index.constant {i * POS_BYTES} : offset
       %ko{i} = index.add %kb_off, %kd{i} : offset
       %kc{i} = buffer.view %arena[%ko{i}] : buffer -> view<{KVH}x32x4xf16>
-      %kh{i} = vector.load %kc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>
-      %vo{i} = index.add %ko{i}, %plane_stride : offset
+      %kh{i} = vector.load %kc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>""" + (f"""
+      %vb{i} = scf.select %ok{i}, %ko{i}, %kb_off : offset""" if SPLIT_VCLAMP else "") + f"""
+      %vo{i} = index.add {"%vb" if SPLIT_VCLAMP else "%ko"}{i}, %plane_stride : offset
       %vc{i} = buffer.view %arena[%vo{i}] : buffer -> view<{KVH}x32x4xf16>
       %vh{i} = vector.load %vc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>
       %k{i} = vector.extf %kh{i} : vector<4xf16> to vector<4xf32>
@@ -3263,7 +3345,8 @@ def attention_text(S, P, twin=False):
       %okh{i} = index.cmp ult, %key{i}_raw, %hi_abs : index
       %ok{i} = scalar.andi %okl{i}, %okh{i} : i1
       %kd{i} = index.constant {i * POS_BYTES} : offset
-      %ko{i} = index.add %kb_off, %kd{i} : offset""" if pa else f"""      %key{i}_raw = index.add %j, %c{i}u : index
+      %ko{i} = index.add %kb_off, %kd{i} : offset""" + (f"""
+      %vb{i} = scf.select %ok{i}, %ko{i}, %kb_off : offset""" if SPLIT_VCLAMP else "") if pa else f"""      %key{i}_raw = index.add %j, %c{i}u : index
       %ok{i} = index.cmp ult, %key{i}_raw, %stop : index
       %key{i}_c = scf.select %ok{i}, %key{i}_raw, %j : index
       %kp{i} = index.add %window_low, %key{i}_c : index
@@ -3271,7 +3354,7 @@ def attention_text(S, P, twin=False):
       %kc{i} = buffer.view %arena[%ko{i}] : buffer -> view<{KVH}x32x4xf16>
       %kh{i} = vector.load %kc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>
       %k{i} = vector.extf %kh{i} : vector<4xf16> to vector<4xf32>
-      %vo{i} = index.add %ko{i}, %plane_stride : offset
+      %vo{i} = index.add {"%vb" if pa and SPLIT_VCLAMP else "%ko"}{i}, %plane_stride : offset
       %vc{i} = buffer.view %arena[%vo{i}] : buffer -> view<{KVH}x32x4xf16>
       %vh{i} = vector.load %vc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>
       %v{i} = vector.extf %vh{i} : vector<4xf16> to vector<4xf32>""")

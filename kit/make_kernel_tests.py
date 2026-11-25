@@ -783,6 +783,55 @@ def kv_arena(planes):
     return arena.reshape(-1).view(np.int32), (c.astype(np.float32) * d[..., None]).astype(np.float16).astype(np.float32)
 
 
+# Stale-KV pairs (stale_kv_* cases; HRX-like E431 / worklist S1, idea from strix-llama.cpp #20 / #127, MIT, ideas only).
+# Recurrence they guard: the stale-KV WMMA leak. A masked key gets P = +0.0, but a kernel that multiplies masked or unwritten
+# KV slots instead of skipping or zeroing them still sums 0 x NaN = NaN (0 x Inf = NaN; a stale +Inf / NaN score masked by
+# adding -inf is NaN), so its output depends on bytes no writer put there; in serving those are a recycled page's or a fresh
+# allocation's. And E88's benign-fill blind spot: every earlier case filled unwritten KV with finite bytes (0x3C, random
+# values, x64 values), which such a kernel multiplies by 0 harmlessly. Each case runs the same inputs over two arenas that
+# differ only in their UNWRITTEN bytes (a row's positions past its last token incl. the ragged tail of its last page, pages
+# in no row's map, other layers' planes, KV8 scale records of those slots and the scale plane's unused bytes): once E88's
+# clean 0x3C bytes, once a poison fill, and expects the outputs equal at atol 0 (the sign of a zero is not distinguished).
+# Poison fills: nan (f16 NaN; KV8 codes 0x7F, f32 NaN scales), negzero (f16 -0.0; KV8 codes 0x01, -0.0 scales: code x
+# scale = -0.0), inf (f16 +Inf; KV8 codes 0x7F, +Inf scales). Each family's _nan_negcontrol twin also puts NaN in one
+# WRITTEN V slot live tokens read (KV8: its V scale records): its output must change, or the comparison is blind.
+SKV_FILLS = (("clean", np.uint16(0x3C3C).view(np.float16), 0x3C, np.uint32(0x3C3C3C3C).view(np.float32)),
+             ("nan", np.float16(np.nan), 0x7F, np.float32(np.nan)), ("negzero", np.float16(-0.0), 0x01, np.float32(-0.0)),
+             ("inf", np.float16(np.inf), 0x7F, np.float32(np.inf)))
+SKV_POISON = ("nan", "negzero", "inf")
+
+
+def skv_arenas(planes, written, neg_slot):
+    """Arenas (kv_arena()'s layout and saved dtype) of K/V values PLANES (2, P, KVH, D) whose physical slots WRITTEN (P bools)
+    hold the values and every other byte a SKV_FILLS fill: {fill: array, "neg": the nan arena with slot NEG_SLOT's V NaN (KV8:
+    its V scale records)}, and the values the readers see of the written slots (2, P, KVH, D) f32."""
+    P = planes.shape[1]; w = np.asarray(written, bool); out = {}
+    if KV8_LIVE:
+        c, d = kv8_quant(planes)
+    for kind, f16v, code, f32v in SKV_FILLS:
+        if not KV8_LIVE:
+            a = np.full((2, P, KVH * D), f16v, np.float16)
+            for pl in (0, 1):
+                a[pl, w] = planes[pl, w].reshape(-1, KVH * D)
+            out[kind] = a
+            continue
+        a = np.full((SP8 + 1, P, POS8), code, np.int8)
+        sb = a[SP8].reshape(-1); sb.view(np.float32)[:] = f32v   # the scale plane: every record and unused byte
+        for pl in (0, 1):
+            a[pl, w] = c[pl, w].reshape(-1, POS8)
+            for slot in np.flatnonzero(w):
+                at = kv8_scale_at(pl, slot); sb[at:at + KVH * 4] = d[pl, slot].astype(np.float32).view(np.int8)
+        out[kind] = a
+    n = out["nan"].copy()
+    if KV8_LIVE:
+        at = kv8_scale_at(1, neg_slot); n[SP8].reshape(-1)[at:at + KVH * 4] = np.full(KVH, np.nan, np.float32).view(np.int8)
+    else:
+        n[1, neg_slot] = np.float16(np.nan)
+    out["neg"] = n
+    seen = (c.astype(np.float32) * d[..., None]).astype(np.float16).astype(np.float32) if KV8_LIVE else planes.astype(np.float16).astype(np.float32)
+    return {k: (a.reshape(-1).view(np.int32) if KV8_LIVE else a.reshape(-1)) for k, a in out.items()}, seen
+
+
 if KV8_LIVE:
     t8, ctx8 = 4, 64; blocks8 = ctx8 // 16; pos8 = np.array([0, 1, 7, 30])
     k8 = (rng.standard_normal((t8, KVH, D)) * 1.5).astype(np.float32); v8 = (rng.standard_normal((t8, KVH, D)) * 1.5).astype(np.float32)
@@ -2897,6 +2946,67 @@ def attention_vsplit_case(tag, p0, T, neg=False, tok0=0, scatter=False):
         f"  check.expect.close actual(%oA) expected(%oB) atol(0.0) rtol(0.0) nan(different) : {OT}\n  check.return\n}}\n")
 
 
+def skv_vsplit_cases():
+    """Stale-KV pairs (see SKV_FILLS), decode / verify: @stale_kv_vsplit_<fill> and @stale_kv_vsplit_nan_negcontrol. vsplit_2043_8's
+    shape (a span of 8 tokens across L17_FROM = 2048: g_attention_split alone below it, then g_attention_vsplit, then combine)
+    with 24 dead padding tokens, on a 2x pool: the row's pages at random physical pages, its positions 2051.. (the ragged tail
+    of page 128 and pages 129-130 of its map) and the other half of the pool unwritten. Clean run vs numpy, poison run == clean
+    at atol 0. Own generator: the other cases' inputs do not move."""
+    p0, T, NT = 2043, 8, 32
+    G_ = QH // KVH; r_ = np.random.default_rng(4311)
+    ctx = ((p0 + T + 1 + 15) // 16) * 16 + 32; blocks = ctx // 16; SPOOL = 2 * blocks
+    perm = r_.permutation(SPOOL)[:blocks]
+    phys = perm[np.arange(ctx) // 16] * 16 + np.arange(ctx) % 16   # the row's position -> physical slot
+    planes = (r_.standard_normal((2, SPOOL * 16, KVH, D)) * 0.5).astype(np.float16)
+    written = np.zeros(SPOOL * 16, bool); written[phys[:p0 + T]] = True
+    arenas, seen = skv_arenas(planes, written, phys[p0])   # negcontrol: V of key p0, which every span token reads
+    q = np.zeros((NT, QH, D), np.float32); q[:T] = r_.standard_normal((T, QH, D)).astype(np.float32)
+    gate = np.full((NT, QH * D), 30.0, np.float32)   # sigmoid(30) = 1 in f32: the reference is plain attention
+    info = np.zeros((NT, 4), np.int32); info[:T, 1] = p0 + np.arange(T); info[:T, 2] = 1
+    tl = np.zeros(NT, np.int32); ent = [i for i in range(T) if i == 0 or (p0 + i) % 16 == 0]
+    tl[NT // 2] = len(ent); tl[NT // 2 + 1:NT // 2 + 1 + len(ent)] = ent
+    orig = np.zeros(10 + blocks, np.int32); orig[8] = 40; orig[10:] = perm
+    att = np.zeros((NT, QH, D))
+    for i in range(T):
+        ks = phys[:p0 + i + 1]
+        for hh in range(QH):
+            k_, v_ = seen[0, ks, hh // G_].astype(np.float64), seen[1, ks, hh // G_].astype(np.float64)
+            sc = k_ @ q[i, hh].astype(np.float64) / np.sqrt(D); pr = np.exp(sc - sc.max())
+            att[i, hh] = pr @ v_ / pr.sum()
+    for nn, a in [("q", q.reshape(NT, -1)), ("gate", gate), ("info", info), ("tiles", tl), ("orig", orig),
+                  ("o", att.reshape(NT, -1).astype(np.float32))] + [(f"arena_{k}", a) for k, a in arenas.items()]:
+        save(f"skv_v_{nn}", a)
+    QD_, S = QH * D, 64
+    OT, IT, TT, AR, RT = f"tensor<{NT}x{QD_}xf32>", f"tensor<{NT}x4xi32>", f"tensor<{NT}xi32>", kv_arena_ty(SPOOL * 16), f"tensor<{10 + blocks}xi32>"
+    PA, PM = f"tensor<{NT * QH * S * D}xf32>", f"tensor<{NT * QH * S * 2}xf32>"
+    def run(x, fill):
+        return (f"  %arena{x} = check.file.read.npy path(\"skv_v_arena_{fill}.npy\") : {AR}\n"
+                f"  %pacc{x} = check.generate.fill value(0.0) : {PA}\n  %pml{x} = check.generate.fill value(0.0) : {PM}\n"
+                f"  %o{x} = check.generate.fill value(0.0) : {OT}\n"
+                f"  kernel.launch @g_attention_split[%t](%t, %layer, %sliding, %ctx, %pool, %q, %info, %orig, %arena{x}, %pacc{x}, %pml{x}) : [index](index, index, i32, index, index, {OT}, {IT}, {RT}, {AR}, {PA}, {PM})\n"
+                f"  kernel.launch @g_attention_vsplit[%t](%t, %layer, %sliding, %ctx, %pool, %q, %pml{x}, %info, %tiles, %orig, %arena{x}, %pacc{x}) : [index](index, index, i32, index, index, {OT}, {PM}, {IT}, {TT}, {RT}, {AR}, {PA})\n"
+                f"  kernel.launch @g_attention_combine[%t](%t, %sliding, %info, %pacc{x}, %pml{x}, %gate, %o{x}) : [index](index, i32, {IT}, {PA}, {PM}, {OT}, {OT})\n")
+    for fill in SKV_POISON:
+        cases.append(f"""check.case public @stale_kv_vsplit_{fill} {{
+  %t = check.literal value({NT}) : index
+  %layer = check.literal value(0) : index
+  %sliding = check.literal value(0) : i32
+  %ctx = check.literal value({ctx}) : index
+  %pool = check.literal value({SPOOL * 16}) : index
+  %q = check.file.read.npy path("skv_v_q.npy") : {OT}
+  %gate = check.file.read.npy path("skv_v_gate.npy") : {OT}
+  %info = check.file.read.npy path("skv_v_info.npy") : {IT}
+  %tiles = check.file.read.npy path("skv_v_tiles.npy") : {TT}
+  %orig = check.file.read.npy path("skv_v_orig.npy") : {RT}
+  %eo = check.file.read.npy path("skv_v_o.npy") : {OT}
+""" + run("C", "clean") + run("P", fill) +
+            f"  check.expect.close actual(%oC) expected(%eo) atol(5.0e-3) rtol(5.0e-3) nan(different) : {OT}\n"
+            f"  check.expect.close actual(%oP) expected(%oC) atol(0.0) rtol(0.0) nan(different) : {OT}\n  check.return\n}}\n")
+        if fill == "nan":
+            nan_case = cases[-1]
+    cases.append(negtwin(nan_case, ('path("skv_v_arena_nan.npy")', 'path("skv_v_arena_neg.npy")')))
+
+
 # L17 step 2b live (gen_llm.py ATTN_L17_VS=1): read off the package, not the environment, so the cases follow what was built.
 # Decode/verify tokens past L17_FROM (2048 visible keys) go to g_attention_vsplit after g_attention_split, so the cases below
 # that launch g_attention_split alone past that point test a path the package never takes (their tokens are left to vsplit
@@ -2922,6 +3032,7 @@ if L17_LIVE or os.environ.get("L17_VSPLIT_TESTS") == "1":
     # kernel alone: the path whose served outputs changed after earlier requests on KV8) and above it, decode (T 1) and verify (T 8).
     for _tag, _p0, _T in (("vscat_300_8", 300, 8), ("vscat_300_1", 300, 1), ("vscat_4109_8", 4109, 8)):
         attention_vsplit_case(_tag, _p0, _T, scatter=True)
+    skv_vsplit_cases()   # E431: NaN / -0.0 / +Inf in the unwritten slots must not change a bit (E146's stale pages were finite)
 
 if _gqa and not L17_LIVE and os.environ.get("L17_TESTS", "1") == "1":   # head_dim 256 drafting builds (the K/V-once body): spans that cross a 16-key block
     # (4156, 8) and (20030, 8): visible crosses a multiple of 64, so the span's tokens get different split lengths
@@ -3387,6 +3498,59 @@ def dflash_attention_case():
     T = lambda n: f"tensor<{t}x{n}xf32>"
     tys = {"meta": ty(meta), "info": ty(info), "orig": ty(orig), "q": T(QD), "bk": T(KD), "bv": T(KD),
            "cache": f"tensor<{cache_saved.size}xi32>" if dkv8 else f"tensor<{cache.size}xf16>"}
+    PT, MT = f"tensor<{t * QH * S * D}xf32>", f"tensor<{t * QH * S * 2}xf32>"
+    # Stale-KV pairs (see SKV_FILLS): @stale_kv_dfl_<fill>, @stale_kv_dfl_nan_negcontrol. The same inputs over caches whose
+    # written slots (each row's context [0, P), keys below a window included: serving wrote them) are this case's and whose
+    # every other byte is a fill: positions >= P of each row (its ragged last context page and the pages past it; the x64
+    # values above were finite), the other layers' planes, and with KV8 the scale records of those slots and the scale plane's
+    # unused bytes. Clean run vs the reference above, poison run == clean at atol 0; negcontrol: V of row 0's last context key NaN.
+    wmask = np.zeros(pool, bool)
+    for r, (P, n) in enumerate(spans):
+        wmask[(perm[nb * r:nb * (r + 1), None] * 16 + np.arange(16)).reshape(-1)[:P]] = True
+    neg_slot = perm[nb * 0 + (spans[0][0] - 1) // 16] * 16 + (spans[0][0] - 1) % 16
+    skv = {}
+    for kind, f16v, code, f32v in SKV_FILLS:
+        if dkv8:
+            a = np.full_like(arena, code); a[2 * F["layers"]].view(np.float32)[:] = f32v
+            for pl in (2 * layer, 2 * layer + 1):
+                rec = slice(pl * KVH * SPW * 4, (pl + 1) * KVH * SPW * 4)
+                a[pl, wmask] = arena[pl, wmask]; a[2 * F["layers"], wmask, rec] = arena[2 * F["layers"], wmask, rec]
+        else:
+            a = np.full_like(cache, f16v)
+            for pl in (2 * layer, 2 * layer + 1):
+                a[pl, wmask] = cache[pl, wmask]
+        skv[kind] = a
+    skv["neg"] = skv["nan"].copy()
+    if dkv8:
+        rv = (2 * layer + 1) * KVH * SPW * 4
+        skv["neg"][2 * F["layers"], neg_slot, rv:rv + KVH * SPW * 4] = np.full(KVH * SPW, np.nan, np.float32).view(np.int8)
+    else:
+        skv["neg"][2 * layer + 1, neg_slot] = np.float16(np.nan)
+    for kind, a in skv.items():
+        save(f"skv_d_cache_{kind}", a.reshape(-1).view(np.int32) if dkv8 else a.reshape(-1))
+
+    def skv_run(x, fill):
+        r = f'  %cache{x} = check.file.read.npy path("skv_d_cache_{fill}.npy") : {tys["cache"]}\n  %o{x} = check.generate.fill value(0.0) : {T(QD)}\n'
+        if not split:
+            return r + f'  kernel.launch @g_dfl_attention[%t](%t, %spans, %layer, %ctx, %pool, %meta, %info, %q, %bk, %bv, %orig, %cache{x}, %o{x}) : [index](index, index, index, index, index, {tys["meta"]}, {tys["info"]}, {T(QD)}, {T(KD)}, {T(KD)}, {tys["orig"]}, {tys["cache"]}, {T(QD)})\n'
+        return r + (f"  %pacc{x} = check.generate.fill value(0.0) : {PT}\n  %pml{x} = check.generate.fill value(0.0) : {MT}\n"
+                    f'  kernel.launch @g_dfl_ctx_split[%t](%t, %spans, %layer, %ctx, %pool, %meta, %info, %q, %orig, %cache{x}, %pacc{x}, %pml{x}) : [index](index, index, index, index, index, {tys["meta"]}, {tys["info"]}, {T(QD)}, {tys["orig"]}, {tys["cache"]}, {PT}, {MT})\n'
+                    f'  kernel.launch @g_dfl_attention[%t](%t, %spans, %layer, %ctx, %pool, %meta, %info, %q, %bk, %bv, %orig, %cache{x}, %o{x}, %pacc{x}, %pml{x}) : [index](index, index, index, index, index, {tys["meta"]}, {tys["info"]}, {T(QD)}, {T(KD)}, {T(KD)}, {tys["orig"]}, {tys["cache"]}, {T(QD)}, {PT}, {MT})\n')
+
+    def skv_cases():
+        out_ = []
+        for fill in SKV_POISON:
+            out_.append(f"""check.case public @stale_kv_dfl_{fill} {{
+  %t = check.literal value({t}) : index
+  %spans = check.literal value({len(spans)}) : index
+  %layer = check.literal value({layer}) : index
+  %ctx = check.literal value({16 * nb}) : index
+  %pool = check.literal value({pool}) : index
+""" + "".join(f'  %{nm} = check.file.read.npy path("{tag}_{nm}.npy") : {tt}\n' for nm, tt in tys.items() if nm != "cache") +
+                f'  %eo = check.file.read.npy path("{tag}_o.npy") : {T(QD)}\n' + skv_run("C", "clean") + skv_run("P", fill) +
+                f"  check.expect.close actual(%oC) expected(%eo) atol(2.0e-3) rtol(3.0e-3) nan(different) : {T(QD)}\n"
+                f"  check.expect.close actual(%oP) expected(%oC) atol(0.0) rtol(0.0) nan(different) : {T(QD)}\n  check.return\n}}\n")
+        return out_ + [negtwin(out_[0], ('path("skv_d_cache_nan.npy")', 'path("skv_d_cache_neg.npy")'))]
     if not split:
         for neg in ((False, True) if dkv8 else (False,)):
             cn = f"{tag}_cacheneg" if neg else f"{tag}_cache"
@@ -3403,8 +3567,8 @@ def dflash_attention_case():
   check.return
 }}
 """)
+        cases.extend(skv_cases())
         return
-    PT, MT = f"tensor<{t * QH * S * D}xf32>", f"tensor<{t * QH * S * 2}xf32>"
     cases.append(f"""check.case public @{tag} {{
   %t = check.literal value({t}) : index
   %spans = check.literal value({len(spans)}) : index
@@ -3421,6 +3585,7 @@ def dflash_attention_case():
   check.return
 }}
 """)
+    cases.extend(skv_cases())
 
 
 dflash_attention_case()
@@ -3951,6 +4116,84 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
 {list_launch("%t", _ot, "%info", "b")}{_fl("g_attention_flash2_f16o", "b", "%hb", _HT)}{_fl("g_attention_flash2_partial_f16o", "b", "%hb", _HT)}{_tail}  check.return
 }}
 """)
+    # Stale-KV pairs (see SKV_FILLS), prefill. @stale_kv_flash_<fill>: the prefill path as served (work lists, g_attention_split +
+    # combine for every token, then g_attention_flash2, the partial kernel and the deep one added below) on one epoch: row 1 at
+    # positions 301-400 (a 3-token head and a 1-token tail for the partial kernel, six whole tiles with their causal diagonal;
+    # 400 is the first slot of its page: the ragged rest of the page and the pages past it unwritten), row 2 at 77-84 (8 tokens,
+    # the split-K fallback's) and 11 dead padding tokens. Written: rows 1 and 2 up to their last positions (f_arena_a's values);
+    # unwritten: the rest of their pages and all of row 0's. The live rows (0-107) vs numpy on the clean run, poison == clean at
+    # atol 0. @stale_kv_flash_f16o_<fill> (F16O_O packages): g_attention_flash2_f16o + its partial kernel on row 1's run alone,
+    # the f16 rows. Negcontrols: V of row 1's position 350 NaN (read by tokens 350-400). Own generator: other inputs do not move.
+    _skr = np.random.default_rng(4312)
+    _skw = np.zeros(pool_a, bool); _skw[1024:1024 + 401] = True; _skw[2048:2048 + 85] = True
+    _ska, _ = skv_arenas(arena_a_raw, _skw, 1024 + 350)
+    for _k, _a in _ska.items():
+        save(f"skv_f_arena_{_k}", _a)
+    _ski = np.zeros((len(epoch_info([(1, 301, 100), (2, 77, 8), (None, 0, 11)])), 4), np.int32)
+    _ski[:, :3] = epoch_info([(1, 301, 100), (2, 77, 8), (None, 0, 11)]); _skt, _skn, _skd = len(_ski), 108, QH * D
+    _skq = np.zeros((_skt, QH, D), np.float32); _skg = np.zeros((_skt, QH, D), np.float32)
+    _skq[:_skn] = (_skr.standard_normal((_skn, QH, D)) * 2.5).astype(np.float32); _skg[:_skn] = _skr.standard_normal((_skn, QH, D)).astype(np.float32)
+    _skref = aliased_ref(_skq.astype(np.float16).astype(np.float64), _ski)[:_skn]   # the live tokens see only written keys
+    _skref = _skref * gate_mul(_skg[:_skn]) if cfg.get("attn_gate") else _skref
+    for _n, _a in (("info", _ski), ("q", _skq.reshape(_skt, -1)), ("g", _skg.reshape(_skt, -1)), ("ref", _skref.reshape(_skn, -1).astype(np.float32))):
+        save(f"skv_f_{_n}", _a)
+    _skOT, _skIT, _skXT = f"tensor<{_skt}x{_skd}xf32>", f"tensor<{_skt}x4xi32>", f"tensor<{_skn}x{_skd}xf32>"
+    _skPT, _skMT = f"tensor<{_skt * QH * 64 * D}xf32>", f"tensor<{_skt * QH * 64 * 2}xf32>"
+
+    def _skv_run(x, fill, ofill):
+        return (f'  %arena{x} = check.file.read.npy path("skv_f_arena_{fill}.npy") : {AA}\n'
+                f"  %o{x} = check.generate.fill value({ofill}) : {_skOT}\n  %pacc{x} = check.generate.fill value(0.0) : {_skPT}\n"
+                f"  %pml{x} = check.generate.fill value(0.0) : {_skMT}\n  %x{x} = check.generate.fill value({ofill}) : {_skXT}\n"
+                f"  kernel.launch @g_attention_split[%t](%t, %layer, %sliding, %ctx, %pool, %q, %info, %orig, %arena{x}, %pacc{x}, %pml{x}) : [index](index, index, i32, index, index, {_skOT}, {_skIT}, {OA}, {AA}, {_skPT}, {_skMT})\n"
+                f"  kernel.launch @g_attention_combine[%t](%t, %sliding, %info, %pacc{x}, %pml{x}, %g, %o{x}) : [index](index, i32, {_skIT}, {_skPT}, {_skMT}, {_skOT}, {_skOT})\n"
+                f"{list_launch('%t', _skt, '%info', x)}  kernel.launch @g_attention_flash2[%t](%t, %layer, %sliding, %ctx, %pool, %q, %g, %info, %tiles{x}, %orig, %arena{x}, %o{x}) : [index](index, index, i32, index, index, {_skOT}, {_skOT}, {_skIT}, tensor<{_skt}xi32>, {OA}, {AA}, {_skOT})\n"
+                f"  kernel.launch @test_copy_rows[%nx](%nx, %wd, %skip, %t, %o{x}, %x{x}) : [index](index, index, index, index, {_skOT}, {_skXT})\n")
+
+    def _skv_head(t):
+        return f"""  %t = check.literal value({t}) : index
+  %layer = check.literal value(0) : index
+  %sliding = check.literal value(0) : i32
+  %ctx = check.literal value({ctx_a}) : index
+  %pool = check.literal value({pool_a}) : index
+  %orig = check.file.read.npy path("f_orig_a.npy") : {OA}
+"""
+    for _fill in SKV_POISON:
+        cases.append(f"""check.case public @stale_kv_flash_{_fill} {{
+{_skv_head(_skt)}  %nx = check.literal value({_skn}) : index
+  %wd = check.literal value({_skd}) : index
+  %skip = check.literal value(0) : index
+  %q = check.file.read.npy path("skv_f_q.npy") : {_skOT}
+  %g = check.file.read.npy path("skv_f_g.npy") : {_skOT}
+  %info = check.file.read.npy path("skv_f_info.npy") : {_skIT}
+  %ref = check.file.read.npy path("skv_f_ref.npy") : {_skXT}
+""" + _skv_run("C", "clean", "0.0") + _skv_run("P", _fill, "7.0") +
+            f"  check.expect.close actual(%xC) expected(%ref) atol(4.0e-3) rtol(4.0e-3) nan(different) : {_skXT}\n"
+            f"  check.expect.close actual(%xP) expected(%xC) atol(0.0) rtol(0.0) nan(different) : {_skXT}\n  check.return\n}}\n")
+        if _fill == "nan":
+            _skv_nan = cases[-1]
+    cases.append(negtwin(_skv_nan, ('path("skv_f_arena_nan.npy")', 'path("skv_f_arena_neg.npy")')))
+    if not KS and 'export("g_attention_flash2_f16o")' in (_pkg_llm_text() or ""):
+        _skhi = np.zeros((len(epoch_info([(1, 301, 100), (None, 0, 12)])), 4), np.int32); _skhi[:, :3] = epoch_info([(1, 301, 100), (None, 0, 12)])
+        assert (flash_covered(_skhi) == (_skhi[:, 2] != 0)).all(), "stale_kv_flash_f16o: a live token outside the flash kernels"
+        _skht = len(_skhi); _skhOT, _skhIT, _skhHT = f"tensor<{_skht}x{_skd}xf32>", f"tensor<{_skht}x4xi32>", f"tensor<{_skht}x{_skd + _PFPAD}xf16>"
+        save("skv_h_info", _skhi); save("skv_h_q", _skq[:_skht].reshape(_skht, -1)); save("skv_h_g", _skg[:_skht].reshape(_skht, -1))
+
+        def _skv_hrun(x, fill):
+            return (f'  %arena{x} = check.file.read.npy path("skv_f_arena_{fill}.npy") : {AA}\n  %h{x} = check.generate.fill value(0.0) : {_skhHT}\n'
+                    + list_launch("%t", _skht, "%info", x) + "".join(
+                        f"  kernel.launch @{k}[%t](%t, %layer, %sliding, %ctx, %pool, %q, %g, %info, %tiles{x}, %orig, %arena{x}, %h{x}) : "
+                        f"[index](index, index, i32, index, index, {_skhOT}, {_skhOT}, {_skhIT}, tensor<{_skht}xi32>, {OA}, {AA}, {_skhHT})\n"
+                        for k in ("g_attention_flash2_f16o", "g_attention_flash2_partial_f16o")))
+        for _fill in SKV_POISON:
+            cases.append(f"""check.case public @stale_kv_flash_f16o_{_fill} {{
+{_skv_head(_skht)}  %q = check.file.read.npy path("skv_h_q.npy") : {_skhOT}
+  %g = check.file.read.npy path("skv_h_g.npy") : {_skhOT}
+  %info = check.file.read.npy path("skv_h_info.npy") : {_skhIT}
+""" + _skv_hrun("C", "clean") + _skv_hrun("P", _fill) +
+                f"  check.expect.close actual(%hP) expected(%hC) atol(0.0) rtol(0.0) nan(different) : {_skhHT}\n  check.return\n}}\n")
+            if _fill == "nan":
+                _skv_hnan = cases[-1]
+        cases.append(negtwin(_skv_hnan, ('path("skv_f_arena_nan.npy")', 'path("skv_f_arena_neg.npy")')))
 
 # 6. MoE (gen_moe.py) on real tensors, one layer per expert-down format: the decode chain (router -> top-k ->
 # gate/up -> down -> combine, plus the prefill router with padding tokens) and the prefill chain (prefill router ->
@@ -4648,6 +4891,136 @@ if True:   # coverage: a case for every kernel the package launches
     cases += ktest_variants.clones(real_cases(), _lib + _helpers, pkg_launched() - cases_launched(), save, KS, lambda f: np.load(os.path.join(out, f)))
     for _k in sorted(pkg_launched() - cases_launched()):
         print(f"coverage: no case launches {_k}")
+
+
+def split_vzero_cases():
+    """KV8_SPLIT_VZERO's red / green (HRX-like E441 / E444). Recurrence: g_attention_split and g16_attention_split_listed
+    select only the SCORE of a key past the token's range; the V of the 1-15 unwritten slots after the token's last key in its
+    16-key page block was still loaded and multiplied by p = +0, so NaN / Inf bytes there reached the output (0 x NaN = NaN).
+    stale_kv_flash_nan / _inf caught it only through an 8-token run (E441); no case launched the served prefill fallback
+    (g16_attention_split_listed) or a decode / verify token below 2,048 visible keys whose last key is a page's first slot
+    (stale_kv_vsplit's split tokens end on a fully written page, E444). Each case: the clean run (E88's 0x3C fill) vs numpy,
+    every SKV_POISON fill == clean at atol 0, and a _nan_negcontrol (NaN in one WRITTEN V slot that all of row 0's live tokens
+    read: the output must change, or the comparison is blind). Own generators: no other case's inputs move.
+      @stale_kv_split_listed_<fill>: an epoch of 16 tokens, row 0 at 76-80 and row 1 at 30-33 (runs < 9: every token is the
+        listed fallback's; 80 and 32 are first slots of a page) and 7 dead padding tokens, as served: g_attention_fallback_list,
+        then ktn_ copies of g16_attention_split_listed and g16_attention_combine_listed over its list (the package's kernels
+        with the count as an index; ktn_ is not counted as their test, so the listed_cases clones stay as they are).
+      @stale_kv_split_decode_<fill>: the decode / verify branch as served (g_attention_split, g_attention_vsplit when the package
+        has it, g_attention_combine), 4 rows below 2,048 visible keys: decode at 64 and 1040 (page-first), a 4-token verify span
+        400-403 (400 page-first), decode at 100 (mid-page), 25 dead padding tokens.
+    The rows share physical pages for their full (written) pages and own the page of their last position; spare pages are
+    unwritten. Expected: FAIL on kernels without the switch (pkg-e379), PASS with KV8_SPLIT_VZERO=1."""
+    def layout(last, spare, seed):
+        R = len(last); r_ = np.random.default_rng(seed)
+        nsh = max(p // 16 for p in last); npg = nsh + R + spare; blocks = nsh + 2
+        perm = r_.permutation(npg); shared, own, spr = perm[:nsh], perm[nsh:nsh + R], perm[nsh + R:]
+        maps = np.zeros((R, blocks), np.int32)
+        for r, p in enumerate(last):
+            lp = p // 16; maps[r, :lp] = shared[:lp]; maps[r, lp] = own[r]; maps[r, lp + 1:] = spr[r % spare]
+        phys = lambda r, pos: maps[r, np.asarray(pos) // 16] * 16 + np.asarray(pos) % 16
+        written = np.zeros(npg * 16, bool)
+        for r, p in enumerate(last):
+            written[phys(r, np.arange(p + 1))] = True
+        orig = np.zeros(10 * R + R * blocks, np.int32)
+        for r in range(R):
+            orig[r * 10 + 8] = (10 * R + r * blocks) * 4
+        orig[10 * R:] = maps.reshape(-1)
+        planes = (r_.standard_normal((2, npg * 16, KVH, D)) * 0.5).astype(np.float16)
+        return planes, written, phys, orig, blocks * 16, npg * 16, r_
+
+    def reference(q, info, phys, seen, gate):
+        G_ = QH // KVH; att = np.zeros(q.shape)
+        for i in np.flatnonzero(info[:, 2]):
+            ks = phys(info[i, 0], np.arange(info[i, 1] + 1))
+            for hh in range(QH):
+                k_, v_ = seen[0, ks, hh // G_].astype(np.float64), seen[1, ks, hh // G_].astype(np.float64)
+                sc = k_ @ q[i, hh].astype(np.float64) / np.sqrt(D); pr = np.exp(sc - sc.max())
+                att[i, hh] = pr @ v_ / pr.sum()
+        return (att.reshape(len(q), -1) * gate_mul(gate)).astype(np.float32)
+
+    def emit(name, pfx, NT, ctx, pool, RT, AR, run, extra=""):
+        OT, IT = f"tensor<{NT}x{QH * D}xf32>", f"tensor<{NT}x4xi32>"
+        for fill in SKV_POISON:
+            cases.append(f"""check.case public @{name}_{fill} {{
+  %t = check.literal value({NT}) : index
+  %layer = check.literal value(0) : index
+  %sliding = check.literal value(0) : i32
+  %ctx = check.literal value({ctx}) : index
+  %pool = check.literal value({pool}) : index
+  %q = check.file.read.npy path("{pfx}_q.npy") : {OT}
+  %g = check.file.read.npy path("{pfx}_g.npy") : {OT}
+  %info = check.file.read.npy path("{pfx}_info.npy") : {IT}
+  %orig = check.file.read.npy path("{pfx}_orig.npy") : {RT}
+  %eo = check.file.read.npy path("{pfx}_o.npy") : {OT}
+{extra}""" + run("C", "clean") + run("P", fill) +
+                f"  check.expect.close actual(%oC) expected(%eo) atol(5.0e-3) rtol(5.0e-3) nan(different) : {OT}\n"
+                f"  check.expect.close actual(%oP) expected(%oC) atol(0.0) rtol(0.0) nan(different) : {OT}\n  check.return\n}}\n")
+            if fill == "nan":
+                nan_case = cases[-1]
+        cases.append(negtwin(nan_case, (f'path("{pfx}_arena_nan.npy")', f'path("{pfx}_arena_neg.npy")')))
+
+    def save_all(pfx, arenas, **arrays):
+        for nn, a in list(arrays.items()) + [(f"arena_{k}", a) for k, a in arenas.items()]:
+            save(f"{pfx}_{nn}", a)
+
+    lib = _pkg_llm_text() or ""
+    # (a) the served prefill fallback: g16_attention_split_listed (16 splits) + its combine, over g_attention_fallback_list's list
+    import ktest_variants as _vz_kv
+    cps = {k: _vz_kv.listed_copy(lib, k) for k in ("g16_attention_split_listed", "g16_attention_combine_listed")}
+    if all(cps.values()):
+        for k, c in cps.items():
+            assert c.count(f"kt_{k}") == 2, f"split_vzero: copy of {k} not recognized"
+            cases.append(c.replace(f"kt_{k}", f"ktn_{k}"))
+        planes, written, phys, orig, ctx, pool, r_ = layout([80, 33], 3, 4441)
+        arenas, seen = skv_arenas(planes, written, int(phys(0, 50)))   # negcontrol: V of row 0's key 50 (read by 76-80)
+        NT, S = 16, 16
+        info = np.zeros((NT, 4), np.int32)
+        info[:5, :3] = [(0, 76 + i, 1) for i in range(5)]; info[5:9, :3] = [(1, 30 + i, 1) for i in range(4)]
+        assert not flash_covered(info).any(), "stale_kv_split_listed: a token the flash kernels take"
+        q = np.zeros((NT, QH, D), np.float32); q[:9] = r_.standard_normal((9, QH, D)).astype(np.float32)
+        g = np.full((NT, QH * D), 30.0, np.float32)
+        save_all("svz_l", arenas, q=q.reshape(NT, -1), g=g, info=info, orig=orig, o=reference(q, info, phys, seen, g))
+        OT, IT, LT, RT, AR = f"tensor<{NT}x{QH * D}xf32>", f"tensor<{NT}x4xi32>", f"tensor<{NT}xi32>", f"tensor<{len(orig)}xi32>", kv_arena_ty(pool)
+        PA, PM = f"tensor<{NT * QH * S * D}xf32>", f"tensor<{NT * QH * S * 2}xf32>"
+
+        def run_l(x, fill):
+            return (f'  %arena{x} = check.file.read.npy path("svz_l_arena_{fill}.npy") : {AR}\n'
+                    f"  %pacc{x} = check.generate.fill value(0.0) : {PA}\n  %pml{x} = check.generate.fill value(0.0) : {PM}\n"
+                    f"  %o{x} = check.generate.fill value(0.0) : {OT}\n" + list_launch("%t", NT, "%info", x) +
+                    f"  kernel.launch @ktn_g16_attention_split_listed[%t](%t, %flist{x}, %layer, %sliding, %ctx, %pool, %q, %info, %orig, %arena{x}, %pacc{x}, %pml{x}) : [index](index, {LT}, index, i32, index, index, {OT}, {IT}, {RT}, {AR}, {PA}, {PM})\n"
+                    f"  kernel.launch @ktn_g16_attention_combine_listed[%t](%t, %flist{x}, %sliding, %info, %pacc{x}, %pml{x}, %g, %o{x}) : [index](index, {LT}, i32, {IT}, {PA}, {PM}, {OT}, {OT})\n")
+        emit("stale_kv_split_listed", "svz_l", NT, ctx, pool, RT, AR, run_l)
+    else:
+        print("split_vzero: the package has no g16_attention_split_listed / g16_attention_combine_listed; no listed case")
+    # (b) decode / verify below 2,048 visible keys: the program's decode branch (split, vsplit, combine)
+    planes, written, phys, orig, ctx, pool, r_ = layout([64, 1040, 403, 100], 3, 4442)
+    arenas, seen = skv_arenas(planes, written, int(phys(0, 10)))   # negcontrol: V of row 0's key 10 (read by its token at 64)
+    NT, S = 32, 64
+    info = np.zeros((NT, 4), np.int32)
+    info[:7, :3] = [(0, 64, 1), (1, 1040, 1)] + [(2, 400 + i, 1) for i in range(4)] + [(3, 100, 1)]
+    q = np.zeros((NT, QH, D), np.float32); q[:7] = r_.standard_normal((7, QH, D)).astype(np.float32)
+    g = np.full((NT, QH * D), 30.0, np.float32)
+    tl = np.zeros(NT, np.int32)   # vsplit's old tile list (unread by the self-listing kernel; the program passes %info)
+    save_all("svz_d", arenas, q=q.reshape(NT, -1), g=g, info=info, orig=orig, tiles=tl, o=reference(q, info, phys, seen, g))
+    OT, IT, TT, RT, AR = f"tensor<{NT}x{QH * D}xf32>", f"tensor<{NT}x4xi32>", f"tensor<{NT}xi32>", f"tensor<{len(orig)}xi32>", kv_arena_ty(pool)
+    PA, PM = f"tensor<{NT * QH * S * D}xf32>", f"tensor<{NT * QH * S * 2}xf32>"
+    vs = 'export("g_attention_vsplit")' in lib
+
+    def run_d(x, fill):
+        return (f'  %arena{x} = check.file.read.npy path("svz_d_arena_{fill}.npy") : {AR}\n'
+                f"  %pacc{x} = check.generate.fill value(0.0) : {PA}\n  %pml{x} = check.generate.fill value(0.0) : {PM}\n"
+                f"  %o{x} = check.generate.fill value(0.0) : {OT}\n"
+                f"  kernel.launch @g_attention_split[%t](%t, %layer, %sliding, %ctx, %pool, %q, %info, %orig, %arena{x}, %pacc{x}, %pml{x}) : [index](index, index, i32, index, index, {OT}, {IT}, {RT}, {AR}, {PA}, {PM})\n"
+                + (f"  kernel.launch @g_attention_vsplit[%t](%t, %layer, %sliding, %ctx, %pool, %q, %pml{x}, %info, %tiles, %orig, %arena{x}, %pacc{x}) : [index](index, index, i32, index, index, {OT}, {PM}, {IT}, {TT}, {RT}, {AR}, {PA})\n" if vs else "")
+                + f"  kernel.launch @g_attention_combine[%t](%t, %sliding, %info, %pacc{x}, %pml{x}, %g, %o{x}) : [index](index, i32, {IT}, {PA}, {PM}, {OT}, {OT})\n")
+    emit("stale_kv_split_decode", "svz_d", NT, ctx, pool, RT, AR, run_d,
+         f'  %tiles = check.file.read.npy path("svz_d_tiles.npy") : {TT}\n' if vs else "")
+
+
+if not KS and os.environ.get("SPLIT_VZERO_TESTS", "1") == "1":
+    split_vzero_cases()   # HRX-like E441 / E444: unwritten slots after a token's last key in the split kernels' last block
+
 if flash2_deep_from(cfg):   # gen_llm.py launches the deep pairs' kernel after every one-tile prefill flash launch
     cases = [re.sub(r"^( *)kernel\.launch @g_attention_flash2\[(.*)$", r"\g<0>\n\1kernel.launch @g_attention_flash2_deep[\2", c,
                     flags=re.M) for c in cases] + DEEP_CASES   # these launch the two kernels as they test them
@@ -4664,6 +5037,19 @@ for h in sorted(set(cfg.get("layer_heads") or []) - {QH}):
                    env=dict(os.environ, KTEST_HEADS_SFX=f"_h{h}", GEMM_TESTS="0", DRAFTER_TESTS="0", MOE_TESTS="0"))
     cases.append(open(os.path.join(out, f"cases_h{h}.loom-test")).read())
     os.remove(hc); os.remove(os.path.join(out, f"cases_h{h}.loom-test"))
+# Known defects (run_kernel_tests.sh reads known_defects.json beside the cases): a tagged case may fail on an expectation ('KNOWN-FAIL
+# (id)') without failing the run; one that passes fails the run ('KNOWN-DEFECT NOW PASSES'), so a tag cannot outlive its defect.
+# E444 (HRX-like E441 / E444): the split kernels multiply the V of unwritten slots after a token's last key by p = +0; the poison
+# fills that are non-finite after dequant (nan, inf; negzero stays finite and passes) fail on a package built without
+# KV8_SPLIT_VZERO=1 and are required with it (the generator runs with the package's switches, common/ktest.sh). Negative controls
+# are never tagged (the runner keeps their must-fail rule anyway).
+KNOWN_DEFECTS = {"E444": ("" if os.environ.get("KV8_SPLIT_VZERO", "0") == "1" else
+                          "stale_kv_flash_nan stale_kv_flash_inf stale_kv_split_listed_nan stale_kv_split_listed_inf "
+                          "stale_kv_split_decode_nan stale_kv_split_decode_inf").split()}
+if not KS:
+    _have = set(re.findall(r"(?m)^check\.case public @(\w+) \{", "\n".join(cases)))
+    json.dump({n: ref for ref, ns in KNOWN_DEFECTS.items() for n in ns if n in _have},
+              open(os.path.join(out, "known_defects.json"), "w"), indent=1, sort_keys=True)
 # hrx-loom 0.1.0: float comparison is check.expect.approximate with the actual and expected types.
 text = re.sub(r"check\.expect\.close (actual\(.*\)) : (.*)$", r"check.expect.approximate \1 : \2, \2", "\n".join(cases), flags=re.M)
 open(os.path.join(out, f"cases{KS}.loom-test"), "w", newline="\n").write(text)

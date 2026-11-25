@@ -26,10 +26,27 @@ except ValueError:  # loom-test did not get to run the cases: a compile/link err
     print("(a case launching a kernel the generator no longer emits shows up as a SYMBOL error: regenerate the tests "
           "with make_kernel_tests.py after changing the generator)")
     sys.exit(1)
-bad = nneg = 0
+import os
+# Known defects (make_kernel_tests.py writes known_defects.json: {case: ledger id}, e.g. HRX-like E444's split-kernel stale-V cases
+# on a package built without the fix's switch). Such a case may fail on an expectation: 'KNOWN-FAIL (id) case', not counted bad.
+# If it PASSES, the tag has outlived the defect: 'KNOWN-DEFECT NOW PASSES', counted bad. A failure only on an issue (a fault, a
+# timeout) is not the known defect: FAIL. Negative controls keep their must-fail rule whatever the file says.
+kd = json.load(open("known_defects.json")) if os.path.exists("known_defects.json") else {}
+bad = nneg = nknown = 0
 for s in d["samples"]:
     fails = [f.get("detail", f.get("message", "")) if isinstance(f, dict) else str(f) for f in s["expectations"].get("failures", [])]
     issues = [i.get("message", "") for i in s.get("issues", [])]
+    if s["case"] in kd and "_negcontrol" not in s["case"]:
+        if s["passed"]:
+            bad += 1
+            print(f"FAIL KNOWN-DEFECT NOW PASSES {s['case']}: remove the tag ({kd[s['case']]})")
+        elif (fails or s["expectations"].get("failure_count", 0) > 0) and not issues:
+            nknown += 1
+            print(f"KNOWN-FAIL ({kd[s['case']]}) {s['case']}", *(x[:300] for x in fails[:2]))
+        else:
+            bad += 1
+            print(f"FAIL {s['case']} (known defect {kd[s['case']]}, but failed on an issue)", *(x[:300] for x in issues + fails[:2]))
+        continue
     # A negative control (any case named *_negcontrol: a planted difference its checks must see) must FAIL, and on an
     # expectation: one that fails only on an issue (a fault, a timeout) proves nothing about its checks (HRX-like E398).
     neg = "_negcontrol" in s["case"]
@@ -41,6 +58,7 @@ for s in d["samples"]:
            " (negative control passed: its checks cannot see the planted difference)")
     print(("PASS " if ok else "FAIL ") + s["case"] + why, *(x[:300] for x in issues + fails[:2]))
 print(f"negative controls: {nneg}")
+print(f"known defects (KNOWN-FAIL): {nknown}")
 print(f"{len(d['samples']) - bad}/{len(d['samples'])} passed")
 sys.exit(1 if bad else 0)
 PY
