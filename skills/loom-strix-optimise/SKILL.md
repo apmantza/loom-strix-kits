@@ -35,16 +35,22 @@ This file is the entry point and the loop; the companion skills hold one procedu
 2. **Distributions, not means.** `--split KERNEL` shows a kernel's time clusters; the top-kernels table splits by
    workgroup count. One kernel's mean hid two populations (aligned and straddling verify tokens) at 1.62 and 3.01 ms.
 3. **Classify the bound** (rules section 1): bytes / time against bandwidth, FLOPs / time against the WMMA peak, latency
-   (a timing ablation without loads and one with cache-resident loads), or registers (the compile report).
+   (a timing ablation without loads and one with cache-resident loads), or registers / LDS (Loom's compile report:
+   `loom-compile-report show` for the resource that sets the residency tier, `suggest --include-experimental` for a cliff two
+   resources set together; tools.md, step 3).
    Before designing, run `common/kernel_lint.py` over the package's compiled kernels: it flags the defect shapes already
    found (a scalarised lookup, byte-vector repacking, a hot-loop spill) and prints instructions per MMA and the registers to
    the next residency tier.
 4. **Read the SDK and this repository's generator before designing around a limit** (rules section 6): grep an hrx-system
-   checkout at the installed tag (loom/docs/src, loom/py/loom/dialect) and kit/.
+   checkout at the installed tag (loom/docs/src, loom/py/loom/dialect) and kit/, and the tools' `--help=all`; `common/fresh.py`
+   prints the flags, tools and workflows a Loom release added (step 0).
 5. **Prior art at the diagnosis step** (rules section 3), with the measured diagnosis in the brief; spot-check key claims.
+   Loom's oracle workflows (tools.md) say how to freeze another engine's selected kernel (llama.cpp, RADV) or a native schedule
+   as a reference.
 6. **Cheapest evidence first** (rules section 2): the compile report, `common/loop_census.py` (the hot loop from its
    backward branch: length, moves, waits), `common/load_cover.py` (where each load is waited), `common/kernel_lint.py`
-   (every root of a package or program; against another build or compiler with `--baseline`), `loom-compile-report show/suggest` on a details report (wait reasons, copy waits, the LDS
+   (every root of a package or program; against another build or compiler with `--baseline`), `loom-compile-report show/suggest` on a details report and
+   `loom-compile-report diff` against the other build's report (wait reasons, copy waits, the LDS
    bank model), Radeon GPU Analyzer for live registers; then a timing ablation; then the served binary (`common/serve_code_dump.py`) timed through
    HIP, with rocprofv3 counters or thread trace on it when the question is about caches, LDS or stalls; then a build.
 7. **Change test-first.** Kernel cases that straddle every new boundary (`kit/make_kernel_tests.py`), then deliberate
@@ -66,6 +72,10 @@ This file is the entry point and the loop; the companion skills hold one procedu
 9. **Adopt** only after both pass, with the rollback package named.
 10. **New weights** (another quant, a re-upload): `common/quant_eval.sh` against the reference quant, a `variants/<name>/` in the
    kit, `KIT_VARIANT=<name> common/kit_check.sh`, then the same candidate check.
+
+Loom tools still pending verification here (sanitizers in kernel tests, one-kernel served profiles, IR-level ablation and pass
+bisect, `--config` schedule search) are listed under tools.md's table: try them, and move one into a step only with the row that
+verified it.
 
 ## Running long jobs
 

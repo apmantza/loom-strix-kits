@@ -81,10 +81,21 @@ for a fraction of the next one's cost.
   because its last round is part-empty' was written down, then the same model put 14-29 % idle on kernels measured at the
   bandwidth ceiling. A model that mispredicts the controls explains nothing.
 - **Ablation**: timing-only builds that remove one ingredient (loads, barriers, dequant, a scale read) rank levers
-  before any rewrite (E15, E52). Results are garbage by design; label them so.
+  before any rewrite (E15, E52). Results are garbage by design; label them so, and check the ablation's binary before timing it:
+  the loads still issue in a cache-resident build, the removed work is gone and nothing else is, the barrier and publication stay in
+  a dispatch-only build. A build the compiler emptied bounds nothing (E137 kept the stores live with a data-dependent never-true guard;
+  E318 stopped on an ablation pattern that matched nothing in live's kernel; Loom: the proxy's native artifact must prove it kept the mechanism).
 - **Profile per kernel, both sides of a loss** (E10: an average hid +84 % in one kernel and -11/-23 % in two). Split a
-  shared kernel name by call site before attributing time (E13). Attribute by call shape, not by name (E43).
-- **Price the lever before building it** (E15/E24): if the ablation's best case is below the A/B noise, do not build.
+  shared kernel name by call site before attributing time (E13). Attribute by call shape, not by name (E43). A change that moves
+  work between kernels (fusion, split, deferral) names the cut it spans first (inputs, outputs, exactness, every reader of what it
+  writes) and is judged on the summed served time of every lane in that cut, never on the lane it shrinks; the launch count is not
+  the objective (HRX-like E314: a deferred GDN fold cut its lane 3.61 -> 2.86 ms/step and moved the work into the matvecs, +0.6-0.8
+  ms/step, bench tie; E329: an epilogue fusion paid 2.75 s).
+- **Price the lever before building it** (E15/E24): the price goes in the step's `# bound:` line (strix-ledger: the part now, its
+  limit and the best engine, the lever's best case as a share of the request, the measurement that resolves it); a best case below
+  every measurement's floor is not built. A best case below the deciding bench's floor names the finer measurement that decides
+  (the served lane ABBA, section 5), never 'the bench will tell' (HRX-like E536: q205's flash2 lever was 0.3-1.8 % of prefill against a
+  7 % bench floor). Loom requires the same record (agent-driven-kernel-development.md, 'Admit only optimization that can close the gap').
 - **Call a cause a hypothesis until a count or an ablation shows it** (E76-E77: two causes stated as likely, both
   refuted by the next measurement). Report what was measured, what is suspected, and the test that will tell. A source
   read is a hypothesis too: follow the value from its producer to the binding the kernel reads before naming its memory,
@@ -103,7 +114,12 @@ for a fraction of the next one's cost.
   (tools.md lists them by step). In one session a remote safetensors reader, a hand bank-conflict analysis and a KL-divergence
   path were each about to be written while huggingface_hub, Loom's compile report and llama-perplexity already did them.
 - **Plateau rule**: after three levers in a row land inside noise, stop and write a ranked status of the remaining levers, each with
-  its price and the evidence behind it, before starting a fourth (E212, from sybil-solutions/inference-optimisation-skill).
+  its price and the evidence behind it, before starting a fourth (E212, from sybil-solutions/inference-optimisation-skill). The same
+  holds on a part below about two thirds of its limit: after three exact trims of under 2 % of the part each, the next step for that
+  part is a design note for its execution shape (tile ownership, staging, reuse, split or fusion), priced against the limit and the
+  best engine, before a fourth trim is queued; kept trims stay kept (exact and not slower). HRX-like: flash2 stayed at 49 % of its
+  limit (60.1 s vs 29.7 s) through E468, E496, E511 and E516, each real, none moving the 30 s gap; Loom calls repeated 1-2 % wins
+  against a large gap non-evidence for the execution shape.
 - **Never park an experiment without its root cause**. "Slower, unexplained" or "held back by X" is not a
   verdict: dig until the mechanism is shown (a counter, an ablation, the disassembly line that waits), then decide. An
   experiment may wait for GPU time, but its log entry names the open question and the next probe, and it is
@@ -232,7 +248,9 @@ more bytes than Strata's' after checking only Strata's file; our generator's doc
 - Loom's prefix cache on a hybrid (GDN) model: a row cannot roll back, so reuse below the tip needs a checkpoint;
   automatic `prefix_cache_capacity` is 2 and a full table refuses deeper captures, so agent sessions fell back to their
   first prefill's 32,768 (E105). Packages set it explicitly (8: +1.9 GB, E106).
-- Budget for SDK bugs on paths published ports never took; timebox and park with a reproducer (the published 27B port used the proposal-head copy with MTP only; DFlash plus our kernels hit a parser bug).
+- Budget for SDK bugs on paths published ports never took; timebox and park with a compiler packet (Loom agent-driven-kernel-development.md, 'Reduce compiler blockers to standalone packets':
+  minimized .loom, exact command, expected vs observed, provenance, report or ISA), checked against upstream main and existing issues,
+  and a draft only until the owner approves posting (the published 27B port used the proposal-head copy with MTP only; DFlash plus our kernels hit a parser bug).
 - **Always read the SDK and its docs first**. Before designing around a compiler or runtime limit, and
   always before filing an upstream issue or feature request, search the installed tag's docs (loom/docs/src: guide,
   workflows), op definitions (loom/py/loom/dialect) and source for the capability: `git grep` in an hrx-system checkout at the

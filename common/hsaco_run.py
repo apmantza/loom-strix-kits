@@ -185,6 +185,12 @@ def name_args(meta, names):
     return meta
 
 
+def arg_layout(meta):
+    """(name, offset, size, kind) per argument, for comparing two code objects' layouts. Hidden arguments carry no name in
+    code objects named by --arg-names (name_args names the non-hidden ones only), so their name reads as None."""
+    return [(x.get(".name"), x[".offset"], x[".size"], x[".value_kind"]) for x in meta[".args"]]
+
+
 def bind_names(meta, dev):
     """metadata arg name -> every name it may be given by (metadata name, source name, source name without _arg)."""
     args = [a for a in meta[".args"] if not a[".value_kind"].startswith("hidden_")]
@@ -533,7 +539,7 @@ def main():
     arm_kern, arm_bufs = arm_options(a.arm_kernel, a.arm_buf, labels, bufspec)
     kname = {lab: arm_kern.get(lab, a.kernel) for lab in labels}
     metas = [name_args(kernel_meta(p, kname[lab]), a.arg_names.split(",") if a.arg_names else None) for lab, p in objs]
-    lay = [[(x[".name"], x[".offset"], x[".size"], x[".value_kind"]) for x in m[".args"]] for m in metas]
+    lay = [arg_layout(m) for m in metas]
     if any(l != lay[0] for l in lay):
         sys.exit("the code objects' argument layouts differ: not an A/B of one kernel")
     dev, grid, block = None, None, None

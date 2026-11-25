@@ -34,6 +34,12 @@ duplicate, but the project's own check should refuse it).
 # changed: E175 grouped order now measured on the served shape   answers a row instead of citing it (any number of lines)
 # predict: decode ratio 0.97-0.99      metric words, then lo-hi (also lo..hi, lo to hi); lo <= hi
 # kill: paired ratio CI includes 1.0   what result ends the lever
+# bound: flash2 60.1 s (limit 29.7 s; best engine none measured), best case 1.2 % of the request (amdahl.py), resolved by served lane ABBA (floor 0.5 %)
+                                      a tuning step's admission record (rules section 2, 'Price the lever'); diagnosis / tool steps: # bound: n/a (diagnosis)
+# compiler: g_attention_flash2.* loop_instructions 952 -> 903   the static delta the hypothesis predicts in the built package, one line
+                                      per delta (loop instructions, VALU per tile, VGPR, waves, s_barrier, load cover, scratch); the chain
+                                      checks it with kernel_lint / loop_census before any GPU minute: an absent delta goes back to source
+                                      (E110, E230, E318), never to a timing
 # budget: 45 min                       the step's time budget
 # result: all ([0-9.]+) \[             optional: regex, one capture group; the last match in the result file is the figure
 # result-file: out/summary.txt         optional: where verdict reads it, relative to the step's directory

@@ -19,8 +19,6 @@
   that launches it, not by its name.
 
 ## Kernels and the SDK
-- **Read the SDK and our own kit before a workaround or an upstream request** (E145): the fence existed in 0.2.0 docs
-  and in our own generator while we shipped a NaN-fragile pin and filed an upstream feature request for it.
 - **Loom places a pending load's consumer at its earliest legal point**; source order is not kept (E110). Keep a consumer
   late with `scf.schedule.fence`; check with common/load_events.py / load_cover.py that the wait moved.
 - **A data-dependency pin must hold for every value, NaN included**: dead padding columns read stale workspace (E123).

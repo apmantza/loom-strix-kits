@@ -13,6 +13,9 @@ and only an orientation swap for traversal (GEMM_N_FASTEST, gen_gemm.py:1344-134
 
 ## Table
 
+Compile-report views (wait reasons, `suggest`, spill and allocation rows, the LDS bank model, schedule bands) and Loom's oracle
+workflows are in tools.md by step; this table keeps what our kernels' source could use.
+
 | Feature | Syntax (one line) | Doc / source file:line | Our kernel + bottleneck | Expected effect | In 0.2.0? |
 |---|---|---|---|---|---|
 | Source scheduling fence | `scf.schedule.fence` (statement; no operands; emits nothing, waits for nothing) | D/guide/functions-and-control.md:289-291 (source form), :269-287 (Low form semantics); :649-681 (composes with unroll; pipeline depth>1 rejects fences, :678-681) | flash2 (1): replaces the bit-pattern select that keeps V's consumer late: load K/V, fence, QK/softmax, fence, V conversion/staging. vsplit (3): stage page-id/K/V reads at separate lead distances | doc claim: "keeps future reads ahead of older arithmetic without emitting a hardware wait" (D/workflows/tune-loop-schedules.md:652-654). Main doc adds the exact defer-consumer recipe (commit ae677f36db, #3500) | yes |
@@ -36,15 +39,11 @@ and only an orientation swap for traversal (GEMM_N_FASTEST, gen_gemm.py:1344-134
 | Split barrier | `kernel.barrier.arrive<workgroup>` ... `kernel.barrier.wait %phase` | D/guide/buffers-views-memory.md:306-331; GFX11 selects complete-barrier fallback D/workflows/tune-loop-schedules.md:190-195 | flash2/GEMM barriers | no effect on gfx11 | gfx12 native only |
 | Device-produced dispatch counts | launch-config region loads workload storage -> `workgroups(...)`; command lowering folds or emits indirect dispatch | D/guide/kernels-and-launch.md:79-90 | vsplit/verify (3), live-row counts: skip empty workgroups | doc claim | yes |
 | Command-program subgraph specialization | command roots: launches rewritten, specialized, inlined, CSE'd; one request per live kernel class | D/guide/command-programs.md:316-345 | small producers (4): already what serving does; no fusion op found | nothing new found for fusion/persistent kernels/graph replay | yes |
-| Wait attribution in reports | `jq '.wait_reason_summary_rows.rows[]'`, details: `.wait_action_rows.rows[]` (producer/consumer semantic tag, outstanding before/after) | D/workflows/compile-report-queries.md:428-485 | all; replaces part of common/load_cover.py | doc claim | yes (reasons improved on main, #3421) |
-| `suggest` finding for copy waits | `loom-compile-report suggest r.json` -> `amdgpu.pipeline_copy_waits`, `scf.compare_pipeline_depth` | D/workflows/compile-reports.md:463-515 (copy waits :509-515) | GEMM back-edge (2), flash2 (1) | doc claim: flags full global-load waits whose consumer is a branch-payload copy, the #3409 shape | yes |
-| Register/spill cliff queries | `allocation_high_water_rows`, `spill_rows` | D/workflows/compile-report-queries.md:13-32, :110-217 | flash2 241 VGPRs (1) | doc claim | yes |
-| LDS bank-conflict model for gfx1151 | `loom-compile-report show` "Bank service" view (details report) | D/workflows/compile-reports.md:241-300 (gfx1151 ds b32/b64/b128 and u16_d16 calibrated, :256-262) | GEMM (2) ds_load pairs, flash2 V^T staging (1) | doc claim: silicon-calibrated model, exact/unknown/unmodeled coverage | yes |
-| Schedule bands | `.schedule_band_summary_rows.rows[]` (matrix/memory bands) | D/workflows/compile-report-queries.md:366-426 | GEMM (2): how WMMAs and ds_loads interleave | doc claim, structural not cycles | yes |
-| Hardware counters / traces in benchmark | `loom-benchmark ... --profile-data=counters,counter-ranges,executable-traces --profile-counter=SQ_WAVES --profile-artifacts-dir=DIR` | S/tools/loom-benchmark/options.c:113-126; D/workflows/benchmark-results.md:334-360 | all (1)-(4) | unknown whether gfx1151 produces executable traces (amdgpu HAL driver source not in this checkout); ATT/SQTT decoder exists in runtime/src/iree/tooling/profile/att/att.h but no `iree-profile` binary in .venv/bin | yes (flags) |
-| Native-schedule oracle workflow | raise a hand native schedule into Loom Low and diff | D/workflows/oracles/native-schedule.md:83-142 | GEMM (2) vs llama.cpp/Strata ISA | method only | yes |
 
 ## Upstream main only (since 0.2.0, 2026-11-16; dev identity now 0.3.0, #3469)
+
+Stale since 11-20: refresh at the 0.3.0 port (main adds a novel-kernel baseline built from measured primitives, command-program
+compile reports, `suggest --expand`, and 11-24 agent-workflow additions on workgroup traversal and shared-operand reuse distance).
 
 | PR | Date | What | Relevance |
 |---|---|---|---|
@@ -70,4 +69,5 @@ Nothing found on main (commit titles 11-16..11-20) adding a VGPR cap, occupancy 
 
 Dead ends on gfx1151 in 0.2.0 (do not spend time): VGPR cap/occupancy knobs (none), cache policy hints (dropped), async
 global->LDS copy (rejected), `view.prefetch` (gfx12 `s_prefetch_data`), split barriers (full-barrier fallback), scheduler
-strategy (fixed).
+strategy (fixed), GPU hardware counters and executable traces from Loom's runtime (the AMD GPU driver supports only queue /
+dispatch events and executable metadata at 0.2.0, 0.3.0 and main; nothing produces traces: HRX-like E530).
