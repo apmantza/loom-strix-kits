@@ -1137,12 +1137,13 @@ def loom_candidates(name, ins, addr, rep):
                                     + (f" ({red})" if red else "") + f"; whole workgroups ({occ['wg']} lanes = {w} waves, "
                                     f"{st['q']} per SIMD{', bound: placement undocumented' if st['bound'] else ''}): {ours}; "
                                     f"contradicts {LOOM_TIER_DOC}"})
-    groups = []
-    for t, e in loops(ins, addr):                  # each backward branch has its own edge group (one per branch, never shared)
-        body = ins[t:e + 1]
+    groups, seen = [], set()
+    for t, e in loops(ins, addr):                  # one copy group can end within 8 of two backward branches (pkg-e480 g_post_add_norm:
+        body = ins[t:e + 1]                        # loops ending at 756 and 758): counted once, by its first instruction
         bb = backedge_block(body)
-        if not bb:
+        if not bb or t + bb[0] in seen:
             continue
+        seen.add(t + bb[0])
         pairs = vopd_pairs(body, *bb)[0]
         if pairs >= EDGE_PAIRS_MIN:
             groups.append((sum(copy_moves(x) for x in body[bb[0]:bb[1] + 1]), pairs, t + bb[0]))

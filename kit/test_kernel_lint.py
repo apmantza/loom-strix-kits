@@ -602,6 +602,11 @@ def loom_cands():
     edge = lambda body, tail=(): one(kl.loom_candidates("x", *listing(loop_of(body, tail)), None)[0], "vopd-edge")
     c = edge([mv(k) for k in range(16)])
     ok(c and c["groups"] == [(16, 8)], f"vopd-edge: 16 independent copies at the back-edge, 8 pairs = EDGE_PAIRS_MIN: candidate ({c})")
+    two = loop_of([mv(k) for k in range(16)], ["s_nop 0"])
+    two.append(f"s_branch {(1 - (len(two) + 1)) & 0xFFFF}")          # a second backward branch 2 after the first (pkg-e480 g_post_add_norm)
+    c = one(kl.loom_candidates("x", *listing(two), None)[0], "vopd-edge")
+    ok(c and c["groups"] == [(16, 8)], f"vopd-edge: one copy group within 8 of two backward branches is one group, not two (fire "
+       f"11-25: g_post_add_norm's loops end at 756 and 758 after one 61-move group) ({c})")
     c = edge([mv(k) for k in range(14)])
     ok(c is None, f"vopd-edge: 14 copies, 7 pairs, under EDGE_PAIRS_MIN: none (N5a) ({c})")
     c = edge([mv(k) for k in range(16)], ["s_nop 0"] * 9)
