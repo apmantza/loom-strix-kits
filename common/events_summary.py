@@ -94,6 +94,13 @@ def classify(ev, d):
     return pre, lane_of
 
 
+def verify_steps(ev, pre, lane_of, lanes):
+    """verify steps: the distinct decode submissions that ran the verify-attention lane (floor decode_kv); a kit without such a
+    lane has none to count (summarize, lint_counters)"""
+    vlane = next(ln["lane"] for ln in lanes if ln.get("floor") == "decode_kv")
+    return len({e["submission_id"] for e in ev if e["submission_id"] not in pre and lane_of(e) == vlane})
+
+
 def summarize(ev, prompt, d):
     m, hw, lanes = d["model"], d["hardware"], d["lanes"]
     pre, lane_of = classify(ev, d)
@@ -102,8 +109,7 @@ def summarize(ev, prompt, d):
         p = per[lane_of(e)]
         p[0] += 1
         p[1] += e["duration_ns"] / 1e9
-    vlane = next(ln["lane"] for ln in lanes if ln["floor"] == "decode_kv")
-    steps = len({e["submission_id"] for e in ev if e["submission_id"] not in pre and lane_of(e) == vlane})
+    steps = verify_steps(ev, pre, lane_of, lanes)
     rows = []
     for ln in lanes:
         n, s = per[ln["lane"]]
