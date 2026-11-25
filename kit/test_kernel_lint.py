@@ -114,6 +114,10 @@ def occupancy_seam():
        f"occupancy: g_dfl_ctx_split's -3 VGPRs (123 -> 120) lands on 12 waves, not 11 (review F2) ({o})")
     o = kl.tier_state(occ(160, 114, 12, 10240, 15, 15, 12), 4)                   # g_head_mv_t8_q8
     ok(o.get("tier") == 12 and o.get("next") == 15, f"occupancy: g_head_mv_t8_q8 12 -> 15 after -18 VGPRs (review F2: was 12.5) ({o})")
+    o = kl.tier_state(occ(32, 240, 6, 9216, 4, 16, 4), 4)                       # v_attn_72x16_s3456_0_1152_2304 (1 wave)
+    ok(o.get("tier") == 4 and o.get("next") == 5 and o.get("needs") == [("lds", 9216, "bytes", 7168, 2048)],
+       f"occupancy: a 1-wave workgroup's next tier needs 17 workgroups (LDS <= 7,168 B), not 15 or 16 that stay at tier 4 "
+       f"(verify r2 V-F1: next 4 at -1,024 B) ({o})")
     o = kl.tier_state(occ(384, 252, 5, 61952, 6, 15, 5), 4)                      # flash2_partial
     ok(o.get("tier") == 3 and o.get("report_tier") == 5 and o.get("next") == 6, f"occupancy: flash2_partial is 3, Loom says 5 ({o})")
     o = kl.tier_state(occ(544, 30, 16, 544, 16, 13, 13), 4)                      # g_mv_iq4_nl_k17408_q8_r8: 3 workgroups, the wave cap
@@ -132,6 +136,19 @@ def occupancy_seam():
     ok("unverified" in o.get("why", "") and "says 7" in o["why"], f"occupancy: every row agrees but the report's current tier does not: "
        f"unverified ({o})")
     ok("unverified" in kl.tier_state(occ(384, 240, 6, 61952, 6, 15, 6), None).get("why", ""), "occupancy: no SIMD count: unverified")
+    # device_simds() reads common/devices/<target_key>.json (verify r2 V7: a constant 4 passed every gfx1151 test)
+    ok(kl.device_simds("no_such_target") is None and kl.device_simds(None) is None, "device_simds: no device file: None (unverified)")
+    import importlib.util, json, shutil, tempfile
+    with tempfile.TemporaryDirectory() as t:
+        shutil.copy(kl.__file__, t)
+        os.makedirs(os.path.join(t, "devices"))
+        json.dump({"simds_per_occupancy_domain": 2}, open(os.path.join(t, "devices", "fake2.json"), "w"))
+        sp = importlib.util.spec_from_file_location("kl_fake2", os.path.join(t, "kernel_lint.py"))
+        k2 = importlib.util.module_from_spec(sp)
+        sp.loader.exec_module(k2)
+        o = k2.tier_state(dict(occ(64, 48, 16, 16384, 8, 16, 8), target="fake2"), k2.device_simds("fake2"))
+        ok(k2.device_simds("fake2") == 2 and o.get("tier") == 8,
+           f"device_simds: a device file with 2 SIMDs gives 2, and a 64-lane workgroup's tier 8 verifies with it ({o})")
     o = kl.tier_state(occ(384, 240, 6, 61952, 6, 15, 6, extra=[{"name": "amdgpu.sgpr", "kind": "pooled_resource", "allocation_scope":
                                                                  "subgroup", "pool_units": 800, "allocation_granularity": 16,
                                                                  "units": 106, "independent_tier": 7}]), 4)
