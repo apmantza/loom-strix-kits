@@ -37,12 +37,10 @@ FMT = {
     # directly, rounded to F16 for the MMA
     "f32": dict(block_bytes=128, block_values=32),
 }
-HELPER = {"q4_0", "q5_0", "iq4_nl", "iq4_xs", "q3_k", "iq3_s", "f16", "mxfp4", "mxfp4s"}
-# IQ4_GEMM_DIRECT (default on; 0 = the shared-helper path): IQ4_NL / IQ4_XS dequantize 16 values directly with explicit
-# loads (dequant16 below), so they take the prefetching 128-row (gemm_big) and 256-row (gemm_big256) kernels instead of
-# the 64-row tile kernel the helper formats run under the 128-row name.
-if os.environ.get("IQ4_GEMM_DIRECT", "1") not in ("", "0", "false", "no", "off"):
-    HELPER = HELPER - {"iq4_nl", "iq4_xs"}
+# IQ4_NL / IQ4_XS are not helper formats (HRX-like E10 / E11; the switch census 11-25 folded IQ4_GEMM_DIRECT, default on): they
+# dequantize 16 values directly with explicit loads (dequant16 below), so they take the prefetching 128-row (gemm_big) and 256-row
+# (gemm_big256) kernels instead of the 64-row tile kernel the helper formats run under the 128-row name.
+HELPER = {"q4_0", "q5_0", "q3_k", "iq3_s", "f16", "mxfp4", "mxfp4s"}
 # PREFILL_F16_SCRATCH: prefill GEMMs read an f16 copy of the weight that g_deq16_<fmt> writes into a scratch buffer
 # just before the GEMM, so F16 weights take the prefetching 128/256-row kernels (a plain 16-value load, no dequant).
 PF16 = os.environ.get("PREFILL_F16_SCRATCH", "0") not in ("", "0", "false", "no", "off")

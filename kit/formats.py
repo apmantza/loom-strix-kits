@@ -23,10 +23,11 @@ SB = {"q4_k": 256, "q5_k": 256, "q6_k": 256, "q8_0": 32, "f32": 32,
 LOWBIT = {"q4_0", "iq4_nl", "iq4_xs", "q3_k", "iq3_s"}
 # Formats whose decode matvecs and head take int8 activations (ACT_Q8): gen_llm.py has their @g_<fmt>_icodes.
 import os as _os
-# IQ4_NL / IQ4_XS (env IQ4_Q8, default on; 0 = the f32 path): signed kvalues_iq4nl codes, one scale per 32 values, no minimum.
+# IQ4_NL / IQ4_XS: signed kvalues_iq4nl codes, one scale per 32 values, no minimum; Q3_K / IQ3_S: signed codes (HRX-like E4,
+# D2; the switch census 11-25 folded IQ4_Q8 / IQ3_Q8, default on since 11-17: their f32 paths are gone for these formats).
 # MXFP4 split planes (choice decode.mxfp4s.act_q8, env MXFP4S_Q8): opt-in per model, gen_mxfp4s.mxfp4s_icodes.
-ICODES = frozenset({"q8_0", "q4_k", "q5_k", "q6_k", "q5_0", "nvfp4"} | ({"mxfp4s"} if _os.environ.get("MXFP4S_Q8", "0").lower() not in ("", "0", "false", "no", "off") else set()) | ({"iq4_nl", "iq4_xs"} if _os.environ.get("IQ4_Q8", "1").lower() not in ("", "0", "false", "no", "off") else set())
-                   | ({"q3_k", "iq3_s"} if _os.environ.get("IQ3_Q8", "1").lower() not in ("", "0", "false", "no", "off") else set()))
+ICODES = frozenset({"q8_0", "q4_k", "q5_k", "q6_k", "q5_0", "nvfp4", "iq4_nl", "iq4_xs", "q3_k", "iq3_s"}
+                   | ({"mxfp4s"} if _os.environ.get("MXFP4S_Q8", "0").lower() not in ("", "0", "false", "no", "off") else set()))
 # Formats stored as two tensors (weight plane + scale plane): a call site passes two views, the second named <weight>_sc.
 SPLIT = frozenset({"mxfp4s"})
 SCALE_DIV = {"mxfp4s": 16}   # nibble-plane bytes per scale-plane byte
