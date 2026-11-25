@@ -26,6 +26,11 @@
 - **A data-dependency pin must hold for every value, NaN included**: dead padding columns read stale workspace (E123).
 - **A loop-carried converted value drags its loads' wait into the issuing iteration** (E109): carry raw codes.
 - **Spills and global loads share vmcnt**: any spill drains the prefetch (gfx11).
+- **A wait inside a branch retires every load issued before it**: a carried value (a prefetched scale) first used inside an
+  `scf.if` gets a full `s_waitcnt vmcnt(0)` there, so loads issued ahead of the branch for later use are waited too. Two flash
+  changes each kept the V prefetch (cover 174-190 instructions) and together lost it (23-25), because one put the use in a branch
+  and the other moved the loads before it (HRX-like E520 / E521). Convert the carried value before the early loads issue,
+  and lint every combined build, not only each change alone (kernel_lint's pf column said 'drain').
 - **f16 accumulation is not free speed on gfx1151**: strix-llama.cpp measured it 6.9 % slower than f32 (their #193); weigh that before
   an inexact f16 accumulator (HRX-like E394).
 - **I2: a token's result must not depend on its span** (alone == in span, atol 0). Partitions (split-K boundaries) must
