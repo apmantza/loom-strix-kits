@@ -60,6 +60,7 @@
     each with near misses (two rounds, a runtime grid, an unmodelled op; loads kept in flight or issued early; loads issued after
     the join, read inside the block or issued inside it, an exit test; one-parity destinations, dependent moves, modifiers).
 usage: python3 kit/test_kernel_lint.py   (needs loom-compile: VENV from the environment or the machine env file)"""
+import json
 import os
 import subprocess
 import sys
@@ -532,6 +533,114 @@ def lesson_notes():
        "E340; re-add only if E534's SQ_WAIT_INST_LDS contradicts E341)")
 
 
+def loom_cands():
+    """C19: kernel_lint surfaces Loom upstream CANDIDATES, never verdicts (HANDOFF failure list T1-T5, N1-N7). Recurrences: E533 (a
+    report's next tier a whole workgroup cannot seat, found by hand after E527 / E531 built on it), E592 (allocation-emitted back-edge
+    copies the VOPD planner never sees, found by a source read), E177 / E227 (a lint shape that moved with only the compiler changed,
+    attributed by hand)."""
+    F = lambda n: os.path.join(HERE, "fixtures", n)
+    rep = lambda n: json.load(open(F(n)))
+    def fx(name):
+        lst = [x.split("\t", 1) for x in open(F(name)).read().split("\n") if x]
+        return [i for _, i in lst], [int(a, 16) for a, _ in lst]
+    kinds = lambda cs: [c["kind"] for c in cs]
+    def one(cs, kind):
+        x = [c for c in cs if c["kind"] == kind]
+        return x[0] if len(x) == 1 else None
+    # ---- T1 / T1b / T1c: the report's next tier vs whole-workgroup arithmetic (E533)
+    cs, skip = kl.loom_candidates("g_attention_flash2_f16o", [], [], rep("flash2_f16o_residency.json"))
+    c = one(cs, "tier")
+    ok(c and (c["report"], c["whole"]) == ((6, 7), (6, 9)) and "compile-report-queries.md:122" in c["line"]
+       and "occupancy.c:377" in c["line"] and "VGPR <= 168" in c["line"] and "LDS <= 43008" in c["line"] and not skip,
+       f"tier: pkg-cmb2 flash2_f16o, report 6 -> 7, whole workgroups 6 -> 9 at VGPR <= 168 and LDS <= 43008 (T1) ({c and c['line']}, {skip})")
+    c = one(kl.loom_candidates("g_gemm_f16_store_m256", [], [], rep("gemm_f16_store_m256_e480_residency.json"))[0], "tier")
+    ok(c and (c["report"], c["whole"]) == ((4, 5), (4, 6)) and "bound" not in c["line"],
+       f"tier: live m256 GEMM report 4 -> 5, whole workgroups 4 -> 6 (T1b) ({c and c['line']})")
+    c = one(kl.loom_candidates("g_mv_q4_k_k17408_t16_q8_r32", [], [], rep("mv_q4_k_k17408_t16_r32_e480_residency.json"))[0], "tier")
+    ok(c and (c["report"], c["whole"]) == ((7, 8), (5, 9)) and "bound" in c["line"],
+       f"tier: a 544-lane matvec (17 waves) report 7 -> 8, whole workgroups 5 -> 9, marked bound (T1c) ({c and c['line']})")
+    cs, skip = kl.loom_candidates("g_gemm_f16_swiglu_m256", [], [], rep("gemm_f16_swiglu_m256_e480_residency.json"))
+    ok(cs == [] and skip == [], f"tier: the swiglu m256 GEMM's report 4 -> 6 agrees: no candidate (N1) ({kinds(cs)}, {skip})")
+    best = rep("gemm_f16_swiglu_m256_e480_residency.json")
+    rows = best["residency_constraints"]["rows"]
+    for x in rows:
+        if x["name"] == "amdgpu.lds":
+            x.update(units=0, rounded_units=0, independent_tier=16)
+        if x["name"] == "amdgpu.vgpr":
+            x.update(units=96, rounded_units=96, independent_tier=16)
+        if x["name"] == "amdgpu.workgroup_slots":
+            x.update(independent_tier=16)
+    best["target_resources"]["residency"].update(current_tier=16, next_better_tier=16)
+    cs, skip = kl.loom_candidates("best", [], [], best)
+    ok(cs == [] and skip == [], f"tier: at the wave cap, report next = current: no candidate (N2) ({kinds(cs)}, {skip})")
+    unm = rep("flash2_f16o_residency.json")
+    unm["residency_constraints"]["rows"].append({"name": "amdgpu.barrier_slots", "kind": "fixed_limit", "allocation_scope": None,
+                                                 "independent_tier": 16})
+    cs, skip = kl.loom_candidates("unm", [], [], unm)
+    ok(cs == [] and len(skip) == 1 and "tier unverified" in skip[0],
+       f"tier: an unmodelled residency row: no candidate, counted not compared (N3) ({kinds(cs)}, {skip})")
+    cs, skip = kl.loom_candidates("norep", [], [], None)
+    ok(cs == [] and skip == ["no compile report"], f"no report: nothing, said (N4) ({cs}, {skip})")
+    # ---- T4 / N5: VOPD for allocation-emitted back-edge copies (E592)
+    f2 = fx("flash2_f16o_e480_loop.listing")
+    cs, _ = kl.loom_candidates("g_attention_flash2_f16o", *f2, rep("flash2_f16o_residency.json"))
+    c = one(cs, "vopd-edge")
+    ok(c and c["groups"] == [(65, 31)] and "packet_plan.c:72-77" in c["line"] and "encoding.c:1016" in c["line"]
+       and "not itemised" in c["line"] and kinds(cs) == ["tier", "vopd-edge"],
+       f"vopd-edge: live flash2_f16o back-edge group 65 moves -> 31 pairs (T4) ({c and c['line']}, {kinds(cs)})")
+    withc = rep("flash2_f16o_residency.json")
+    withc["move_causes"] = {"kind_count": 1, "packet_count": 20, "unit_count": 407,
+                            "causes": [{"cause": "branch_edge", "packet_count": 20, "unit_count": 407}]}
+    c = one(kl.loom_candidates("g_attention_flash2_f16o", *f2, withc)[0], "vopd-edge")
+    ok(c and "branch_edge 407 moves in 20 packets" in c["line"], f"vopd-edge: a details report's branch_edge cause is cited ({c and c['line']})")
+    def listing(body):
+        return body, [4 * i for i in range(len(body))]
+    def loop_of(body, tail=()):
+        b = ["s_mov_b32 s0, 0", "v_wmma_f32_16x16x16_f16 v[200:207], v[192:199], v[184:191], v[200:207]"] + body + list(tail)
+        return b + [f"s_branch {(1 - (len(b) + 1)) & 0xFFFF}"]
+    mv = lambda k: f"v_mov_b32_e32 v{100 + k}, v{1 + k}"
+    edge = lambda body, tail=(): one(kl.loom_candidates("x", *listing(loop_of(body, tail)), None)[0], "vopd-edge")
+    c = edge([mv(k) for k in range(16)])
+    ok(c and c["groups"] == [(16, 8)], f"vopd-edge: 16 independent copies at the back-edge, 8 pairs = EDGE_PAIRS_MIN: candidate ({c})")
+    c = edge([mv(k) for k in range(14)])
+    ok(c is None, f"vopd-edge: 14 copies, 7 pairs, under EDGE_PAIRS_MIN: none (N5a) ({c})")
+    c = edge([mv(k) for k in range(16)], ["s_nop 0"] * 9)
+    ok(c is None, f"vopd-edge: a copy run ending 10 instructions before the branch is not the edge group (N5b) ({c})")
+    chain = [mv(0)] + [f"v_mov_b32_e32 v{100 + k}, v{99 + k}" for k in range(1, 20)]
+    c = edge(chain)
+    ok(c is None, f"vopd-edge: a sequentialized copy chain (each move reads the previous one's destination): no pair (N5c) ({c})")
+    war = sum(([f"v_mov_b32_e32 v{100 + 2 * k}, v{1 + 2 * k}", f"v_mov_b32_e32 v{1 + 2 * k}, v{51 + 2 * k}"] for k in range(10)), [])
+    c = edge(war)
+    ok(c is None, f"vopd-edge: the second move overwrites the first's source (the first reads the other's destination): no pair, "
+       f"order constraint (N5c) ({c})")
+    dual = [f"v_dual_mov_b32 v{100 + 2 * k}, v{1 + 2 * k} :: v_dual_mov_b32 v{101 + 2 * k}, v{2 + 2 * k}" for k in range(10)]
+    c = edge(dual)
+    ok(c is None, f"vopd-edge: copies already paired: none (N5d) ({c})")
+    c = one(kl.loom_candidates("flat", *listing(["s_mov_b32 s0, 0"] + [mv(k) for k in range(20)] + ["s_endpgm"]), None)[0], "vopd-edge")
+    ok(c is None, f"vopd-edge: no loop, no back-edge group (N5e) ({c})")
+    # ---- T5 / N6: the SDK differential (E177 / E227 by hand): the m256 GEMM's loop by 0.2.0 (live) and by 0.3.0
+    g2 = kl.lint_listing("g_gemm_f16_store_m256", *fx("gemm_f16_store_m256_e480_loop.listing"))
+    g3 = kl.lint_listing("g_gemm_f16_store_m256", *fx("gemm_f16_store_m256_v030_loop.listing"))
+    prov = lambda v, path, sha="a" * 64: {"compiler": path, "version": f"hrx-loom {v}", "programs": {"llm.loom": sha},
+                                          "roots": None, "target": "amdgpu:gfx1151"}
+    pa, pb = prov("0.2.0", "/v020/bin/loom-compile"), prov("0.3.0", "/v030/bin/loom-compile")
+    lines = kl.sdk_diff({"g_gemm_f16_store_m256": g3}, {"g_gemm_f16_store_m256": g2}, pb, pa)
+    hit = [x for x in lines if x.startswith("loomcand sdk g_gemm_f16_store_m256:")]
+    ok(len(hit) == 1 and "+addr64" in hit[0] and "hrx-loom 0.2.0 -> hrx-loom 0.3.0" in hit[0] and "loop209->249" in hit[0],
+       f"sdk: addr64 appears in the m256 GEMM with only the compiler changed (T5) ({lines})")
+    same = kl.sdk_diff({"k": g2}, {"k": dict(g2)}, pb, pa)
+    ok(not [x for x in same if x.startswith("loomcand sdk k:")], f"sdk: equal shapes: no candidate (N6) ({same})")
+    for what, a_, b_ in (("programs differ", prov("0.3.0", "/v030/bin/loom-compile", "b" * 64), pa),
+                         ("provenance missing", pb, None), ("one compiler", pa, dict(pa))):
+        got = kl.sdk_diff({"g_gemm_f16_store_m256": g3}, {"g_gemm_f16_store_m256": g2}, a_, b_)
+        ok(len(got) == 1 and got[0].startswith("loomcand sdk: not attributable"), f"sdk: {what}: not attributable, no per-kernel line (N6) ({got})")
+    got = kl.sdk_diff({"a": g3, "new": g3}, {"a": g3, "old": g2}, pb, pa)
+    ok(sorted(x.split(":")[0] for x in got if x.startswith("loomcand sdk ")) == ["loomcand sdk new", "loomcand sdk old"],
+       f"sdk: a kernel compiled by one side only is a line ({got})")
+    # ---- N7: candidates never reach flags or notes (cand_lint calls lint_listing / lint)
+    ok("loomcand" not in g2 and "loomcand" not in g3, "isolation: lint_listing rows carry no candidates (N7)")
+
+
 def main():
     lc = loom_compile()
     qv = open(os.path.join(HERE, "quant_values.loom")).read()
@@ -590,6 +699,29 @@ def main():
                 ok(p.returncode == 0 and row and "loom:unknown" in row[0] and "loom g_deq16_iq4_nl: unknown (" in p.stdout
                    and "kernel_lint: 1 kernels" in p.stdout and ": every run failed (unknown (" in p.stdout,
                    f"--suggest with a {name} tool: 'unknown', table complete (rc {p.returncode}, {row}, {p.stderr[-300:]})")
+        # C19 N7: --loom-candidates adds lines only: every table row and the --strict exit code are the same without it
+        base_run = subprocess.run([sys.executable, klp, sg, "--strict"], capture_output=True, text=True, timeout=300)
+        cand_run = subprocess.run([sys.executable, klp, sg, "--strict", "--loom-candidates"], capture_output=True, text=True, timeout=300)
+        tab = lambda o: [x for x in o.splitlines() if x.startswith(("kernel ", "g_deq16_iq4_nl ", "kernel_lint:"))]
+        ok(base_run.returncode == cand_run.returncode and tab(base_run.stdout) == tab(cand_run.stdout) and tab(base_run.stdout)
+           and "loomcand tier g_deq16_iq4_nl: report tier 4 -> 5" in cand_run.stdout and "loomcand" not in base_run.stdout,
+           f"isolation: --loom-candidates changes no row and no exit code, and prints the tier line (N7) (rc {base_run.returncode} / "
+           f"{cand_run.returncode}; {' | '.join(x for x in cand_run.stdout.splitlines() if 'loomcand' in x)[:300]} {cand_run.stderr[-300:]})")
+        # C19 provenance: a compile records the compiler, its version and each program's sha256; two compiles by one compiler are
+        # not attributable to Loom (N6 through main)
+        import hashlib
+        pv1, pv2 = os.path.join(t, "pv1"), os.path.join(t, "pv2")
+        prog_iq4 = os.path.join(t, "iq4_new.loom")
+        for d_ in (pv1, pv2):
+            subprocess.run([sys.executable, klp, "--program", prog_iq4, "--out", d_, "--loom-compile", lc], capture_output=True, text=True,
+                           timeout=600)
+        pr = json.load(open(os.path.join(pv1, "loom-provenance"))) if os.path.exists(os.path.join(pv1, "loom-provenance")) else {}
+        ok(pr.get("programs") == {"iq4_new.loom": hashlib.sha256(open(prog_iq4, "rb").read()).hexdigest()} and
+           pr.get("compiler") == os.path.realpath(lc) and pr.get("version", "").startswith("hrx-loom "),
+           f"provenance: compiler, version and program sha256 recorded beside the objects ({pr})")
+        dr = subprocess.run([sys.executable, klp, pv2, "--baseline", pv1, "--loom-candidates"], capture_output=True, text=True, timeout=300)
+        ok(dr.returncode == 0 and "loomcand sdk: not attributable (one compiler" in dr.stdout and "loomcand sdk g_" not in dr.stdout,
+           f"sdk through main: the same compiler twice is not attributable ({[x for x in dr.stdout.splitlines() if 'loomcand' in x]} {dr.stderr[-300:]})")
         r = compile_lint(lc, t, "q6_old", q6_old + kernel("g_q6_k_icodes", False), "t_g_q6_k_icodes")
         ok("repack" in r["flags"], f"pre-E233 q6_k codes flag repack (pk {r['pk']}, bfe {r['bfe']})")
         r = compile_lint(lc, t, "q6_new", q6_new + kernel("g_q6_k_icodes", False), "t_g_q6_k_icodes")
@@ -717,6 +849,7 @@ def main():
     occupancy_seam()
     livereg()
     lesson_notes()
+    loom_cands()
     prog = ("template.def<@sel1_g_k1> target(@rdna3) @sel1_g_k1_rdna3(%g0: index) {\n  kernel.launch @g_k1[%g0](%g0) : [index](index)\n}\n"
             "command.def public @c() {\n  template.apply<@sel1_g_k1>(%t) : (index)\n  template.apply<@sel1_g_k1>(%u) : (index)\n"
             "  kernel.launch @g_k2[%t](%t) : [index](index)\n  kernel.launch @g_k3(%t, %u) : (index, index)\n}\n")
@@ -1006,7 +1139,7 @@ def main():
     b = kl.barrier_check(bk(st + bar + nb + "  view.store %v, %tv[%c1] : f32, view<64xf32>\n"))
     ok(b["races"] == [], f"barrier: races are computed only when asked (--barriers): super-linear, detail only (review N2: "
        f"187 s / 2 GB at 4,000 accesses) ({b['races']})")
-    import json, tempfile as tf
+    import tempfile as tf
     with tf.TemporaryDirectory() as t:
         js = os.path.join(t, "k.json")
         json.dump({"source_low": {"memory": {"bank_service": {"structural": {"conflicted_packet_count": 4, "extra_round_count": 48}}}}}, open(js, "w"))

@@ -1092,6 +1092,124 @@ def lesson_lines(rows):
     return out
 
 
+EDGE_PAIRS_MIN = 8   # VOPD pairs in one back-edge copy group at or above which a vopd-edge candidate is printed (C19, fire data 11-25 on
+# pkg-e480: 230 groups at 0-3 pairs, 224 at 4-7 (almost all g_head_mv_t16_q8_p40's, a DRAM-bound decode matvec), 23 at >= 8 in 17 kernels)
+LOOM_TIER_DOC = ("loom/docs/src/workflows/compile-report-queries.md:122-124 (v0.2.0: 'the producer's reduction required for the "
+                 "jointly selected next residency tier') against Loom's own whole-workgroup ceil (planning/occupancy.c:377 "
+                 "wave_limit_for_workgroups)")
+LOOM_VOPD_SRC = ("v0.2.0 planning/packet_plan.c:72-77 (the VOPD plan walks schedule packets only); a branch's edge-copy group is "
+                 "expanded at emission (encode_branch_packet, emit/native/amdgpu/encoding.c:1719-1728 -> encode_move_range_impl, "
+                 "encoding.c:1016-1072) with no VOPD lookup")
+CAND_HEAD = ("loom candidates (prompts for a compiler packet, never verdicts: each needs a minimal .loom repro, upstream main and "
+             "existing issues checked, and the user's approval before anything is posted):")
+
+
+def loom_candidates(name, ins, addr, rep):
+    """Loom upstream CANDIDATES for one kernel (C19), never flags or notes: ([{"kind", "line", ...}], [why not compared]).
+    tier: the compile report's next tier (target_resources.residency.next_better_tier, or its current tier) differs from tier_state()'s
+      whole-workgroup arithmetic (HRX-like E533: flash2 384 lanes reported 6 -> 7 at -21 VGPR / -18,944 B; a workgroup seats 3 waves
+      per SIMD, so the next tier is 9 at VGPR <= 168 and LDS <= 43,008 B). An unverified tier is counted, never a candidate.
+    vopd-edge: a loop's back-edge copy group (backedge_block: the move run ending <= 8 instructions before the backward branch) in
+      which vopd_pairs(), Loom 0.2.0's planner rules with the order constraint (neither half reads the other's destination, the
+      copies being a sequentialized parallel copy), forms >= EDGE_PAIRS_MIN pairs: moves the allocator emits after the VOPD plan
+      (HRX-like E592: flash2_f16o 65 moves -> 31 pairs). A details report's move_causes.branch_edge is cited when present."""
+    out, skip = [], []
+    if rep is None:
+        skip.append("no compile report")
+    else:
+        occ = occ_inputs(rep)
+        st = tier_state(occ, device_simds(occ["target"]))
+        res = ((rep.get("target_resources") or {}).get("residency") or {})
+        cur, nb = res.get("current_tier"), res.get("next_better_tier")
+        if "why" in st:
+            skip.append(st["why"])
+        elif isinstance(cur, int) and isinstance(nb, int):
+            rn = nb if nb > cur else None
+            if (cur, rn) != (st["tier"], st["next"]):
+                red = ", ".join(f"{(x.get('name') or '?').split('.')[-1]} -{x['reduction_units_to_next_better_tier']}"
+                                for x in occ["rows"] if x.get("reduction_units_to_next_better_tier"))
+                w = -(-occ["wg"] // occ["wave"])
+                need = " and ".join(f"{'VGPR' if n == 'vgpr' else n.upper()} <= {mx}" for n, _, _, mx, _ in st["needs"])
+                ours = (f"{tier_text(st)} -> " + (f"{st['next']} at {need}" if st["next"] is not None else
+                                                  (st["blocked"] or "none (wave cap)")))
+                out.append({"kind": "tier", "report": (cur, rn), "whole": (st["tier"], st["next"]),
+                            "line": f"loomcand tier {name}: report tier {cur} -> {rn if rn is not None else 'none'}"
+                                    + (f" ({red})" if red else "") + f"; whole workgroups ({occ['wg']} lanes = {w} waves, "
+                                    f"{st['q']} per SIMD{', bound: placement undocumented' if st['bound'] else ''}): {ours}; "
+                                    f"contradicts {LOOM_TIER_DOC}"})
+    groups, seen = [], set()
+    for t, e in loops(ins, addr):
+        body = ins[t:e + 1]
+        bb = backedge_block(body)
+        if not bb or (t + bb[0], t + bb[1]) in seen:
+            continue
+        seen.add((t + bb[0], t + bb[1]))
+        pairs = vopd_pairs(body, *bb)[0]
+        if pairs >= EDGE_PAIRS_MIN:
+            groups.append((sum(copy_moves(x) for x in body[bb[0]:bb[1] + 1]), pairs, t + bb[0]))
+    if groups:
+        bc = [c for c in ((rep or {}).get("move_causes") or {}).get("causes") or [] if c.get("cause") == "branch_edge"]
+        ev = (f"report: branch_edge {bc[0].get('unit_count')} moves in {bc[0].get('packet_count')} packets" if bc else
+              "report: move causes not itemised (summary report; --compile-report=details itemises branch_edge)")
+        out.append({"kind": "vopd-edge", "groups": [(m, p) for m, p, _ in groups],
+                    "line": f"loomcand vopd-edge {name}: " + "; ".join(f"back-edge copy group at instruction {i}: {m} moves -> {p} "
+                                                                         f"VOPD pairs" for m, p, i in groups)
+                            + f" by Loom's own pairing rules, order respected; {ev}; {LOOM_VOPD_SRC}"})
+    return out, skip
+
+
+SHAPE_NOTES = ("reread", "addr64", "guardwait", "vopd", "ldsbank")   # the notes lint() sets per kernel (the rest need texts or peers)
+
+
+def provenance(lc, progs, roots):
+    """what compiled a code-object directory: the compiler (real path), its hrx-loom version, each program's sha256, the roots regex,
+    the target; written by compile_programs as OUT/loom-provenance, read by the SDK differential"""
+    import hashlib
+    import loom_suggest
+    return {"compiler": os.path.realpath(lc), "version": loom_suggest.version(lc), "roots": roots, "target": "amdgpu:gfx1151",
+            "programs": {os.path.basename(p): hashlib.sha256(open(p, "rb").read()).hexdigest() for p in progs}}
+
+
+def read_provenance(d):
+    """a directory's loom-provenance, or None (absent or unreadable)"""
+    f = os.path.join(d, "loom-provenance") if d and os.path.isdir(d) else None
+    try:
+        return json.load(open(f)) if f and os.path.exists(f) else None
+    except (OSError, ValueError):
+        return None
+
+
+def sdk_diff(cur, base, pc, pb):
+    """the SDK differential (C19; by hand so far: HRX-like E177 / E227): kernel -> row of two compiles of the same programs by two
+    compilers (provenance pc / pb). Per kernel in both, the shapes (flags, the per-kernel notes SHAPE_NOTES, candidate kinds) that
+    appear or disappear and regressions() each way; a kernel compiled by one side only. Fails closed: without both provenances, with
+    different programs, roots or targets, or with one compiler, one 'not attributable' line and nothing else."""
+    why = ("provenance missing" if not (pc and pb) else "programs differ" if pc.get("programs") != pb.get("programs") or not pc.get("programs")
+           else "roots or target differ" if (pc.get("roots"), pc.get("target")) != (pb.get("roots"), pb.get("target"))
+           else "one compiler" if pc.get("compiler") == pb.get("compiler") else None)
+    if why:
+        return [f"loomcand sdk: not attributable ({why}): an SDK differential needs both directories compiled by kernel_lint "
+                f"(--package / --program) from identical programs by two compilers"]
+    vb, vc = pb.get("version"), pc.get("version")
+    shapes = lambda r: ({f for f in r.get("flags", []) if not f.startswith("regress:")} | {n for n in r.get("notes", []) if n in SHAPE_NOTES}
+                        | {"loomcand:" + c["kind"] for c in r.get("loomcand", [])})
+    out, n_same = [], 0
+    for k in sorted(set(cur) | set(base)):
+        if k not in cur or k not in base:
+            out.append(f"loomcand sdk {k}: compiled by {vb if k in base else vc} only ({vc if k in base else vb} has no object)")
+            continue
+        a, b = shapes(base[k]), shapes(cur[k])
+        flip = lambda x: re.sub(r"^(\D+)(\d+)->(\d+)$", r"\1\3->\2", x) if "->" in x else x + " gone"
+        worse, better = regressions(cur[k], base[k]), [flip(x) for x in regressions(base[k], cur[k])]
+        if a == b and not worse and not better:
+            n_same += 1
+            continue
+        out.append(f"loomcand sdk {k}: {vb} -> {vc}: " + " ".join([f"+{x}" for x in sorted(b - a)] + [f"-{x}" for x in sorted(a - b)])
+                   + (f" worse {','.join(worse)}" if worse else "") + (f" better {','.join(better)}" if better else "")
+                   + f"; programs {','.join(f'{p}:{h[:12]}' for p, h in sorted(pc['programs'].items()))}")
+    return out + [f"loomcand sdk: {vb} -> {vc}: {len(out)} kernel line(s), {n_same} kernel(s) with the same shapes"]
+
+
 def lint_listing(name, ins, addr, res=(None, None)):
     """the lint of one kernel's decoded listing (instructions, byte addresses), as lint() reports it"""
     r = {"kernel": name, "instr": len(ins), "flags": []}
@@ -1796,6 +1914,9 @@ def compile_programs(progs, out, jobs, lc=None, roots=None):
     (named, never hidden)"""
     lc = lc or loom_compile()
     os.makedirs(out, exist_ok=True)
+    pv = os.path.join(out, "loom-provenance")
+    if os.path.exists(pv):
+        os.remove(pv)                                 # a compile that dies half-way leaves no provenance (no SDK differential on it)
     texts, work = [], []
     for prog in progs:
         t = open(prog).read()
@@ -1817,6 +1938,7 @@ def compile_programs(progs, out, jobs, lc=None, roots=None):
         for k, rc, err in ex.map(one, work):
             if rc:
                 failed.append((k, (err.strip().split("\n") or [""])[0][:160]))
+    json.dump(provenance(lc, progs, roots), open(pv, "w"), indent=1)
     return texts, failed
 
 
@@ -1897,6 +2019,10 @@ def main():
     ap.add_argument("--livereg", action="store_true", help="RGA's live VGPRs per instruction (rga -s bin --livereg): the 'live' "
                     "column peak/floor/over and a line per kernel whose loop floor exceeds the next tier's VGPR budget")
     ap.add_argument("--rga", help="with --livereg: the rga binary (default: RGA from the environment or the machine env file)")
+    ap.add_argument("--loom-candidates", action="store_true", help="print Loom upstream CANDIDATES (C19; never flags or notes, no "
+                    "exit code): per kernel the report's next tier vs whole-workgroup arithmetic (E533) and back-edge copy groups VOPD "
+                    "could pair (E592); with --baseline, the SDK differential when both directories were compiled from identical "
+                    "programs by two compilers (loom-provenance)")
     ap.add_argument("--flagged", action="store_true", help="print flagged kernels only")
     ap.add_argument("--strict", action="store_true", help="exit 1 when any kernel is flagged")
     a = ap.parse_args()
@@ -1934,11 +2060,35 @@ def main():
     for r in rows:
         if r["kernel"] in mv:
             r.setdefault("notes", []).append("maskedv")         # E444: V read unconditionally under a score-only mask
+    base_rows = {}
     if a.baseline:
         for r in rows:
             b = os.path.join(a.baseline, r["kernel"] + ".hsaco")
             if os.path.exists(b):
-                r["flags"] += ["regress:" + x for x in regressions(r, lint(b))]
+                base_rows[r["kernel"]] = lint(b)
+                r["flags"] += ["regress:" + x for x in regressions(r, base_rows[r["kernel"]])]
+    cand_lines, cand_skip = [], collections.Counter()
+    if a.loom_candidates:
+        def cands(f):
+            js = f[:-6] + ".json"
+            rep = json.load(open(js)) if os.path.exists(js) else None
+            return loom_candidates(os.path.basename(f)[:-6], *disasm(f), rep)
+        loom_files = [f for f in files if f.endswith(".hsaco")]          # one Loom kernel per object, named by the file (lint())
+        with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
+            got = dict(zip([os.path.basename(f)[:-6] for f in loom_files], ex.map(cands, loom_files)))
+        for r in rows:
+            cs, sk = got.get(r["kernel"], ([], ["not a Loom kernel object"]))
+            r["loomcand"] = cs
+            cand_lines += [c["line"] for c in cs]
+            cand_skip.update(sk)
+        if a.baseline:
+            bfiles = sorted(glob.glob(os.path.join(a.baseline, "*.hsaco")))
+            with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
+                for f, (cs, _) in zip(bfiles, ex.map(cands, bfiles)):
+                    k = os.path.basename(f)[:-6]
+                    base_rows.setdefault(k, lint(f))["loomcand"] = cs
+            here = a.out if progs else (a.paths[0] if a.paths and os.path.isdir(a.paths[0]) else None)
+            cand_lines += sdk_diff({r["kernel"]: r for r in rows}, base_rows, read_provenance(here), read_provenance(a.baseline))
     loom_lines = []
     if a.suggest:
         import loom_suggest
@@ -1990,6 +2140,13 @@ def main():
             print(line)
     for line in lesson_lines(rows):
         print(line)
+    if a.loom_candidates:
+        print(CAND_HEAD)
+        for line in cand_lines:
+            print(line)
+        kinds = collections.Counter(c["kind"] for r in rows for c in r.get("loomcand", []))
+        print("loomcand: " + (", ".join(f"{v} {k}" for k, v in sorted(kinds.items())) or "none") + "; not compared: "
+              + (", ".join(f"{v} {k}" for k, v in sorted(cand_skip.items())) or "none"))
     for k, c in sorted(mv.items()):
         print(f"maskedv {k}: {len(c)} key-valid bits ({' '.join(c[:3])}{' ...' if len(c) > 3 else ''}) mask only the score: no value "
               f"outside the score chain is zeroed and no compared key is clamped (E444: V of a masked key times p = +0)")
