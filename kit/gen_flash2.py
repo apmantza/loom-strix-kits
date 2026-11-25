@@ -31,6 +31,8 @@ if os.environ.get("FLASH2_TARGET", "llm") == "llm" and os.environ.get("FLASH2_SP
         import runpy
         runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen_flash2s.py"))
         raise SystemExit(0)
+if os.environ.get("FLASH2_SMX", "0") == "1" and os.environ.get("FLASH2_ARCH") != "rdna4":   # flash2_smx.py rewrites gen_flash2s.py's text only
+    raise SystemExit("FLASH2_SMX: only the split-dims kernel (gen_flash2s.py, head_dim 256/512) has the pass; unset it for this model")
 T = os.environ.get("FLASH2_TARGET", "llm")
 if T == "llm":  # gen_llm.py: geometry from the LLM_CONFIG json (see inspect_gguf.py)
     _c = json.load(open(os.environ["LLM_CONFIG"]))

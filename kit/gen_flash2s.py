@@ -821,6 +821,9 @@ if os.environ.get("FLASH2_PEEL", "1") == "1" and not EDGE_ZERO and B_MODE != "2"
     if not R4 and not PARTIAL and os.environ.get("FLASH2_SX11", "0") == "1":   # gfx11 g_attention_flash2: S partials exchanged as lane vectors (flash2_trim.sx11)
         from flash2_trim import sx11
         text = sx11(text)
+if not R4 and not SPLITK and os.environ.get("FLASH2_SMX", "0") == "1":   # gfx11 g_attention_flash2 / _partial: P^T from f16, scale folded into exp2 (flash2_smx.py; needs the peeled loop)
+    from flash2_smx import smx
+    text = smx(text)
 if os.environ.get("FLASH2_ENTRY") == "bcast" and os.environ.get("FLASH2_ROLE") != "partial":   # experiment: the listed entry broadcast from lane 0
     _old = "  %entry32 = view.load %tiles_view[%entry_slot] : view<[%tokens]xi32> -> i32\n  %entry = index.cast %entry32 : i32 to index\n"
     assert _old in text, "entry load not found"
