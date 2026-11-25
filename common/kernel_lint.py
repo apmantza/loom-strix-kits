@@ -55,6 +55,23 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
             g_attention_split, g16_attention_split_listed (and the _rdna4 twin), nothing else; KV8_SPLIT_VZERO (pkg-q179) clears
             all three. Quiet: flash2 / flash2_partial / vsplit (K and V zeroed under the bit), g_dfl_ctx_split (key clamped),
             g_dfl_topk (a logit mask, no softmax). The stale_kv kernel tests are the guard; this points at a kernel to read.
+  [barrier] a NOTE (with --package / --program / --source: the kernel's Loom text, checked against the binary's s_barrier count;
+            user 11-25, after cuda-oxide's no_data_race / uniform_barriers; E504: one extra barrier per flash2 tile cost +1.4 %):
+            a kernel.barrier<workgroup> that orders no workgroup-memory hazard (RAW / WAR / WAW between overlapping accesses of one
+            buffer.alloca<workgroup>, one writing) that no other barrier on the same path also orders: removable on its own (two such
+            barriers removed together are not covered). --barriers prints every barrier with the pairs it orders. Fire 11-25 on
+            pkg-e480 (259 kernels, 83 MB, 3.4 s): 8 barriers, all flash2 (main-loop end-of-tile barrier and the tail's last
+            barrier, in flash2 / _f16o / _partial / _partial_f16o); author-judged sample 2 of 2 real (static-1125/barrier-lint).
+  [divbar]  a NOTE: a barrier or workgroup collective under an scf.if / scf.for whose condition or bound may differ between a
+            workgroup's invocations (derived from ids, lanes, shuffles, scans, atomics; an unlisted kernel.* result counts as
+            non-uniform; a workgroup reduce / vote is uniform): some waves may never arrive. Fire 11-25 on pkg-e480: none.
+  (potential races, two overlapping accesses with no barrier between, are listed by --barriers only, never as a note: lane- or
+  wave-indexed staging stores are not proved disjoint (no per-invocation index model), and an author-judged sample of 10 of the
+  60 on pkg-e480 found 0 real; all were `row = tid / 2, col = (tid % 2) * 32 + c` staging or per-wave rows.)
+  Not analysed (printed, never clean): unknown region ops, a return before the end, workgroup scan / vote, a workgroup view
+  through a loop or yield, a callee that synchronises or allocates workgroup memory, barrier forms other than <workgroup>
+  scope(workgroup), and a text whose implied s_barrier count (two per workgroup reduce, times constant unrolls) is not the
+  binary's. Another engine's code objects carry no Loom text: the check does not apply to them.
   regress:  (with --baseline) worse than the same kernel in another build: a new spill, the prefetch now drained, fewer
             waves per SIMD, or the hot loop / its longest move run >= 10 % longer (E226: Loom 0.3.0's vmcnt(0) + 32-move shift;
             E230: a rewrite's spill; E236: a variant's residency drop).
@@ -68,7 +85,7 @@ back-edge (E109), the extra LDS bank-service rounds of Loom's gfx1151 bank model
 bank_service_groups before acting; E249: the f16 GEMMs' 48 extra rounds were the epilogue's once-per-tile store), and with --profile
 each kernel's served ms.
 A code object holding many kernels (another engine's build: *.co / *.hsaco) is linted kernel by kernel (lint_object).
-usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--profile RUN] [--flagged] [--strict]
+usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--profile RUN] [--source PKG_OR_LOOM] [--barriers] [--flagged] [--strict]
        kernel_lint.py --package PKG | --program FILE.loom ... --out DIR [--loom-compile PATH] [--roots REGEX] [--jobs N] [...]
          (compiles every gfx11 kernel root into DIR first; two compilers: run twice with --loom-compile and pass the first
           run's DIR as --baseline of the second; --strict: exit 1 when anything is flagged)"""
@@ -706,6 +723,8 @@ def _taint(tree, funcs=None):
                 defs = re.findall(r"%\w+", m.group(1) or "") if m else []
                 rest = it[2][m.end():] if m else it[2]
                 bad = (m and nonuniform_op(m.group(2))) or bool(set(re.findall(r"%\w+", rest)) & T)
+                if m and m.group(2).startswith(UNIFORM_KERNEL):
+                    bad = False                               # a workgroup reduce / vote of lane values is the same for all
                 if m and m.group(2) == "func.call":           # a callee reading an invocation id returns a non-uniform value
                     callee = (funcs or {}).get((re.search(r"@(\w+)", rest) or [None, ""])[1])
                     bad = bad or callee is None or _calls_nonuniform(callee)
@@ -1085,7 +1104,7 @@ def barrier_check(text, funcs=None):
 def barriers(rows, texts, funcs, roots=None):
     """attach barrier_check to each row whose kernel text is known, cross-checked against the binary: when the text's barriers
     (plus two per workgroup collective, times constant unroll counts) are not the binary's s_barrier count, the text is not
-    what runs and no verdict is given (fail closed). Notes: 'barrier' (a barrier orders nothing), 'race' (a potential race),
+    what runs and no verdict is given (fail closed). Notes: 'barrier' (a barrier orders nothing; races are listed, not noted),
     'divbar' (a barrier or collective under control flow that may differ between invocations). With texts, a binary with
     s_barriers whose text is missing is 'not analysed'; without any text (another engine's objects) the rule does not apply"""
     for r in rows:
@@ -1104,8 +1123,6 @@ def barriers(rows, texts, funcs, roots=None):
         r["barrier"] = b
         if any(x["verdict"] == "orders nothing" for x in b["barriers"]):
             r.setdefault("notes", []).append("barrier")
-        if b["races"]:
-            r.setdefault("notes", []).append("race")
         if b["status"].startswith("divergent"):
             r.setdefault("notes", []).append("divbar")
 
@@ -1121,7 +1138,7 @@ def barrier_report(r, start=None, full=False):
     L = lambda n: f"L{n + off}"
     head = f"barriers {r['kernel']}: {b['status']}" + (f" ({os.path.basename(start[0])})" if start else "")
     out = []
-    if not full and not any(x["verdict"] == "orders nothing" for x in b["barriers"]) and not b["races"] and not (
+    if not full and not any(x["verdict"] == "orders nothing" for x in b["barriers"]) and not (
             b["status"].startswith(("not analysed", "divergent"))):
         return out                                        # a kernel the check could not model is always printed (fail closed)
     out.append(head + (f", {len(b['barriers'])} barriers, {b['collectives']} collectives" if b["status"] == "analysed" else ""))
@@ -1135,7 +1152,7 @@ def barrier_report(r, start=None, full=False):
         desc = "; ".join(f"{reg} {k}: {' '.join(L(v) for v in sorted(e[0]))} -> {' '.join(L(v) for v in sorted(e[1]))} ({e[2][0]} pairs)"
                          for (reg, k), e in sorted(g.items()))
         out.append(f"  {L(x['line'])}: {x['verdict']}" + (f"  [{desc}]" if desc else ""))
-    for a, c, k, reg, lab in b["races"]:
+    for a, c, k, reg, lab in (b["races"] if full else []):   # 0 of 10 sampled races real (11-25): detail only
         out.append(f"  potential race {k} on {reg}: {L(a)} / {L(c)} with no barrier between" + (f" ({lab})" if lab else ""))
     return out
 

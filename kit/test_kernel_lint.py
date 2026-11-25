@@ -315,6 +315,11 @@ def main():
     b = kl.barrier_check(bk(st + "  %pre = kernel.subgroup.scan<add> %n : index\n  scf.if %pre {\n" + bar + "  }\n"))
     ok(b["status"].startswith("divergent"), f"barrier: a subgroup scan of a uniform value (a per-lane prefix) is non-uniform "
        f"({b['status']})")
+    red = div.replace("index.cmp ult, %tid, %c32", "scalar.cmpf one, %any, %no_scale").replace(
+        "  %lt", "  %any = kernel.workgroup.reduce<maxnumf> %v : f32\n  %lt")
+    b = kl.barrier_check(bk(red))
+    ok(b["status"] == "analysed", f"barrier: a workgroup reduce of lane values is uniform (the GEMMs' tile_live skip; 42 GEMMs read "
+       f"divergent while it was not) ({b['status']})")
     b = kl.barrier_check(bk(st + bar + "  scf.while %a {\n" + nb + "  }\n"))
     ok(b["status"].startswith("not analysed"), f"barrier: an unknown region op is 'not analysed', never clean ({b['status']})")
     b = kl.barrier_check(bk(st + "  scf.if %n {\n  kernel.return\n  }\n" + bar + nb))
@@ -344,6 +349,12 @@ def main():
     want = 100 + bk(st + bar + nb).split("\n").index(bar.rstrip("\n"))
     ok(any(x.startswith(f"  L{want}: orders") for x in rep), f"barrier: report lines are the program file's (kernel.def at 100, "
        f"barrier at {want}): {rep[1:3]}")
+    row = {"kernel": "g_b", "s_barrier": 2}
+    kl.barriers([row], {"g_b": bk(st + bar + bar + nb + "  view.store %v, %tv[%c1] : f32, view<64xf32>\n")}, {})
+    ok("race" not in row.get("notes", []) and row["barrier"]["races"] and kl.barrier_report(row)
+       and not any("potential race" in x for x in kl.barrier_report(row))
+       and any("potential race" in x for x in kl.barrier_report(row, full=True)),
+       "barrier: a potential race is listed with --barriers only, never a note (0 of 10 sampled real, 11-25)")
     row = {"kernel": "g_other", "s_barrier": 3}
     kl.barriers([row], {"g_b": bk(st)}, {})
     ok(row.get("barrier", {}).get("status", "").startswith("not analysed"), "barrier: a binary with barriers and no text is 'not analysed'")
