@@ -1129,14 +1129,20 @@ BFLY_PERM = os.environ.get("MV_BFLY_PERM", "1") == "1"
 # MV_SCHED=D:U (sched-1125, open A/B; HRX-like static-1125/sched): Loom's own read-ahead on the _mv row loop,
 # `pipeline(D) unroll(U) schedule(recurrence)` (docs workflows/tune-loop-schedules.md), instead of a hand-split prefetch (MV_PF,
 # E388). Static, 0.2.0 = 0.3.0: 2:2 keeps 2 weight loads in flight across the back-edge with no vmcnt(0) in the steady loop
-# (hand MV_PF and pipeline alone: 0 in flight, vmcnt(0) + queue copies). Exact by construction (same ops per row, same order).
+# (hand MV_PF and pipeline alone: 0 in flight, vmcnt(0) + queue copies). Same ops per row in the same order: the int8 (dot4) kernels
+# are exact by construction; the f32 one (q8_0 t4 r48, vector.dotf<reassoc>) is settled by EXACT, not by this argument.
+# Refusals exit (not assert: `python -O` strips asserts). The only accepted spec is two positive decimal integers D:U.
 MV_SCHED = os.environ.get("MV_SCHED", "")
+MV_SCHED_D = MV_SCHED_U = 0
 if MV_SCHED:
-    _d, _u = (int(x) for x in MV_SCHED.split(":"))
-    assert _d >= 1 and _u >= 1, MV_SCHED
-    assert os.environ.get("VERIFY_FUSE", "") in ("", "0"), "MV_SCHED: gen_pstep anchors the bare row loop (ROW_LOOP)"
-    MV_SCHED_POL = f" pipeline(%mvs_d) unroll(%mvs_u) schedule(recurrence)"
-    MV_SCHED_DEF = f"  %mvs_d = index.constant {_d} : index\n  %mvs_u = index.constant {_u} : index\n"
+    _p = MV_SCHED.split(":")
+    if len(_p) != 2 or not all(x.isascii() and x.isdigit() and int(x) >= 1 for x in _p):
+        sys.exit(f"MV_SCHED={MV_SCHED!r}: want D:U, two integers >= 1 (pipeline depth, unroll factor), e.g. MV_SCHED=2:2")
+    if os.environ.get("VERIFY_FUSE", "") not in ("", "0"):
+        sys.exit(f"MV_SCHED={MV_SCHED!r} with VERIFY_FUSE={os.environ['VERIFY_FUSE']!r}: gen_pstep anchors the bare row loop (ROW_LOOP)")
+    MV_SCHED_D, MV_SCHED_U = int(_p[0]), int(_p[1])
+    MV_SCHED_POL = " pipeline(%mvs_d) unroll(%mvs_u) schedule(recurrence)"
+    MV_SCHED_DEF = f"  %mvs_d = index.constant {MV_SCHED_D} : index\n  %mvs_u = index.constant {MV_SCHED_U} : index\n"
 else:
     MV_SCHED_POL = MV_SCHED_DEF = ""
 
@@ -1210,9 +1216,9 @@ def _mv(fmt, K, R=16, TG=1, swiglu=False, suffix="", iq=False, pair=False, chunk
     NCH = TG // CHK
     assert NCH * CHK == TG
     PERM = iq and nw == 2 and BFLY_PERM and CHK >= 8
-    # MV_SCHED: single-weight kernels with >= 8 rows only (static, sched-1125: the swiglu pair spilled / lost residency and
-    # kept no load in flight; R <= D x U leaves no steady loop)
-    sched = bool(MV_SCHED_POL) and nw == 1 and R >= 8
+    # MV_SCHED: single-weight kernels with R > D x U rows only (static, sched-1125: the swiglu pair spilled / lost residency and
+    # kept no load in flight; R <= D x U leaves no steady loop: at 2:4 the R=8 kernels took VGPRs and kept vmcnt(0))
+    sched = bool(MV_SCHED_POL) and nw == 1 and R > MV_SCHED_D * MV_SCHED_U
     wargs = "%w: buffer, %w2: buffer" if nw == 2 else "%w: buffer" + (", %ws: buffer" if fmt in SPLIT else "")
     assert not (fmt in SPLIT and nw == 2), f"{fmt}: split-plane weights have no swiglu matvec"
     yargs = "%y: buffer, %y2: buffer" if pair else "%y: buffer"
@@ -6478,6 +6484,10 @@ if __name__ == "__main__":
         import gemm_flataddr
         text, _done = gemm_flataddr.apply(text)
         print("GEMM256_FLATADDR:", ", ".join(_done), file=sys.stderr)
+    if MV_SCHED:   # the build log names the policy and its reach (a reader of the .log sees it was applied)
+        _n = sum(1 for _b in re.split(r"(?m)^(?=kernel\.def )", text) if _b.startswith("kernel.def") and MV_SCHED_POL + " {" in _b)
+        print(f"MV_SCHED={MV_SCHED_D}:{MV_SCHED_U}: pipeline({MV_SCHED_D}) unroll({MV_SCHED_U}) schedule(recurrence) on {_n} kernels "
+              f"(single-weight matvec row loops, R > {MV_SCHED_D * MV_SCHED_U})", file=sys.stderr)
     out = os.path.join(out_dir, "model.loom")
     open(out, "w", newline="\n").write(text)
     print("wrote", out)
