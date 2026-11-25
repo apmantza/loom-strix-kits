@@ -4736,8 +4736,9 @@ def cover_sources():
     return _COVER_SRC
 
 
-def mv_cover_case(kern, m, crng):
-    """A case for matvec KERN (MV_NAME match M) on a model tensor whose shape the rows rule maps to it, or None."""
+def mv_cover_pick(m):
+    """(tensor source, tensor, its pair tensor or None, output width) of a model tensor whose shape the rows rule maps to
+    matvec MV_NAME match M (else one of its format and K: the fallback), or None."""
     fmt, K, kind, q8 = m["fmt"], int(m["K"]), m["kind"] or "", bool(m["q8"])
     tg = int(m["tg"] or 1)
     R = int(m["R"] or 16)
@@ -4772,7 +4773,15 @@ def mv_cover_case(kern, m, crng):
             fallback = fallback or (src, an, bn, n)
         if pick:
             break
-    pick = pick or fallback   # a launch whose width is symbolic (gen_llm NVAL, e.g. the GDN heads) keeps the default rows
+    return pick or fallback   # a launch whose width is symbolic (gen_llm NVAL, e.g. the GDN heads) keeps the default rows
+
+
+def mv_cover_case(kern, m, crng):
+    """A case for matvec KERN (MV_NAME match M) on a model tensor whose shape the rows rule maps to it, or None."""
+    K, q8 = int(m["K"]), bool(m["q8"])
+    tg = int(m["tg"] or 1)
+    sw = {"": 0, "_swiglu": 1, "_pair": 2}[m["kind"] or ""]
+    pick = mv_cover_pick(m)
     if pick is None:
         return None
     src, an, bn, n = pick
@@ -4891,6 +4900,162 @@ if True:   # coverage: a case for every kernel the package launches
     cases += ktest_variants.clones(real_cases(), _lib + _helpers, pkg_launched() - cases_launched(), save, KS, lambda f: np.load(os.path.join(out, f)))
     for _k in sorted(pkg_launched() - cases_launched()):
         print(f"coverage: no case launches {_k}")
+
+
+# Width equality, 16 tokens vs 8 + 8 (HRX-like E439 / q177, q178). Recurrence it guards: concurrent decode not bit-identical to
+# solo. Two decoding streams make one 16-token verify epoch and run the t16 kernels (g_mv_*_t16_q8[_r32], g_head_mv_t16_q8[_p40])
+# where one stream alone runs the t8 ones, so a t16 kernel that reduces a row in another order than its t8 sibling changes a
+# served token. @weq_<t16 kernel>: one 16-row input as a concurrent epoch serves it (g_quant_q8 over 16 rows, the t16 kernel)
+# and as two solo epochs do (each 8-row half quantized and launched alone, rows 0-7 and 8-15, the t8 kernel the rows rule
+# gives that width: a t16 _r32 kernel meets its 16-row t8 sibling); every row equal at atol 0 (test_copy_rows takes the 16-row
+# output's halves). Section 2's t16 == t1 cases launch the 1-token kernel over the 16-row quantization of section 2's
+# tensors; these follow the served launches and also reach the kernels those tensors miss (swiglu, drafter widths, the
+# proposal head). @weq_g_post_add_norm_rs: 16 rows vs 8 + 8 (gen_llm launches it at >= 17 tokens, the GEMM path). Each case
+# has a _negcontrol twin: half b's input with one element moved by 1.0, so half b's comparison must FAIL (a blind comparison:
+# a kernel that does not write, a buffer compared with itself). Own generator; appended after the coverage cases, so no other
+# case's inputs or selection move.
+def width_eq_cases():
+    lib = _pkg_llm_text() or ""
+    copy_rows = globals().get("COPY_ROWS")   # the flash section's test helper
+    if not lib or not copy_rows:
+        print("width_eq: no package llm.loom or no test_copy_rows (FLASH_TESTS=0): no weq_ cases")
+        return
+    exp = set(re.findall(r'^kernel\.def\b[^\n]*?\bexport\("([^"]+)"\)', lib, re.M))
+    if not any('export("test_copy_rows")' in c for c in cases):
+        cases.append(copy_rows)
+    wr = np.random.default_rng(4390)
+    wdecl = {}
+
+    def weight(src, nm, key):   # (decl, launch args, launch types) of tensor NM as %KEY, its files saved once per tensor
+        k_ = (id(src), nm, key)
+        if k_ not in wdecl:
+            f = f"weq_{len(wdecl)}"; a = src["raw"](nm); save(f + "_w", a)
+            sd, sa, st = src["split"](nm, f, key)
+            wdecl[k_] = (f'  %{key} = check.file.read.npy path("{f}_w.npy") : {ty(a)}\n' + sd, f"%{key}" + sa, ty(a) + st)
+        return wdecl[k_]
+
+    def halves(tag, a, neg_row):   # saves TAG_{x,xa,xb,xbn}: 16 rows, the halves, half b with element (NEG_ROW, 0) moved by 1.0
+        save(tag + "_x", a); save(tag + "_xa", a[:8]); save(tag + "_xb", a[8:])
+        n_ = a[8:].copy(); n_[neg_row, 0] += 1.0; save(tag + "_xbn", n_)
+
+    def copy_cmp(v, wd, t16, t8, eq="close"):   # %v's rows 0-7 / 8-15 vs %va / %vb at atol 0
+        out_ = f"  %wd_{v} = check.literal value({wd}) : index\n"
+        for hh, s in (("a", 0), ("b", 8)):
+            out_ += (f"  %{v}_{hh} = check.generate.fill value(0{'' if eq == 'equal' else '.0'}) : {t8}\n"
+                     f"  kernel.launch @test_copy_rows[%t8](%t8, %wd_{v}, %s{s}, %t16, %{v}, %{v}_{hh}) : [index](index, index, index, index, {t16}, {t8})\n"
+                     + (f"  check.expect.equal actual(%{v}_{hh}) expected(%{v}{hh}) : {t8}\n" if eq == "equal" else
+                        f"  check.expect.close actual(%{v}_{hh}) expected(%{v}{hh}) atol(0.0) rtol(0.0) nan(different) : {t8}\n"))
+        return out_
+
+    def add(name, body, tag):
+        cases.append(f"check.case public @{name} {{\n  %t16 = check.literal value(16) : index\n  %t8 = check.literal value(8) : index\n"
+                     f"  %s0 = check.literal value(0) : index\n  %s8 = check.literal value(8) : index\n{body}  check.return\n}}\n")
+        cases.append(negtwin(cases[-1], (f'path("{tag}_xb.npy")', f'path("{tag}_xbn.npy")')))
+
+    # matvecs: every exported t16 kernel with a t8 sibling of its format, K and kind
+    for k16 in sorted(exp):
+        m = MV_NAME.match(k16)
+        if not m or m["tg"] != "16" or (m["kind"] or "") not in ("", "_swiglu") or (m["q8"] and m["fmt"] not in IQ_FMTS):
+            continue
+        fmt, K, kind, q8 = m["fmt"], int(m["K"]), m["kind"] or "", bool(m["q8"])
+        sw = 1 if kind else 0
+        pick = mv_cover_pick(m)
+        if pick is None:
+            print(f"width_eq: no {fmt} tensor with K={K} for {k16}")
+            continue
+        src, an, bn, n = pick
+        R8 = iq_r(n, K, 8, sw) if q8 else pick_r(n, K, 8)
+        k8 = f"g_mv_{fmt}_k{K}{kind}_t8" + ("_q8" if q8 else "") + (f"_r{R8}" if R8 != 16 else "")
+        if k8 not in exp or n % 16:
+            print(f"width_eq: {k16}: no t8 sibling {k8} exported (width {n})")
+            continue
+        tag = f"weq_{k16}"
+        halves(tag, wr.standard_normal((16, K)).astype(np.float32), 3)
+        decl, wargs, wtys = weight(src, an, "wa")
+        if bn:
+            d2, a2, t2 = weight(src, bn, "wb"); decl += d2; wargs += ", " + a2; wtys += ", " + t2
+        X = lambda r: f"tensor<{r}x{K}xf32>"
+        XQ = (lambda r: f"tensor<{r}x{2 * K}xi8>") if q8 else X
+        Y = lambda r: f"tensor<{r}x{n}xf32>"
+        body = f"  %n = check.literal value({n}) : index\n  %k = check.literal value({K}) : index\n  %acc = check.literal value(0) : i32\n" + decl
+        for v, r in (("", 16), ("a", 8), ("b", 8)):
+            tv = "%t16" if r == 16 else "%t8"
+            body += (f'  %x{v} = check.file.read.npy path("{tag}_x{v}.npy") : {X(r)}\n  %y{v} = check.generate.fill value(0.0) : {Y(r)}\n'
+                     + (f"  %xq{v} = check.generate.fill value(0) : {XQ(r)}\n"
+                        f"  kernel.launch @g_quant_q8[{tv}, %k]({tv}, %k, %x{v}, %xq{v}) : [index, index](index, index, {X(r)}, {XQ(r)})\n" if q8 else "")
+                     + f"  kernel.launch @{k16 if r == 16 else k8}[%n, {tv}](%n, {tv}, %acc, %x{'q' if q8 else ''}{v}, {wargs}, %y{v}) : "
+                       f"[index, index](index, index, i32, {XQ(r)}, {wtys}, {Y(r)})\n")
+        add(tag, body + copy_cmp("y", n, Y(16), Y(8)), tag)
+
+    # the int8 head: 16 spans (one token each) vs 8 + 8; logits and argmax partials. _p40: the proposal head's Q4_0 copy of
+    # the whole head (g_prep_<fmt>_q4_0 at load), made here from the head's own bytes
+    if HEAD_Q8 or VHEAD:
+        CHH = (cfg["vocab"] + 127) // 128
+        for suf in ("", "_p40"):
+            k16, k8 = f"g_head_mv_t16_q8{suf}", f"g_head_mv_t8_q8{suf}"
+            if k16 not in exp or k8 not in exp:
+                continue
+            if suf:
+                nb = cfg["vocab"] * H // 32
+                pk = f"g_prep_{HEAD_FMT}_q4_0"
+                vm = re.search(rf"kernel\.launch @{k16}\[[^\n]*view<(\d+)xi8>", lib)
+                pm = re.search(rf'export\("{pk}"\)[^\n]*\n(?:[^\n]*\n)*?\}} launch\(([^)]*)\)', lib)
+                if VHEAD or not vm or int(vm.group(1)) != nb * 18 or not pm or pm.group(1).count("%") not in (4, 6):
+                    print(f"width_eq: {k16}: not a whole-head Q4_0 copy from {pk}; no case")
+                    continue
+                w4t = f"tensor<{nb * 18}xi8>"
+                wpre = (f"  %b4 = check.literal value({nb}) : index\n  %o4 = check.literal value(0) : i64\n  %w4 = check.generate.fill value(0) : {w4t}\n"
+                        + (f"  %sp4 = check.literal value({nb}) : i64\n  kernel.launch @{pk}[%b4](%b4, %o4, %sp4, %o4, %w4, %w) : [index](index, i64, i64, i64, {w4t}, {hwt})\n"
+                           if pm.group(1).count("%") == 6 else f"  kernel.launch @{pk}[%b4](%b4, %o4, %w4, %w) : [index](index, i64, {w4t}, {hwt})\n"))
+                warg, wty = "%w4", w4t
+            else:
+                wpre = VQ_PREP.replace("{hwt}", hwt) if VHEAD else ""
+                warg, wty = ("%wq", f"tensor<{VQB}xi8>") if VHEAD else ("%w", hwt)
+            tag = f"weq_{k16}"
+            halves(tag, wr.standard_normal((16, H)).astype(np.float32), 5)
+            for S in (16, 8):
+                hm = np.zeros(4 + 9 * S, np.int32); hm[0] = S
+                for j in range(S):
+                    hm[4 + 9 * j + 0] = 1; hm[4 + 9 * j + 4] = j; hm[4 + 9 * j + 6] = 1
+                save(f"weq_hm{S}", hm)
+            MT = lambda r: f"tensor<{4 + 9 * r}xi32>"
+            HT, HQ = (lambda r: f"tensor<{r}x{H}xf32>"), (lambda r: f"tensor<{r}x{2 * H}xi8>")
+            PT, LT = (lambda r: f"tensor<{r * CHH * 2}xi32>"), (lambda r: f"tensor<{r * CHH * 128}xf32>")
+            body = (f"  %hk = check.literal value({H}) : index\n  %w = check.file.read.npy path(\"hd_w.npy\") : {hwt}\n" + wpre
+                    + "".join(f'  %m{r} = check.file.read.npy path("weq_hm{r}.npy") : {MT(r)}\n' for r in (16, 8)))
+            for v, r in (("", 16), ("a", 8), ("b", 8)):
+                tv = "%t16" if r == 16 else "%t8"
+                body += (f'  %x{v} = check.file.read.npy path("{tag}_x{v}.npy") : {HT(r)}\n  %xq{v} = check.generate.fill value(0) : {HQ(r)}\n'
+                         f"  kernel.launch @g_quant_q8[{tv}, %hk]({tv}, %hk, %x{v}, %xq{v}) : [index, index](index, index, {HT(r)}, {HQ(r)})\n"
+                         f"  %p{v} = check.generate.fill value(0) : {PT(r)}\n  %l{v} = check.generate.fill value(0.0) : {LT(r)}\n"
+                         f"  kernel.launch @{k16 if r == 16 else k8}[{tv}]({tv}, {tv}, %m{r}, %xq{v}, {warg}, %p{v}, %l{v}) : "
+                         f"[index](index, index, {MT(r)}, {HQ(r)}, {wty}, {PT(r)}, {LT(r)})\n")
+            add(tag, body + copy_cmp("l", CHH * 128, LT(16), LT(8)) + copy_cmp("p", CHH * 2, PT(16), PT(8), "equal"), tag)
+
+    # g_post_add_norm_rs (x += y or post-normed y; h = rmsnorm(x) * w_next; the f16 row scale): x, h and the scales per row.
+    # The f16 rows (f16(h x scale) of the compared h and scale) are written but not compared (test_copy_rows copies F32 rows).
+    pk = "g_post_add_norm_rs"
+    sig = "%tokens_arg: index, %y: buffer, %w_post: buffer, %x: buffer, %w_next: buffer, %h: buffer, %scales: buffer, %h16: buffer"
+    pd = re.search(rf'export\("{pk}"\)(?:[^\n]*\n)*?\}} launch\(([^)]*)\)(?:[^\n]*\n)*?[^\n]*view<\[%tokens\]x(\d+)x(\d+)xf16>', lib)
+    if pd and pd.group(1) == sig:
+        W16 = int(pd.group(2)) * int(pd.group(3))
+        tag = "weq_pan"
+        halves(tag, (wr.standard_normal((16, H)) * 3).astype(np.float32), 2)   # y
+        px = (wr.standard_normal((16, H)) * 10).astype(np.float32)
+        save(tag + "_px", px); save(tag + "_pxa", px[:8]); save(tag + "_pxb", px[8:])
+        save(tag + "_wp", (1 + 0.1 * wr.standard_normal(H)).astype(np.float32)); save(tag + "_wn", wr.standard_normal(H).astype(np.float32))
+        R_ = lambda r, w=H: f"tensor<{r}x{w}xf32>"
+        body = (f'  %wp = check.file.read.npy path("{tag}_wp.npy") : tensor<{H}xf32>\n  %wn = check.file.read.npy path("{tag}_wn.npy") : tensor<{H}xf32>\n')
+        for v, r in (("", 16), ("a", 8), ("b", 8)):
+            tv = "%t16" if r == 16 else "%t8"
+            body += (f'  %x{v} = check.file.read.npy path("{tag}_x{v}.npy") : {R_(r)}\n  %z{v} = check.file.read.npy path("{tag}_px{v}.npy") : {R_(r)}\n'
+                     f"  %h{v} = check.generate.fill value(0.0) : {R_(r)}\n  %s{v} = check.generate.fill value(0.0) : {R_(r, 2)}\n"
+                     f"  %q{v} = check.generate.fill value(0.0) : tensor<{r}x{W16}xf16>\n"
+                     f"  kernel.launch @{pk}[{tv}]({tv}, %x{v}, %wp, %z{v}, %wn, %h{v}, %s{v}, %q{v}) : "
+                     f"[index](index, {R_(r)}, tensor<{H}xf32>, {R_(r)}, tensor<{H}xf32>, {R_(r)}, {R_(r, 2)}, tensor<{r}x{W16}xf16>)\n")
+        add("weq_g_post_add_norm_rs", body + copy_cmp("z", H, R_(16), R_(8)) + copy_cmp("h", H, R_(16), R_(8)) + copy_cmp("s", 2, R_(16, 2), R_(8, 2)), tag)
+    elif f'export("{pk}")' in lib:
+        print(f"width_eq: {pk}: launch signature or f16 row width not recognized; no case")
 
 
 def split_vzero_cases():
@@ -5021,6 +5186,9 @@ def split_vzero_cases():
 if not KS and os.environ.get("SPLIT_VZERO_TESTS", "1") == "1":
     split_vzero_cases()   # HRX-like E441 / E444: unwritten slots after a token's last key in the split kernels' last block
 
+
+if not KS and os.environ.get("WIDTH_EQ_TESTS", "1") == "1":
+    width_eq_cases()
 if flash2_deep_from(cfg):   # gen_llm.py launches the deep pairs' kernel after every one-tile prefill flash launch
     cases = [re.sub(r"^( *)kernel\.launch @g_attention_flash2\[(.*)$", r"\g<0>\n\1kernel.launch @g_attention_flash2_deep[\2", c,
                     flags=re.M) for c in cases] + DEEP_CASES   # these launch the two kernels as they test them
