@@ -273,6 +273,39 @@ class LaneGate(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("cannot be measured", r.stdout)
 
+    def floor_file(self, table):
+        p = os.path.join(self.root, "floor.json")
+        open(p, "w").write(json.dumps(table) if not isinstance(table, str) else table)
+        return p
+
+    def test_noise_floor_stops_drop_inside_measured_floor(self):
+        # HRX-like E485: flash2's start-to-start spread was 4.2 % over 8 starts while one ABBA's two runs per arm read ~1 %:
+        # a 3 % drop passes on the ABBA's own spread and is noise against the measured floor
+        runs = self.abba((1000.0, 1010.0), (975.0, 978.0))
+        self.assertEqual(self.gate(runs).returncode, 0)   # without the floor: passes
+        r = self.gate(runs, "--noise-floor", self.floor_file({"prefill: attention": 4.2}))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("did not move beyond noise", r.stdout)
+        self.assertIn("| 4.20 % (floor) |", r.stdout)
+        r = self.gate(runs, "--noise-floor", self.floor_file({"prefill: attention": 0.5}))   # a floor below the spread changes nothing
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("(floor)", r.stdout)
+
+    def test_noise_floor_applies_to_guarded_lanes(self):
+        runs = self.abba((1000.0, 1010.0), (935.0, 940.0), cgemm=(1030.0, 1030.0))   # GEMMs +3 %
+        self.assertEqual(self.gate(runs, "--guard-others", "2").returncode, 1)
+        r = self.gate(runs, "--guard-others", "2", "--noise-floor", self.floor_file({"GEMMs": 4.0}))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_noise_floor_refuses_what_it_cannot_place(self):
+        # a key that names no lane (a typo) or several, or a value that is not a number >= 0, must not pass silently: exit 2
+        runs = self.abba((1000.0, 1010.0), (935.0, 940.0))
+        for table in ({"prefill: atention": 4.2}, {"GDN": 1.0}, {"prefill: attention": "4.2"}, {"prefill: attention": -1},
+                      {"prefill: attention": True}, ["prefill: attention", 4.2], "{not json"):
+            r = self.gate(runs, "--noise-floor", self.floor_file(table))
+            self.assertEqual(r.returncode, 2, f"{table!r}: {r.stdout + r.stderr}")
+            self.assertNotIn("LANE GATE:", r.stdout)
+
     def test_lane_must_match_once(self):
         runs = self.abba((1000.0, 1010.0), (935.0, 940.0))
         for lane in ("GDN", "no such lane"):   # GDN names a decode and a prefill lane

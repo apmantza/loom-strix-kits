@@ -7,7 +7,7 @@ size). Dispatches go to the first lane whose regex matches the kernel name (MODE
 distinct submissions that ran the verify-attention lane. Several RUNs print side by side (an ABBA's four runs).
 
 usage: events_summary.py MODEL.json RUN [RUN ...] [--top 12] [--split KERNEL[:CUT_MS]] [--device DEV.json [--profile P]]
-         [--gate LANE --ref I,J --cand K,L [--min-drop-pct P] [--guard-others PCT] [--expect-kernel REGEX]]
+         [--gate LANE --ref I,J --cand K,L [--min-drop-pct P] [--guard-others PCT] [--expect-kernel REGEX] [--noise-floor FILE.json]]
   --device: floors at a device file's power profile (common/devices/<gfx>.json; ceiling.py), not MODEL.json's hardware.
   --split prints a kernel's dispatch-time clusters (E143: vsplit's aligned 1.62 ms vs straddling 3.01 ms) per run: below
   and above CUT_MS (default: midway between the run's 10th and 90th percentile), count and median each.
@@ -22,6 +22,9 @@ usage: events_summary.py MODEL.json RUN [RUN ...] [--top 12] [--split KERNEL[:CU
   --no-slower PCT: for a change whose goal is 'not slower' (a correctness fix, an exact layout change; HRX-like E466: q179's NaN fix
   tied +0.20 % inside 0.38 % noise and the speed gate stopped it): the targeted lane passes unless it rose by more than
   max(noise, PCT). The guards on the other lanes and --expect-kernel apply as before.
+  --noise-floor FILE.json: a per-lane noise floor in %, {"LANE substring": PCT, ...} (each key names exactly one lane, else
+  exit 2): a lane's noise is max(its spread, its floor). Two runs per arm understate a lane's start-to-start spread (HRX-like
+  E485: flash2 4.2 % over 8 starts where one ABBA read 3.19 %); measure the floors with an A/A over several starts. Default: none.
 """
 import argparse
 import glob
@@ -158,6 +161,28 @@ def spread(xs):
     return (max(xs) - min(xs)) / m * 100 if m > 0 else float("nan")
 
 
+def noise_floors(path, names):
+    """--noise-floor: {lane index: floor %} from {"LANE substring": PCT}; None (with a message) when the file is unreadable or
+    a key does not name exactly one lane or a value is not a number >= 0: a floor that matches nothing must not pass silently"""
+    try:
+        raw = json.load(open(path))
+    except (OSError, ValueError) as e:
+        print(f"events_summary: --noise-floor {path}: {e}", file=sys.stderr)
+        return None
+    if not isinstance(raw, dict):
+        print(f"events_summary: --noise-floor {path}: want an object {{lane substring: pct}}", file=sys.stderr)
+        return None
+    out = {}
+    for key, v in raw.items():
+        hits = [i for i, n in enumerate(names) if key in n]
+        if len(hits) != 1 or isinstance(v, bool) or not isinstance(v, (int, float)) or not v >= 0:
+            print(f"events_summary: --noise-floor {path}: {key!r}: {v!r} (matches {len(hits)} lanes; want one lane and a number >= 0)",
+                  file=sys.stderr)
+            return None
+        out[hits[0]] = float(v)
+    return out
+
+
 def lane_gate(a, d, res):
     """One-sided lane gate (see the module doc): returns the exit code, 0 = PASS-TO-BENCH, 1 = STOP."""
     names = [ln["lane"] for ln in d["lanes"]]
@@ -178,6 +203,9 @@ def lane_gate(a, d, res):
               file=sys.stderr)
         return 2
     gi = hits[0]
+    floors = noise_floors(a.noise_floor, names) if a.noise_floor else {}
+    if floors is None:
+        return 2
     stops = []
     print(f"\nlane gate: reference {', '.join(res[i][0] for i in ref)}; candidate {', '.join(res[i][0] for i in cand)}")
     print("| lane | reference mean | candidate mean | change | noise |")
@@ -188,12 +216,15 @@ def lane_gate(a, d, res):
         unit = res[0][5][i][3]
         rm, cm = st.mean(rv), st.mean(cv)
         noise = max(spread(rv), spread(cv))
+        floored = i in floors and floors[i] > noise   # False for an unmeasured lane (nan): it stays unmeasured
+        if floored:
+            noise = floors[i]
         # refused, not passed: an unmeasured lane (nan != nan), or a lane missing from a run (a renamed kernel fell into
         # another lane: its 'drop' would be 100 %)
         ok = rm > 0 and noise == noise and cm == cm and all(res[j][5][i][1] for j in ref + cand)
         chg = (cm - rm) / rm * 100 if ok else float("nan")
         mark = " (gated)" if i == gi else ""
-        print(f"| {name}{mark} | {rm:.3f} {unit} | {cm:.3f} {unit} | {chg:+.2f} % | {noise:.2f} % |")
+        print(f"| {name}{mark} | {rm:.3f} {unit} | {cm:.3f} {unit} | {chg:+.2f} % | {noise:.2f} %{' (floor)' if floored else ''} |")
         if i == gi:
             bar = max(noise, a.min_drop_pct) if ok else float("nan")
             if not ok:
@@ -253,6 +284,7 @@ def main():
     ap.add_argument("--guard-others", type=float, help="--gate: stop when another lane rises by more than max(noise, this %%)")
     ap.add_argument("--no-slower", type=float, help="--gate: pass unless the targeted lane rose by more than max(noise, this %%) (a fix)")
     ap.add_argument("--expect-kernel", help="--gate: stop unless a candidate-only kernel name matches this regex")
+    ap.add_argument("--noise-floor", help="--gate: JSON {lane substring: pct}: each lane's noise is at least its floor")
     a = ap.parse_args()
     d = json.load(open(a.model))
     d["hardware"] = hardware(d, a.device, a.profile)   # MODEL.json's block unless --device
