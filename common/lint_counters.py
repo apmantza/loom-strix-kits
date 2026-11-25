@@ -622,10 +622,10 @@ def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname):
         rest = [x for x in lv if x["phase"] == ph and not x["floored"]]
         nofl = [x for x in rest if heads[x["lane"]]["floor_ms"] is not None]
         out += [f"    {ph}: no floor: upper bound = whole kernel time (or the pattern price when smaller); unranked, not screened; "
-                f"top {top} of {len(nofl)}"] + [row("-", x, "no floor: not screened") for x in nofl[:top]]
+                f"{min(top, len(nofl))} of {len(nofl)} shown"] + [row("-", x, "no floor: not screened") for x in nofl[:top]]
         unk = [x for x in rest if heads[x["lane"]]["floor_ms"] is None]
         if unk:
-            out += [f"    {ph}: floor unknown (see the lane table): not ranked, not screened; top {top} of {len(unk)}"] + \
+            out += [f"    {ph}: floor unknown (see the lane table): not ranked, not screened; {min(top, len(unk))} of {len(unk)} shown"] + \
                 [row("-", x, "floor unknown: not screened") for x in unk[:top]]
     ms = collections.Counter()
     for (k, _), r in srv.items():
