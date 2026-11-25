@@ -15,10 +15,10 @@ scratch (private segment) and LDS (group segment) from the code object's metadat
 proxy). _rdna4 variants are skipped (not served on gfx1151; kernel_lint does the same).
 
 Verdicts per kernel: same (closure identical), text-only (closure changed, code identical), CHANGED, NEW, MISSING, ERROR.
-Exit 1 (BINARY GATE: FAIL) on: a CHANGED or NEW kernel no --allow pattern matches; a MISSING kernel; scratch > 0 in a compiled
-candidate kernel whose base had none (or that is new); an ERROR (a kernel that does not compile: fail closed); an --allow
+Exit 1 (BINARY GATE: FAIL) on: a CHANGED or NEW kernel no --allow pattern matches; a MISSING kernel no --allow-missing pattern matches; scratch > 0 in a compiled
+candidate kernel whose base had none (or that is new); an --allow-missing pattern that matches no MISSING kernel; an ERROR (a kernel that does not compile: fail closed); an --allow
 pattern that matches no CHANGED / NEW kernel. Exit 2 on usage errors.
-usage: binary_gate.py BASE_PKG CAND_PKG [--allow REGEX ...] [--all] [--out DIR] [--jobs N] [--json FILE] [--loom-compile PATH]
+usage: binary_gate.py BASE_PKG CAND_PKG [--allow REGEX ...] [--allow-missing REGEX ...] [--all] [--out DIR] [--jobs N] [--json FILE] [--loom-compile PATH]
        (a PKG is a package dir with program/*.loom, or one .loom file)"""
 import argparse
 import concurrent.futures
@@ -138,9 +138,10 @@ def measure(lc, prog, k, out, report=False):
 METRICS = ("isa", "vgpr", "sgpr", "scratch", "lds")
 
 
-def judge(base, cand, measured, allow):
+def judge(base, cand, measured, allow, allow_missing=()):
     """the verdict rows and the failures. BASE / CAND: kernel -> (file, fingerprint); MEASURED: (side, kernel) -> metrics for
-    the kernels compiled; ALLOW: regexes. Pure: the tests drive it with synthetic metrics."""
+    the kernels compiled; ALLOW: regexes; ALLOW_MISSING: regexes of kernels the candidate may drop (each must match a dropped
+    kernel). Pure: the tests drive it with synthetic metrics."""
     rows, fails = [], []
     for k in sorted(set(base) | set(cand)):
         b, c = measured.get(("base", k)), measured.get(("cand", k))
@@ -158,7 +159,7 @@ def judge(base, cand, measured, allow):
         why = []
         if v == "CHANGED" and base[k][1] == cand[k][1]:
             why.append("source closure identical but the code differs (--all): the text proxy is unsound or the compiler nondeterministic")
-        if v == "MISSING":
+        if v == "MISSING" and not any(re.search(a, k) for a in allow_missing):
             why.append("missing in the candidate")
         if v in ("CHANGED", "NEW") and not allowed:
             why.append(f"{v.lower()} and no --allow matches")
@@ -171,10 +172,13 @@ def judge(base, cand, measured, allow):
     for a in allow:
         if not any(r["verdict"] in ("CHANGED", "NEW") and re.search(a, r["kernel"]) for r in rows):
             fails.append(f"--allow {a!r} matched no changed kernel: the switch did not apply")
+    for a in allow_missing:
+        if not any(r["verdict"] == "MISSING" and re.search(a, r["kernel"]) for r in rows):
+            fails.append(f"--allow-missing {a!r} matched no missing kernel")
     return rows, fails
 
 
-def gate(base_pkg, cand_pkg, allow, out, jobs=2, all_=False, lc=None):
+def gate(base_pkg, cand_pkg, allow, out, jobs=2, all_=False, lc=None, allow_missing=()):
     """parse both packages, compile what the closures cannot clear, judge; returns (rows, failures, compiles)"""
     if lc is None:
         from kernel_lint import loom_compile
@@ -190,7 +194,7 @@ def gate(base_pkg, cand_pkg, allow, out, jobs=2, all_=False, lc=None):
     with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
         res = list(ex.map(lambda w: measure(lc, w[2], w[1], os.path.join(out, w[0])), work))
     measured = {(w[0], w[1]): r for w, r in zip(work, res)}
-    rows, fails = judge(base, cand, measured, allow)
+    rows, fails = judge(base, cand, measured, allow, allow_missing)
     return rows, fails, len(work)
 
 
@@ -199,19 +203,21 @@ def main():
     ap.add_argument("base")
     ap.add_argument("cand")
     ap.add_argument("--allow", action="append", default=[], help="regex of kernels the switch may change (repeatable; each must match a change)")
+    ap.add_argument("--allow-missing", action="append", default=[], help="regex of kernels the candidate may drop (a model or drafter "
+                    "change removes the kernels only it called; repeatable; each must match a missing kernel)")
     ap.add_argument("--all", action="store_true", help="compile every kernel, not only those whose source closure changed")
     ap.add_argument("--out", help="where the code objects go (default: a temporary dir)")
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--json", help="write the rows here")
     ap.add_argument("--loom-compile", help="the compiler (default: the machine's VENV)")
     a = ap.parse_args()
-    for x in a.allow:
+    for x in a.allow + a.allow_missing:
         try:
             re.compile(x)
         except re.error as e:
             ap.error(f"--allow {x!r}: {e}")
     tmp = None if a.out else tempfile.TemporaryDirectory(prefix="binary_gate.")
-    rows, fails, n = gate(a.base, a.cand, a.allow, a.out or tmp.name, a.jobs, a.all, a.loom_compile)
+    rows, fails, n = gate(a.base, a.cand, a.allow, a.out or tmp.name, a.jobs, a.all, a.loom_compile, a.allow_missing)
     counts = {}
     for r in rows:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1

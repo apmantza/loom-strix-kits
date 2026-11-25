@@ -105,6 +105,15 @@ def main():
     ok(not fl, f"scratch the base already had is not new ({fl})")
     rows, fl = bg.judge({}, {"n": ("f", "a")}, {("cand", "n"): dict(m0, scratch=16)}, ["^n$"])
     ok(any("new scratch 16" in f for f in fl), f"a new kernel with scratch fails ({fl})")
+    # --allow-missing (HRX-like q199: a drafter of another shape drops the z-lab drafter's k4096 matvecs, called only by
+    # llm_dflash_propose): a declared removal passes, an undeclared one still fails, a declaration that matches nothing fails
+    base2 = {"keep": ("f", "a"), "gone": ("f", "a"), "other": ("f", "a")}
+    rows, fl = bg.judge(base2, {"keep": ("f", "a")}, {}, [], ["^gone$"])
+    ok(any("other: missing" in f for f in fl) and not any(f.startswith("gone:") for f in fl), f"declared missing passes, undeclared fails ({fl})")
+    rows, fl = bg.judge(base2, {"keep": ("f", "a"), "other": ("f", "a")}, {}, [], ["^gone$"])
+    ok(not fl, f"only the declared kernel missing: pass ({fl})")
+    rows, fl = bg.judge(base2, dict(base2), {}, [], ["^gone$"])
+    ok(any("--allow-missing" in f for f in fl), f"a declaration matching no missing kernel fails closed ({fl})")
     sys.exit(1 if fails else 0)
 
 
