@@ -1,0 +1,68 @@
+{
+ "finding_count": 4,
+ "findings": [
+  {
+   "action": "Reduce amdgpu.vgpr by at least 24 registers/subgroup (to at most 216) and amdgpu.lds by at least 18,944 bytes/workgroup (to at most 43,008) together; reducing only one leaves another limiter. Recompile and benchmark the modeled transition 6 -> 7 subgroups/SIMD; higher modeled residency is not a throughput guarantee.",
+   "confidence": "high",
+   "entry": "g_attention_flash2_f16o",
+   "evidence": {
+    "entries.rows[0].target_resources.residency.current_tier": 6,
+    "entries.rows[0].target_resources.residency.next_better_tier": 7,
+    "residency_constraints.rows[1].allocation_scope": "subgroup",
+    "residency_constraints.rows[1].name": "amdgpu.vgpr",
+    "residency_constraints.rows[1].reduction_units_to_next_better_tier": 24,
+    "residency_constraints.rows[1].unit": "registers",
+    "residency_constraints.rows[1].units": 240,
+    "residency_constraints.rows[2].allocation_scope": "workgroup",
+    "residency_constraints.rows[2].name": "amdgpu.lds",
+    "residency_constraints.rows[2].reduction_units_to_next_better_tier": 18944,
+    "residency_constraints.rows[2].unit": "bytes",
+    "residency_constraints.rows[2].units": 61952
+   },
+   "id": "amdgpu.residency_cliff",
+   "variant": "amdgpu.lds + amdgpu.vgpr"
+  },
+  {
+   "action": "WARNING: source_to_low: up to 63 Low operations per source operation. Capture --compile-report=details to identify the source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "<report>",
+   "evidence": {
+    "source_low.unkeyed_maximum_emitted_op_count": 63
+   },
+   "id": "lowering.reduce_expansion",
+   "match_count": 19,
+   "variant": "source_to_low"
+  },
+  {
+   "action": "WARNING: math_legalization: up to 8 source IR operations per source operation. Capture --compile-report=details to identify the source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "<report>",
+   "evidence": {
+    "math_legalization.maximum_created_op_count": 8
+   },
+   "id": "lowering.reduce_expansion",
+   "variant": "math_legalization"
+  },
+  {
+   "action": "WARNING: target_legalization: up to 17 source IR operations per source operation. Capture --compile-report=details to identify the source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "<report>",
+   "evidence": {
+    "target_legalization.maximum_created_op_count": 17
+   },
+   "id": "lowering.reduce_expansion",
+   "variant": "target_legalization"
+  }
+ ],
+ "guidance": "Static compiler findings describe the program. Finding order and confidence do not rank performance benefit. For a port, establish the oracle's native instruction mix, intended-machine performance, and data reuse policy. For a novel kernel, count compulsory bytes and useful operations and measure matched primitives on the intended partition. Bound the end-to-end opportunity. An unexplained large oracle gap stops local tuning.",
+ "kind": "loom.compile_report.suggest",
+ "match_count": 22,
+ "provider": "source+amdgpu",
+ "schema_version": 0,
+ "source": "g_attention_flash2_f16o.report.json",
+ "status": "available",
+ "target": {
+  "family": "amdgpu",
+  "key": "gfx1151"
+ }
+}

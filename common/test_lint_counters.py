@@ -401,6 +401,42 @@ def main():
         ok("placement caveat" in sec(verdicts, noise).split("(d2)")[1], "(d2)'s header says what 'bound' means there", "")
         ma = [x for x in txt.splitlines() if x.startswith("g_mv_a ")]
         ok(ma and "35.0 %" in ma[0], "occupancy lever shows the latency-wait share (vmem 30 + lgkm 5)", ma)
+        # Loom suggest beside the ranking (C6): Loom 0.2.0 named flash2_f16o's next tier 7 and the GEMMs' 5 (E533); relayed as
+        # advice they read as levers the hardware cannot seat. The cell and the (d2) line carry occupancy()'s verdict on them.
+        import loom_suggest as ls
+        fx = os.path.join(H, "..", "kit", "fixtures", "loom_suggest")
+        sres = ls.parse(open(os.path.join(fx, "g_attention_flash2_f16o.suggest.json")).read())
+        sug = {}
+        for k in ("g_fl", "g_gemm_a"):
+            cell, lines = ls.describe(sres, lc.occupancy(lint[k]["_occ"], 4), True)
+            sug[k] = {"res": sres, "cell": cell, "lines": lines, "notes": ls.notes(sres)}
+        sug["g_mv_a"] = {"res": {"error": "unknown (loom-compile-report suggest rc 2)"}, "cell": "unknown (loom-compile-report suggest rc 2)",
+                         "lines": ["unknown (loom-compile-report suggest rc 2)"], "notes": ["loom:unknown"]}
+        full = "\n".join(lc.section_d(lv, heads, verdicts, noise, lint, srv, wl, 10, "fixture hw", 4, sug))
+        rk = [x for x in full.split("(d2)")[0].splitlines() if " g_fl " in x and "| " in x]
+        ok(rk and rk[0].rstrip().endswith("| cliff 6->7 phantom (E533); expand x21"), "(d) row: Loom's cell, the phantom tier labelled", rk)
+        rm = [x for x in full.split("(d2)")[0].splitlines() if " g_mv_a " in x]
+        ok(rm and all(x.rstrip().endswith("| unknown (loom-compile-report suggest rc 2)") for x in rm), "(d) row: a failed suggest is 'unknown', not blank", rm)
+        rb_ = [x for x in full.split("(d2)")[0].splitlines() if " g_mv_b " in x]
+        ok(rb_ and all(x.rstrip().endswith("| no compile report") for x in rb_), "(d) row: a kernel suggest did not cover says so", rb_)
+        d2 = full.split("(d2)")[1]
+        f2 = [x for x in d2.splitlines() if x.startswith("g_fl ")]
+        ok(f2 and "tier 6 -> 9" in f2[0] and "Loom suggest residency cliff: Loom next tier 7: phantom (E533)" in f2[0],
+           "(d2): Loom's tier 7 beside the reachable 9, as phantom", f2)
+        g2 = [x for x in d2.splitlines() if x.startswith("g_gemm_a ")]
+        ok(g2 and "at the best reachable tier" in g2[0] and "phantom (E533)" in g2[0],
+           "(d2): a kernel at its best tier is listed when Loom names a cliff (phantom), not skipped", g2)
+        ok(full.split("(d2)")[0].count(ls.ADVICE) == 1, "(d) header labels suggest as advice, not a measurement", "")
+        ok(all(x.rstrip().endswith("| not run (--no-suggest)") for x in sec(verdicts, noise).split("(d2)")[0].splitlines() if " g_fl " in x and "|" in x),
+           "without a survey: 'not run', never blank", "")
+        # review r1 F4: a best-tier kernel whose suggest run failed is listed as 'unknown' in (d2), not skipped as 'no cliff'; the
+        # (d) header carries the survey's summary line
+        sug["g_gemm_a"] = sug["g_mv_a"]
+        full = "\n".join(lc.section_d(lv, heads, verdicts, noise, lint, srv, wl, 10, "fixture hw", 4, sug, "loom suggest (t, v): 2 of 4 runs unknown"))
+        g2 = [x for x in full.split("(d2)")[1].splitlines() if x.startswith("g_gemm_a ")]
+        ok(g2 and "at the best reachable tier" in g2[0] and "Loom suggest unknown (loom-compile-report suggest rc 2)" in g2[0],
+           "(d2): a failed suggest on a best-tier kernel says 'unknown', not silence", g2)
+        ok("    loom suggest (t, v): 2 of 4 runs unknown" in full.split("(d) decode")[0], "(d) header: the survey's summary line", "")
         wps = lc.load_workloads([workload(os.path.join(t, "wps"), hs, kernel="g_mv_a", level="profile_standard",
                                           wait={"vmem": 30, "lgkm": 5})], codes)
         ok(lc.latency_wait(wps, "g_mv_a").startswith("unknown"), "load waits at profile_standard are not the served latency (q171: 16 vs 75 %)",

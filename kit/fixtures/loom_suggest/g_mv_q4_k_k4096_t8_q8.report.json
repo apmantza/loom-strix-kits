@@ -1,0 +1,98 @@
+{
+ "residency_constraints": {
+  "count": 4,
+  "rows": [
+   {
+    "allocation_granularity": 128,
+    "allocation_scope": "subgroup",
+    "function": "g_mv_q4_k_k4096_t8_q8",
+    "independent_tier": 16,
+    "index": 0,
+    "kind": "unconstrained_resource",
+    "limiting": false,
+    "name": "amdgpu.sgpr",
+    "pool_scope": "SIMD",
+    "pool_units": 2048,
+    "rounded_units": 128,
+    "unit": "registers",
+    "units": 28
+   },
+   {
+    "allocation_granularity": 24,
+    "allocation_scope": "subgroup",
+    "function": "g_mv_q4_k_k4096_t8_q8",
+    "independent_tier": 12,
+    "index": 1,
+    "kind": "pooled_resource",
+    "limiting": true,
+    "name": "amdgpu.vgpr",
+    "pool_scope": "SIMD",
+    "pool_units": 1536,
+    "reduction_units_to_next_better_tier": 16,
+    "rounded_units": 120,
+    "unit": "registers",
+    "units": 112
+   },
+   {
+    "allocation_granularity": 1024,
+    "allocation_scope": "workgroup",
+    "function": "g_mv_q4_k_k4096_t8_q8",
+    "independent_tier": 16,
+    "index": 2,
+    "kind": "pooled_resource",
+    "limiting": false,
+    "name": "amdgpu.lds",
+    "pool_scope": "occupancy domain",
+    "pool_units": 131072,
+    "rounded_units": 2048,
+    "unit": "bytes",
+    "units": 2048
+   },
+   {
+    "function": "g_mv_q4_k_k4096_t8_q8",
+    "independent_tier": 16,
+    "index": 3,
+    "kind": "fixed_limit",
+    "limiting": false,
+    "name": "amdgpu.workgroup_slots"
+   }
+  ]
+ },
+ "target_key": "gfx1151",
+ "target_resources": {
+  "limiting_resource": "amdgpu.vgpr",
+  "max_subgroups_per_simd": 16,
+  "residency": {
+   "best_tier": 16,
+   "current_tier": 12,
+   "launchable": true,
+   "limiting_resource_count": 1,
+   "next_better_tier": 16,
+   "required_tier": 1,
+   "unique_limiting_resource": {
+    "name": "amdgpu.vgpr",
+    "next_worse": {
+     "additional_units": 9,
+     "cliff_units": 121,
+     "tier": 10
+    },
+    "reduction_units_to_next_better_tier": 16,
+    "units": 112
+   }
+  },
+  "subgroup_size": 32,
+  "vector": {
+   "final": {
+    "register_count": 112
+   }
+  }
+ },
+ "workload": {
+  "workgroup_size": {
+   "flat": 128,
+   "x": 128,
+   "y": 1,
+   "z": 1
+  }
+ }
+}

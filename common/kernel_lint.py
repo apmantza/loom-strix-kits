@@ -414,6 +414,12 @@ def residency(js):
         tier_state(occ, device_simds(occ["target"]))
 
 
+def suggest_occ(js):
+    """occupancy() of the compile report JS, the SIMD count from its target's device file: loom_suggest.survey's occ_of"""
+    occ = occ_inputs(json.load(open(js)))
+    return occupancy(occ, device_simds(occ["target"]))
+
+
 def tier_text(o, key="tier"):
     """a tier for print: the integer, plus ' bound' where the workgroup's waves are not a multiple of the SIMDs (placement unknown)"""
     return "-" if not o or o.get(key) is None else f"{o[key]}{' bound' if o.get('bound') else ''}"
@@ -1434,6 +1440,10 @@ def main():
     ap.add_argument("--barriers", action="store_true", help="print every barrier of every analysed kernel with the hazard pairs it "
                     "orders and the potential races (computed only then), not only the kernels with a barrier that orders nothing or "
                     "that the check could not model")
+    ap.add_argument("--suggest", action="store_true", help="run `loom-compile-report suggest` (common/loom_suggest.py) on each kernel's "
+                    "compile report: its findings as loom:<id> notes (never flags) and one 'loom KERNEL:' line per finding kind; a failed "
+                    "run is a printed 'unknown (...)' and the table stays complete")
+    ap.add_argument("--suggest-tool", help="with --suggest: the loom-compile-report (default: loom_suggest.tool())")
     ap.add_argument("--livereg", action="store_true", help="RGA's live VGPRs per instruction (rga -s bin --livereg): the 'live' "
                     "column peak/floor/over and a line per kernel whose loop floor exceeds the next tier's VGPR budget")
     ap.add_argument("--rga", help="with --livereg: the rga binary (default: RGA from the environment or the machine env file)")
@@ -1478,6 +1488,20 @@ def main():
             b = os.path.join(a.baseline, r["kernel"] + ".hsaco")
             if os.path.exists(b):
                 r["flags"] += ["regress:" + x for x in regressions(r, lint(b))]
+    loom_lines = []
+    if a.suggest:
+        import loom_suggest
+        reps = {}
+        for f in files:
+            if f.endswith(".hsaco"):
+                reps[os.path.basename(f)[:-6]] = f[:-6] + ".json"
+        st = loom_suggest.tool(a.suggest_tool)
+        sug = loom_suggest.survey({r["kernel"]: reps.get(r["kernel"], "") for r in rows}, st, suggest_occ, a.jobs)
+        loom_sum = loom_suggest.summary(sug, st)
+        for r in rows:
+            x = sug[r["kernel"]]
+            r.setdefault("notes", []).extend(n for n in x["notes"] if n not in r["notes"])
+            loom_lines += [f"loom {r['kernel']}: {ln}" for ln in x["lines"] if ln != "no findings"]
     rows.sort(key=lambda r: (-bool(r["flags"]), -ms.get(r["kernel"], 0), -len(r["flags"]), -(sites or {}).get(r["kernel"], 0), r["kernel"]))
     print(f"{'kernel':42s} {'where':>6s} {'loop':>5s} {'comm':>5s} {'mm':>4s} {'other/op':>8s} {'sel':>4s} {'pk':>3s} {'bfe':>4s} {'scr':>4s} {'mov':>4s} "
           f"{'run':>4s} {'vgpr':>4s} {'w/S':>8s} {'next':>16s} {'live':>11s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
@@ -1491,6 +1515,10 @@ def main():
               f"{f(r['lds_waits_per_op']):>5s} {f(r['cover_min']):>4s} {r['in_flight']:3d} {f(r.get('bank_extra')):>5s} "
               f"{('%.1f' % ms[r['kernel']]) if r['kernel'] in ms else '-':>8s}  "
               f"{' '.join(r['flags'])}{('  [' + ' '.join(r['notes']) + ']') if r.get('notes') else ''}")
+    if a.suggest:
+        print(loom_suggest.ADVICE + ":")
+        print("\n".join(sorted(loom_lines)))
+        print(loom_sum)
     for r in sorted(rows, key=lambda r: r["kernel"]):
         x = r.get("live")
         if x and "error" in x:

@@ -1,0 +1,66 @@
+{
+ "finding_count": 3,
+ "findings": [
+  {
+   "action": "Reduce amdgpu.lds by at least 12,320 bytes/workgroup (to at most 43,008). Recompile and benchmark the modeled transition 4 -> 5 subgroups/SIMD; higher modeled residency is not a throughput guarantee.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "entries.rows[0].target_resources.residency.current_tier": 4,
+    "entries.rows[0].target_resources.residency.next_better_tier": 5,
+    "residency_constraints.rows[2].allocation_scope": "workgroup",
+    "residency_constraints.rows[2].name": "amdgpu.lds",
+    "residency_constraints.rows[2].reduction_units_to_next_better_tier": 12320,
+    "residency_constraints.rows[2].unit": "bytes",
+    "residency_constraints.rows[2].units": 55328
+   },
+   "id": "amdgpu.residency_cliff",
+   "variant": "amdgpu.lds"
+  },
+  {
+   "action": "Test a pitch or padding change for vector.store/x_stage/amdgpu.ds_write_b128: 4/12 proven instruction sites conflict, needing 96 service rounds versus 48 uncontended (2.00x; 48 extra). These are static counts, not cycles or a runtime ranking. Update producer and consumer views together and recheck the current 16 B/lane instruction width. LDS is 55,328 B/workgroup; with launch and other resources fixed, up to 10,208 B of growth stays below the recorded 4 -> 2 subgroups/SIMD cliff at 65,537 B. Recompile, compare all access directions, check spill or occupancy regressions, and select only from hardware timing.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "entries.rows[0].target_resources.residency.current_tier": 4,
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.name": "amdgpu.lds",
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.next_worse.additional_units": 10209,
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.next_worse.cliff_units": 65537,
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.next_worse.tier": 2,
+    "entries.rows[0].target_resources.residency.unique_limiting_resource.units": 55328,
+    "source_low.memory.bank_service_groups[0].model.evidence": "silicon-calibrated-vendor-model",
+    "source_low.memory.bank_service_groups[0].model.packet_bytes": 16,
+    "source_low.memory.bank_service_groups[0].model.revision": "AMD:CK-LDS-2025-07-25;ROCm-guide-7.2.3:6.3.3",
+    "source_low.memory.bank_service_groups[0].summary.exact_packet_count": 12,
+    "source_low.memory.bank_service_groups[0].summary.structural.conflicted_packet_count": 4,
+    "source_low.memory.bank_service_groups[0].summary.structural.extra_round_count": 48,
+    "source_low.memory.bank_service_groups[0].summary.structural.maximum_request_multiplicity": 4,
+    "source_low.memory.bank_service_groups[0].summary.structural.required_round_count": 96,
+    "source_low.memory.bank_service_groups[0].summary.structural.uncontended_round_count": 48
+   },
+   "id": "amdgpu.lds_bank_service"
+  },
+  {
+   "action": "WARNING: g_gemm_f16_acc_m256 vector.fragment.store: up to 56 Low operations per source operation. Inspect this lowering for a compact native or vector implementation that preserves the source semantics. Fast-math flags alone do not prove a cheaper realization. Check final instructions, registers and measured runtime; these stage-local counts are not cumulative costs.",
+   "confidence": "high",
+   "entry": "g_gemm_f16_acc_m256",
+   "evidence": {
+    "source_low.rows[251].emitted_low_op_count": 56
+   },
+   "id": "lowering.reduce_expansion",
+   "match_count": 101,
+   "variant": "source_to_low"
+  }
+ ],
+ "guidance": "Static compiler findings describe the program. Finding order and confidence do not rank performance benefit. For a port, establish the oracle's native instruction mix, intended-machine performance, and data reuse policy. For a novel kernel, count compulsory bytes and useful operations and measure matched primitives on the intended partition. Bound the end-to-end opportunity. An unexplained large oracle gap stops local tuning.",
+ "kind": "loom.compile_report.suggest",
+ "match_count": 103,
+ "provider": "source+amdgpu",
+ "schema_version": 0,
+ "source": "g_gemm_f16_acc_m256.report.json",
+ "status": "available",
+ "target": {
+  "family": "amdgpu",
+  "key": "gfx1151"
+ }
+}

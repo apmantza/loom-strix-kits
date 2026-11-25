@@ -68,8 +68,12 @@ noise floors' false-pass sweep is still owed (kit NOTES.md): 'clears the screen'
 occupancy levers unpriced (rules 1: occupancy is latency hiding, not a throughput model): every resource the compile report's
 residency_constraints mark limiting with its reduction to the next tier (flash2 is held by VGPR and LDS at once: both must
 move), beside the kernel's load-counter wait share at the served level.
+Loom's advisor (C6): each ranked lever's row ends with `loom-compile-report suggest`'s findings for its kernel (common/loom_suggest.py,
+one run per served report; --suggest-tool, --no-suggest), labelled advice: they never change a price. A residency_cliff is judged
+against (d2)'s whole-workgroup tier: 'agrees', 'phantom (E533)' (a tier the hardware cannot seat), 'unverified' or 'disagrees';
+(d2) prints it beside each kernel's reachable tier, and lists a kernel at its best tier when Loom still names a cliff there.
 usage: lint_counters.py --codes DIR --events RUN --lanes LANES.json [--package PKG] [--counters SPEC ...] [--device DEV.json]
-       [--jobs N] [--profile P] [--noise-floor FILE] [--top N] [--amdahl-out PATH]"""
+       [--jobs N] [--profile P] [--noise-floor FILE] [--top N] [--amdahl-out PATH] [--suggest-tool PATH | --no-suggest]"""
 import argparse
 import collections
 import concurrent.futures
@@ -87,6 +91,7 @@ sys.path.insert(0, H)
 import ceiling  # noqa: E402
 import counter_saturation  # noqa: E402
 import events_summary  # noqa: E402
+import loom_suggest  # noqa: E402
 import kernel_lint  # noqa: E402
 from kernel_lint import occ_inputs, occupancy, tier_state  # noqa: E402,F401  (the one occupancy seam; tests call lc.occupancy)
 
@@ -625,9 +630,14 @@ def screen_cell(x, verdicts, noise):
     return f"attribution clears {where}" if passes else "attribution below screen (no per-kernel floor)"
 
 
-def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname, simds):
+def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname, simds, sug=None, sug_line=None):
     """(d) as lines: the lanes against their floors, then one ranked list per phase (decode first, ranks from 1 in each) with
-    amdahl's verdict, a 'no floor' and a 'floor unknown' block after it; then (d2), the occupancy levers (unpriced)"""
+    amdahl's verdict and Loom's suggest cell (SUG: loom_suggest.survey's result; None: suggest not run), a 'no floor' and a 'floor
+    unknown' block after it; then (d2), the occupancy levers (unpriced), each with Loom's residency cliff judged against them"""
+    def loom(k):
+        if sug is None:
+            return "not run (--no-suggest)"
+        return sug[k]["cell"] if k in sug else "no compile report"
     out = [f"(d) levers per phase, ranked by bound as % of the phase's served time; bound = the kernel's attribution of its lane's",
            f"    headroom, or a counter-backed pattern price when smaller. lane floors: ceiling.lane_floor at {hwname}; headroom = lane",
            "    served - floor. attr = the kernel's share of its lane's served time x the lane's headroom: an attribution, not an upper",
@@ -636,7 +646,11 @@ def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname, sim
            "    counter-backed / counters: not backed or mixed (section b) / static only (a lint flag, no usable counters) / no evidence",
            "    (no lint flag). screen: amdahl.py, one phase per lane; 'not worth building' only for a backed price below the screen.",
            "    Not additive: amdahl's combined line counts the best lever per kernel. Only floor-backed levers are ranked and",
-           "    screened; levers in lanes without a floor (judged against 0, ceiling.py) or with an unknown floor are listed after."]
+           "    screened; levers in lanes without a floor (judged against 0, ceiling.py) or with an unknown floor are listed after.",
+           f"    loom: {loom_suggest.ADVICE}. A residency cliff reads 'agrees' only when its tier and cuts are the",
+           "    occupancy section's whole-workgroup ones; 'phantom (E533)': a tier the hardware cannot seat; 'unverified': not checkable."]
+    if sug_line:
+        out.append("    " + sug_line)
     if noise:
         out += ["    screen per lane: the kit's noise_floor.json (lanes without an entry: amdahl's default). PROVISIONAL: its false-pass",
                 "    sweep is still owed (kit NOTES.md), so a 'clears noise' verdict is provisional."]
@@ -649,9 +663,9 @@ def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname, sim
                    f"{fmt(noise[lane], '{:.2f}') if lane in noise else '-':>6s}  {h['why']}" + (f" [{h['note']}]" if h.get("note") else ""))
     f = lambda y, w=9, p=1: f"{y:{w}.{p}f}" if y is not None else f"{'-':>{w}s}"
     hdr = (f"{'#':>3s} {'bound%':>7s} {'bound ms':>9s} {'attr ms':>9s} {'price ms':>9s}  {'evidence':21s} {'screen':47s} "
-           f"{'kernel':36s} {'lever':22s} lane")
+           f"{'kernel':36s} {'lever':22s} {'lane':40s} | loom (advice)")
     row = lambda i, x, scr: (f"{i:>3s} {f(x['pct'], 7, 2)} {f(x['bound_ms'])} {f(x['attr_ms'])} {f(x['price_ms'])}  "
-                             f"{x['evidence']:21s} {scr:47s} {x['kernel']:36s} {x['lever']:22s} {x['lane']}")
+                             f"{x['evidence']:21s} {scr:47s} {x['kernel']:36s} {x['lever']:22s} {x['lane']:40s} | {loom(x['kernel'])}")
     pms = collections.Counter()
     for (_, ph), r in srv.items():
         pms[ph] += r["ms"]
@@ -679,23 +693,31 @@ def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname, sim
             "    workgroup can reach (tiers move in whole workgroups: waves per SIMD per workgroup = workgroup lanes / wave size /",
             "    SIMDs per occupancy domain; the report's own next tier is not used, HRX-like E533), every resource that must drop for it",
             "    and to what; the tier moves only when ALL of them move. Beside it the kernel's load-counter wait share at the served",
-            "    level: the latency a higher tier could hide. Every served kernel is listed except those at the best reachable tier.",
-            "    'N bound' (here and in (a)) is a placement caveat, not (d)'s attribution bound: the workgroup's waves are not a multiple",
-            "    of the SIMDs, so N = ceil(resident waves / SIMDs) is Loom's own busiest-SIMD count (occupancy.c) and the actual placement",
-            "    is not documented.",
+            "    level: the latency a higher tier could hide. Every served kernel is listed except those at the best reachable tier",
+            "    without a Loom residency cliff. 'Loom suggest' is its residency_cliff judged against this tier: advice, not a lever",
+            "    unless it agrees. 'N bound' (here and in (a)) is a placement caveat, not (d)'s attribution bound: the workgroup's waves",
+            "    are not a multiple of the SIMDs, so N = ceil(resident waves / SIMDs) is Loom's own busiest-SIMD count (occupancy.c) and",
+            "    the actual placement is not documented.",
             f"{'kernel':36s} {'ms':>9s} {'share%':>6s}  next reachable tier and what must move  | load waits"]
     for k in sorted(ms, key=lambda k: -ms[k]):
         lr = lint.get(k)
         o = occupancy(lr.get("_occ"), simds) if lr else {"why": "not linted: no compile report"}
+        sk = (sug or {}).get(k, {})
+        err = (sk.get("res") or {}).get("error")
+        cl = [err] if err and err != "no compile report" else \
+            [ln for ln in sk.get("lines", []) if ln.startswith(("residency cliff:", "unrecognised suggest finding: " + loom_suggest.CLIFF))]
+        if o is None and not cl:
+            continue                                       # the best tier (wave cap), and Loom names no cliff there
         if o is None:
-            continue                                       # the best tier (wave cap)
-        if "why" in o:
+            txt = "at the best reachable tier"
+        elif "why" in o:
             txt = (f"tier {kernel_lint.tier_text(o)}: " if "tier" in o else "") + o["why"]
         else:
             txt = (f"tier {kernel_lint.tier_text(o)}" + (f" (report: {o['report_tier']}, not whole workgroups, E533)" if o["report_tier"] != o["tier"] else "")
                    + f" -> {kernel_lint.tier_text(o, 'next')} ({o['q']} waves/SIMD per workgroup): " +
                    ", ".join(f"{n} {u} -> <= {mx} {unit} (-{cut})" for n, u, unit, mx, cut in o["needs"]) + f": needs all {len(o['needs'])}")
-        out.append(f"{k:36s} {ms[k]:9.1f} {100 * ms[k] / total:6.2f}  {txt}  | {latency_wait(workloads, k)}")
+        out.append(f"{k:36s} {ms[k]:9.1f} {100 * ms[k] / total:6.2f}  {txt}  | {latency_wait(workloads, k)}" +
+                   "".join(f"  | Loom suggest {c}" for c in cl))
     return out
 
 
@@ -727,6 +749,8 @@ def main():
     ap.add_argument("--noise-floor", help="(d): {lane substring: pct}, the kit's noise_floor.json: each lane's amdahl screen")
     ap.add_argument("--top", type=int, default=15, help="(d): levers ranked and screened per phase")
     ap.add_argument("--amdahl-out", help="(d): write amdahl's input JSON here (default: a temporary file)")
+    ap.add_argument("--suggest-tool", help="(d): loom-compile-report for Loom's suggest column (default: common/loom_suggest.tool())")
+    ap.add_argument("--no-suggest", action="store_true", help="(d): do not run loom-compile-report suggest")
     a = ap.parse_args()
     if a.top < 1:
         ap.error("--top must be >= 1")
@@ -759,7 +783,15 @@ def main():
     else:
         lines, verdicts = ["nothing screened: no floor-backed lever"], {}
     print()
-    print("\n".join(section_d(lv, heads, verdicts, noise, lint, srv, wl, a.top, hw["name"], dev.get("simds_per_occupancy_domain"))))
+    simds = dev.get("simds_per_occupancy_domain")
+    sug = None
+    if not a.no_suggest:
+        served_k = sorted({k for k, _ in srv} & set(lint))
+        st = loom_suggest.tool(a.suggest_tool)
+        sug = loom_suggest.survey({k: os.path.join(a.codes, k + ".json") for k in served_k}, st,
+                                  lambda js: occupancy(report_limit(js)[4], simds), a.jobs)
+    print("\n".join(section_d(lv, heads, verdicts, noise, lint, srv, wl, a.top, hw["name"], simds, sug,
+                               loom_suggest.summary(sug, st) if sug is not None else None)))
     print(f"\n(d3) amdahl.py on each phase's top {a.top} floor-backed levers (no-floor lanes are not sent)" + (f" ({a.amdahl_out})" if a.amdahl_out else "") +
           (f"; lanes without a noise floor use amdahl's default screen" if set(heads) - set(noise) else "") + ":")
     print("\n".join("    " + x for x in lines))
