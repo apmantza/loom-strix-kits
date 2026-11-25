@@ -88,6 +88,13 @@ def main():
     for k, e in bad.items():
         ok(len(check({k: e}, amd, {})) == 1, f"negative control {k} caught")
     ok(len(check({}, amd, {"p": ["NoSuchMetric"]})) == 1, "negative control: unknown preset metric caught")
+    # Recurrence (HRX-like T7 / E483): lint_counters prices its rules on raw SQ_WAIT_* / SQ_WAVE_CYCLES, while the presets collected
+    # only derived percentages, so q197 ran a hand-written rocprofv3 pass beside counters.sh. Every raw counter it reads must be in a preset.
+    sys.path.insert(0, H)
+    import lint_counters
+    raw = set(lint_counters.WAITS.values()) | {"SQ_WAVE_CYCLES"}
+    have = {c for v in pre.values() for c in v}
+    ok(raw <= have, f"lint_counters' raw wait counters are collected by a counters.sh preset (missing: {sorted(raw - have)})")
     sys.exit(1 if fails else 0)
 
 

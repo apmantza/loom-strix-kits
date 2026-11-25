@@ -3,7 +3,7 @@
 # Loom drives /dev/kfd itself, so profile served code objects through a HIP harness (devices/<gfx>.md), never loom-serve.
 # Presets (each one hardware pass on gfx1151, checked with rocprofv3-avail pmc-check; definitions follow AMD's, see the yaml):
 #   waits    what waves wait on: WaitVmemPct WaitLgkmPct WaitDelayAluPct WaitAnyPct + raw SQ_WAIT_* and wave cycles
-#   sync     AMD's wait-state table (rocprof-compute 7.9): WaitCntAnyPct WaitBarrierPct WaitIfetchPct WaitAnyPct
+#   sync     AMD's wait-state table (rocprof-compute 7.9): WaitCntAnyPct WaitBarrierPct WaitIfetchPct WaitAnyPct, + their raw counters (lint_counters prices on them, T7)
 #   issue    is the loop issue-bound? WaitInstAnyPct (AMD 2.1 Wave Issue Wait), WaitInstValuPct, IPC (AMD 2.1), VALU and VOPD counts
 #   bytes    MemReadBytes (size-weighted L2 -> fabric read requests = AMD GL2-Fabric Read BW x time) and GPU busy cycles
 #   l2       L2CacheHit (AMD 13.1), GL2C hits, misses, DRAM and memory-controller read requests
@@ -26,8 +26,8 @@ Y=$H/counters/$GFX.yaml; [ -f "$Y" ] || { echo "counters: no derived counters fo
 OUT=${1:?OUT_DIR}; P=${2:?PRESET}; shift 2
 declare -A PMC=(
   [waits]="WaitVmemPct WaitLgkmPct WaitDelayAluPct WaitAnyPct SQ_WAIT_CNT_VMVS SQ_WAIT_DELAY_ALU SQ_WAIT_ANY SQ_WAIT_CNT_LGKM SQ_WAIT_INST_LDS SQ_WAVE_CYCLES SQ_BUSY_CYCLES"
-  [sync]="WaitCntAnyPct WaitBarrierPct WaitIfetchPct WaitAnyPct SQ_WAVES"
-  [issue]="WaitInstAnyPct WaitInstValuPct IPC SQ_INSTS_VALU SQ_INSTS_DUAL_VALU_WAVE32"
+  [sync]="WaitCntAnyPct WaitBarrierPct WaitIfetchPct WaitAnyPct SQ_WAVES SQ_WAIT_CNT_ANY SQ_WAIT_BARRIER SQ_WAIT_IFETCH SQ_WAIT_ANY SQ_WAVE_CYCLES"
+  [issue]="WaitInstAnyPct WaitInstValuPct IPC SQ_INSTS_VALU SQ_INSTS_DUAL_VALU_WAVE32 SQ_WAIT_INST_ANY SQ_WAVE_CYCLES"
   [bytes]="MemReadBytes GRBM_GUI_ACTIVE"
   [l2]="L2CacheHit GL2C_HIT GL2C_MISS GL2C_EA_RDREQ_DRAM GL2C_MC_RDREQ GRBM_GUI_ACTIVE"
   [cache]="GL0HitPct GL1HitPct MemWriteBytes FabricReadBytes FabricWriteBytes GRBM_GUI_ACTIVE"
