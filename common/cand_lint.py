@@ -16,11 +16,13 @@ check BASE_PKG CAND_PKG --out DIR: common/binary_gate.py between the packages (i
       candidate does not is 'exposed a->b' (counts of ranks below FULL); a rank already below FULL in the base that drops further
       is 'coverR a->b' (verify r2 V2); a changed load count ('loads') or loop MMA count ('mma') cannot be paired and is a loss;
     - a new spill in the hot loop (kernel_lint scratch, 'spill') or new scratch bytes (binary_gate, 'scratch'; a NEW kernel's too).
-  Pins (--accept KERNEL:KIND:FROM->TO, comma-separated; build.sh LINT_ACCEPT): a ledger-accepted loss. A kernel passes only when
+  Pins (--accept 'KERNEL:KIND:FROM->TO' quoted, or KERNEL:KIND:FROM:TO; comma-separated; build.sh LINT_ACCEPT): a ledger-accepted loss. A kernel passes only when
   its pins equal its loss set exactly; any other or extra loss fails, a pin that does not equal its kernel's loss set fails, and a
   malformed pin (a regex, an unknown kind) is refused, exit 2 (verify r2 V1: '--accept flash2' passed E520's whole clash).
   E520: pkg-cmb-sf partial {pf kept->drain, exposed 1->4}; pkg-cmb2 partial {exposed 1->3} (E521's accepted residue, V(kt) loads
-  retired at +31 / +59): it passes with g_attention_flash2_partial:exposed:1->3,g_attention_flash2_partial_f16o:exposed:1->3.
+  retired at +31 / +59): it passes with --accept 'g_attention_flash2_partial:exposed:1->3,g_attention_flash2_partial_f16o:exposed:1->3'
+  (or the colon form g_attention_flash2_partial:exposed:1:3,...). A changed load count reports 'loads' and still compares the
+  exposed count (verify r3 A: pinning loads alone hid an exposure).
   Fail closed: a binary_gate ERROR row, a CHANGED kernel whose code objects cannot be linted (neither can be pinned). With
   --allow, binary_gate's own failures (the untouched-kernel verdict) count; without it they are printed.
   text-only kernels (closure changed, code identical: e.g. the launch grid) have nothing to lint and are printed; common/ktest.sh
@@ -51,6 +53,10 @@ CHANGED = ("CHANGED",)        # binary_gate verdicts whose kernels are linted ag
 
 
 WALK = 8   # loop copies walked: a load retired up to WALK - 1 iterations after its issue gets its exact cover
+MEASURED = re.compile(r"(global|buffer)_load_")      # the loads whose cover is measured (the prefetch)
+# every instruction that takes a vmcnt queue entry on gfx11: those loads, scratch (spill) and flat loads, atomics with return (glc,
+# or a _rtn name); an entry the walk missed would let a wait vmcnt(N) look like it retires fewer prefetch loads (verify r3 B)
+VMCNT_ENTRY = re.compile(r"(global|buffer|scratch|flat)_load_|(global|buffer|flat|scratch)_atomic\S*(_rtn\b|.*\bglc\b)")
 
 
 def prefetch_covers(ins, addr):
@@ -59,7 +65,10 @@ def prefetch_covers(ins, addr):
     back-edge into the next iterations (the next tile's prefetch is retired there), up to WALK copies of the body. vmcnt retires in
     issue order and a wait vmcnt(N) retires a load exactly when more than N loads issued at or after it are pending, which older
     loads do not change: the first iteration's covers are the steady state's (verify r2 V6; r2 measured the middle of three copies
-    and undercounted a load retired two iterations later)."""
+    and undercounted a load retired two iterations later). Spill, flat and returning-atomic entries are queued too (VMCNT_ENTRY).
+    Residuals (verify r3, conservative or not seen): the walk is linear, so a load or wait inside a branch counts as executed
+    (cover modelled smaller than real: a false positive, shared by base and candidate); an inner loop that re-issues a load inside
+    the hot body is walked once, which can model a cover larger than real (case C: constructed, no e480 hot loop has one)."""
     import kernel_lint as kl
     h = kl.hot(ins, addr)
     if h is None:
@@ -69,9 +78,10 @@ def prefetch_covers(ins, addr):
     q, out, mine = [], [], 0
     for i in range(WALK * len(body)):
         x = body[i % len(body)]
-        if re.match(r"(global|buffer)_load_", x):
-            q.append([0, i < len(body)])
-            mine += i < len(body)
+        if VMCNT_ENTRY.match(x):
+            mine_now = i < len(body) and bool(MEASURED.match(x))
+            q.append([0, mine_now])
+            mine += mine_now
         if x.startswith(kl.MM):
             for y in q:
                 y[0] += 1
@@ -131,17 +141,18 @@ def losses(gate_row, b, c):
         bm, cm = b.get("loop_mm"), c.get("loop_mm") if c.get("covers") is not None else None
         if bm != cm:
             out.append(("mma", val(bm), val(cm)))
-        if c.get("covers") is not None and len(c["covers"]) != len(b["covers"]):
+        same_n = c.get("covers") is not None and len(c["covers"]) == len(b["covers"])
+        if c.get("covers") is not None and not same_n:
             out.append(("loads", str(len(b["covers"])), str(len(c["covers"]))))
-        elif c.get("covers"):
+        if c.get("covers"):
             ne, ce, full = exposed(b, c)
             # ranks of the sorted capped covers; a rank fully covered in the base and not in the candidate is exactly a rise in the
             # exposed count (both sorted, same length), so ranks only add the decay of loads the base already exposed (verify r2 V2)
             cap = lambda v: sorted(min(x, full) for x in v)
-            for r, (x, y) in enumerate(zip(cap(b["covers"]), cap(c["covers"]))):
+            for r, (x, y) in enumerate(zip(cap(b["covers"]), cap(c["covers"])) if same_n else ()):   # ranks pair only at equal counts
                 if x < full and y < x:
                     out.append((f"cover{r}", str(x), str(y)))
-            if ce > ne:
+            if ce > ne:                       # counts need no pairing: compared at any load count (verify r3 A)
                 out.append(("exposed", str(ne), str(ce)))
     if (c.get("scratch") or 0) and not (b.get("scratch") or 0):
         out.append(("spill", val(b.get("scratch") or 0), val(c["scratch"])))   # spills share vmcnt with the prefetch
@@ -151,11 +162,12 @@ def losses(gate_row, b, c):
     return out
 
 
-PIN = re.compile(r"([A-Za-z0-9_]+):(pf|exposed|cover\d+|loads|mma|spill|scratch):([A-Za-z0-9.]+)->([A-Za-z0-9.]+)")
+PIN = re.compile(r"([A-Za-z0-9_]+):(pf|exposed|cover\d+|loads|mma|spill|scratch):([A-Za-z0-9.]+)(?:->|:)([A-Za-z0-9.]+)")
 
 
 def parse_pins(specs):
-    """KERNEL:KIND:FROM->TO pins (each SPEC may hold several, comma-separated) -> {kernel: set of (kind, from, to)}; ValueError on a
+    """KERNEL:KIND:FROM->TO or KERNEL:KIND:FROM:TO pins (the colon form needs no shell quoting; each SPEC may hold several,
+    comma-separated) -> {kernel: set of (kind, from, to)}; ValueError on a
     malformed pin (a regex, a missing part, an unknown kind): a waiver is exact or it is refused (review r2 V1)"""
     pins = {}
     for spec in specs:
@@ -165,7 +177,7 @@ def parse_pins(specs):
                 continue
             m = PIN.fullmatch(x)
             if not m:
-                raise ValueError(f"malformed pin {x!r}: want KERNEL:KIND:FROM->TO with an exact kernel name, KIND one of pf, exposed, "
+                raise ValueError(f"malformed pin {x!r}: want KERNEL:KIND:FROM->TO (quoted) or KERNEL:KIND:FROM:TO with an exact kernel name, KIND one of pf, exposed, "
                                  "coverN, loads, mma, spill, scratch")
             pins.setdefault(m.group(1), set()).add(m.group(2, 3, 4))
     return pins
@@ -356,8 +368,9 @@ def main():
     p.add_argument("switches", nargs="+")
     for x in (c, p):
         x.add_argument("--allow", action="append", default=[])
-        x.add_argument("--accept", action="append", default=[], help="check: KERNEL:KIND:FROM->TO[,...]: a loss a ledger row "
-                       "accepted (cite it); a kernel passes only when its pins equal its losses, and every pin must match. pairs: "
+        x.add_argument("--accept", action="append", default=[], help="check: KERNEL:KIND:FROM:TO[,...] or, quoted, "
+                       "'KERNEL:KIND:FROM->TO' (unquoted, the shell reads '>' as a redirection), e.g. "
+                       "--accept g_attention_flash2_partial:exposed:1:3: a loss a ledger row accepted (cite it); a kernel passes only when its pins equal its losses, and every pin must match. pairs: "
                        "refused with exit 2 (" + PAIRS_NO_PINS + ")")
         x.add_argument("--jobs", type=int, default=2)
     c.add_argument("--allow-missing", action="append", default=[])

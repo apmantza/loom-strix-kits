@@ -15,6 +15,8 @@ binary_gate-shaped rows. Recurrences it prevents:
   - verify r2 V2: an already-exposed load decaying further with the exposed count unchanged ([3, 4] -> [0, 4]);
   - verify r2 V6: the cover walk not following a load across the back-edge, or stopping before a deep pipeline's wait;
   - verify r2 V13: a NEW kernel with scratch passing;
+  - verify r3 A: a 'loads' pin hiding an exposure (the exposed count is compared at any load count); B: a spill / flat load or a
+    returning atomic missing from the vmcnt queue, so a vmcnt(1) after it looked like it kept the prefetch;
   - pairs taking pins (coordinator r3): the residue's sets pass and every other set fails on the unmatched pin, so pairs names the
     singles; pairs refuses --accept / LINT_ACCEPT and clears LINT_ACCEPT for its builds;
   - binary_gate's own failures not judged with --allow (R6); pairs taking a failed build or a missing verdict as built (R8, F8);
@@ -83,6 +85,12 @@ KINDS = {
     "lost loop": (dict(BASE, covers=None, loop_mm=None), {}, {("mma", "4", "none")}),
     "spill": (dict(BASE, scratch=2), {}, {("spill", "0", "2")}),
 }
+
+
+# verify r3 B: a spill load (or a returning atomic) issued after the prefetch load takes a vmcnt entry, so a vmcnt(1) right after
+# it retires the prefetch before the WMMAs (cover 0); a walk that does not queue it sees cover 4 and only the spill
+def queued(op):
+    return [LOAD, op, "s_waitcnt vmcnt(1)", "v_mov_b32 v50, v40"] + [WMMA] * 4
 
 
 def pin(k, ls):
@@ -176,6 +184,28 @@ def main():
             ok(False, f"V1: malformed pin {bad!r} refused")
         except ValueError:
             ok(True, f"V1: malformed pin {bad!r} refused")
+    # verify r3 A: a changed load count still compares the exposed count, so a 'loads' pin cannot hide an exposure
+    a_b, a_c = dict(BASE, covers=[4], loop_mm=4), dict(BASE, covers=[1, 4], loop_mm=4)
+    la = set(cl.losses(gate_row("k", "CHANGED"), a_b, a_c))
+    ok(la == {("loads", "1", "2"), ("exposed", "0", "1")}, f"verify r3 A: +1 load and L1 exposed 4->1 report loads and exposed ({la})")
+    ok(cl.judge([gate_row("k", "CHANGED")], {"k": a_b}, {"k": a_c}, pin("k", {("loads", "1", "2")}))[1] != [],
+       "verify r3 A: pinning k:loads:1->2 alone FAILS")
+    ok(cl.judge([gate_row("k", "CHANGED")], {"k": a_b}, {"k": a_c}, pin("k", la))[1] == [], "both losses pinned: PASS")
+    # ranks do not pair across a load-count change (the prescribed r4 rule: counts, not ranks); a pairing of sorted prefixes would
+    # report cover0 3->0 here. Consequence (residual, HANDOFF r4): an already-exposed load's decay beside an added load is visible
+    # only as 'loads 2->3', so a loads pin accepts it
+    lc = set(cl.losses(gate_row("k", "CHANGED"), dict(BASE, covers=[3, 4]), dict(BASE, covers=[0, 4, 4])))
+    ok(lc == {("loads", "2", "3")}, f"ranks pair only at equal load counts ({lc})")
+    for name, op, want in (("spill load", "scratch_load_b32 v60, off, s0 offset:16", [0]),
+                           ("flat load", "flat_load_b32 v60, v[2:3]", [0]),
+                           ("returning atomic", "global_atomic_add_u32 v60, v2, v3, s[0:1] glc", [0]),
+                           ("non-returning atomic (vscnt, not vmcnt)", "global_atomic_add_u32 v2, v3, s[0:1]", [4])):
+        r_ = row("k", queued(op))
+        ok(r_["covers"] == want, f"verify r3 B: a {name} before vmcnt(1) is {'' if want == [0] else 'not '}a vmcnt entry (covers {r_['covers']})")
+    sp = set(cl.losses(gate_row("k", "CHANGED"), kept, row("k", queued("scratch_load_b32 v60, off, s0 offset:16"))))
+    ok(("exposed", "0", "1") in sp and ("spill", "0", "1") in sp, f"verify r3 B: the spill case reports the exposure, not only the spill ({sp})")
+    ok(cl.parse_pins(["a:exposed:1:3,b:pf:kept:drain"]) == {"a": {("exposed", "1", "3")}, "b": {("pf", "kept", "drain")}},
+       "the colon form KERNEL:KIND:FROM:TO needs no shell quoting")
     import subprocess
     r = subprocess.run([sys.executable, os.path.join(HERE, "..", "common", "cand_lint.py"), "check", "/nonexistent/a", "/nonexistent/b",
                         "--out", os.devnull, "--accept", "."], capture_output=True, text=True)
