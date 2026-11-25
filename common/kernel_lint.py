@@ -70,34 +70,34 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
             count / size, a workgroup reduce, constants and kernel arguments, and arithmetic, views and plain loads of those;
             everything else (ids, lanes, shuffles, scans, fragments, mma, atomics, volatile loads, unlisted ops, a loop's values
             under a non-uniform trip count) may differ. Fire 11-25 on pkg-e480: none.
-  [rounds]  a NOTE (with --package / --program / --source: launch sites, launch configs and the package's model.json; C18, user 11-25):
-            every launch site's grid (workgroups(...) evaluated from index constants, config.get sizes and arithmetic) fits in one
-            round of resident workgroups at the reachable tier (tier_state()'s workgroups per WGP x the device file's WGPs) at the
-            largest size the package admits for each runtime key (served_sizes(): prefill_capacity for tokens in llm_advance, rows x
-            (draft_depth + 1) in llm_verify, rows for spans), with >= 2 workgroups: their traversal order cannot matter (E539: a
-            worker's study established it by hand for g_gdn_recurrence_pf, 384 one-wave workgroups at spans = 1 against 720
-            resident). Never judged at size 1 (review r1 F3). A key with no admitted size is 'size unknown', an op it does not model
-            (launcher or config), a name defined twice, an empty or shrinking grid are 'unknown'; none of them fires, and one
-            summary line names them and the kernels over one round (with their one-round bound). Fire 11-25 on pkg-e480: 4 (g_attention_flash2 and
-            g_post_add_norm_rs at verify, g_dfl_chain, g_gdn_conv_commit at spans <= rows = 4; E539's g_gdn_recurrence_pf is 3 rounds
-            at spans 4, one round only at spans 1: no note), 24 unknown, 79 size unknown, 178 over one round;
-            llama.cpp: not applicable (no Loom text).
+  [rounds]  INFORMATION, never a note (with --package / --program / --source: launch sites and launch configs; C18, user 11-25; review
+            r2 option iii): for a kernel every launch site of which fits one round of resident workgroups at size 1 (tier_state()'s
+            workgroups per WGP x the device file's WGPs), with >= 2 workgroups, one line gives the grid at size 1, the resident count
+            and the one-round bound in the size variable (tokens <= N, spans <= M; a grid of one size key, searched to ROUNDS_MAX).
+            E539 asked whether all of g_gdn_recurrence_pf's workgroups are resident at once: 'one round while spans <= 1'. No served
+            size is claimed: Loom 0.2.0 admits tokens and spans up to the prefill capacity (serve/service/text/schedule.c
+            loom_serve_text_default_shapes, serve/server/model_registration.c; the package's prepare.loom stage shapes); read the
+            bound against a served profile. An unmodelled op, a name defined twice, an arity mismatch, two size keys, an empty or a
+            shrinking grid: one summary line names the kernel ('not resolved'). Lines 11-25 on pkg-e480: 18 (g_gdn_recurrence_pf: spans <= 1;
+            g_gdn_conv_commit: spans <= 4; matvecs, norms, dflash helpers: tokens <= 3-80), 38 not resolved; llama.cpp: no Loom text.
   [guardwait] a NOTE (C18): a vmcnt wait inside a conditional block of a loop (loop_census.guarded's regions behind a forward
             s_cbranch, minus an exit test that leaves or enters a loop) that drains loads issued before the branch, untouched by the
             block and younger than every load the block needs (issued in the block, or read / written by it): vmcnt(#those) would
             have served the block. Recurrence E520: STAGE_LIVE x FLATADDR, the carried K scale's vmcnt(0) inside the K guard retired
             V(kt)'s prefetch (cover 166-203 -> 23-25); C10 catches it only against a base. Fire 11-25 (r2): pkg-cmb-sf all four flash2 kernels;
             pkg-cmb2 (E521's fix) the two partial kernels (its residue); pkg-cmb-sn / -nf and live pkg-e480 none; llama.cpp 1 of 8,374
-            (solve_tri_f32_fast: E520's shape, waits for an older load and drains a newer one; r1's 129 were 0 / 6 of that shape).
-  [vopd]    a NOTE (C18 from C5, E551; ported from C5's isa_audit.py, operands by hand: AMD's ISA XML changed no lint row): VOPD pairs a
-            greedy pass could still form from single VALU instructions as allocated (X / Y opcode lists, VOP2 form, no modifier,
-            independent, halves <= 8 apart, destinations of opposite parity, SRC0 of different parity, VSRC1 in different banks even
-            for one register, at most one literal: RDNA3 guide 7.6, gfx11.5 interlock, ROCm 10.2 llvm-mc, E580) >= VOPD_MIN in the
-            hot loop; the line adds the back-edge copy block (moves, pairs inside it) and, informational only, WMMAs whose
-            accumulator was written <= 1 WMMA earlier (D -> C latency undocumented, C5 R6a). Live flash2_f16o: 54 (186 eligible;
-            C5's 56 less the two llvm-mc refused, E580), back-edge 65 moves -> 31 pairs, dep1 16; m256 GEMM 0 of 9, dep1 0 (pinned
-            by fixtures). A wasted s_delay_alu count is not a rule (C5: zero cycles, 2.1 % ceiling at q202). Fire 11-25 on pkg-e480:
-            7 (flash2 x4, vsplit, two m256 GEMMs); llama.cpp 269 of 8,374.
+            (solve_tri_f32_fast: E520's shape, waits for an older load and drains a newer one; r1's 129 were 0 / 6 of that shape;
+            soft_max's barrier / wait / invalidate is not judged).
+  [vopd]    a NOTE (C18 from C5, E551; review r2: the oracle is Loom 0.2.0's VOPD planner, not llvm-mc): VOPD pairs a greedy pass
+            could still form from single VALU instructions as allocated, >= VOPD_MIN in the hot loop, by the planner's rules for
+            amdgpu.rdna3_5.core (vopd_eligible / vopd_registers_ok: VGPR sources only except an inline move or fmaak / fmamk's one
+            literal; destinations of opposite parity; per source-cache port both registers of opposite parity, one register in both
+            halves refused; commutable swaps where Loom's descriptors allow them), independent, halves <= 8 apart. The line adds the
+            back-edge copy block (moves, pairs inside it) and, informational only, WMMAs whose accumulator was written <= 1 WMMA
+            earlier (D -> C latency undocumented, C5 R6a). Live flash2_f16o: 35 of 129 eligible (C5's 56 / 186 counted literal and
+            SGPR sources Loom's planner never pairs), back-edge 65 moves -> 31 pairs, dep1 16; m256 GEMM 0 of 1, dep1 0 (pinned by
+            fixtures). A wasted s_delay_alu count is not a rule (C5: zero cycles, 2.1 % ceiling at q202). Fire 11-25 on pkg-e480: 7
+            (flash2 x4, vsplit, iq4_xs_store_m256, q6_k_swiglu_m256); llama.cpp 209 of 8,374 (r2: 269).
   (an 'ldswait' note, LDS loads waited right after issue, was deleted in C18's review: the ldsser lever on the same m256 GEMMs was
   refuted four times, E293 / E309 / E335 / E340, and E341 puts their WMMA phase at the hardware rate. Re-add only if E534's
   SQ_WAIT_INST_LDS / SQ_WAVE_CYCLES measurement on the m256 GEMM contradicts E341.)
@@ -144,7 +144,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from loop_census import cover, disasm, guarded, loops, moves  # noqa: E402
+from loop_census import VMCNT_ENTRY, cover, disasm, guarded, loops, moves  # noqa: E402
 
 FLAGS = ("select", "repack", "scratch", "copies", "join", "serial")
 MM = ("v_wmma", "v_dot4", "v_dot2", "v_dot8")
@@ -680,7 +680,7 @@ def ldsbank(r, js, ins):
 VOPD_MIN = 16    # VOPD pairs left unformed as allocated (whole loop) at or above which the note fires (C5 / E551 / E580: flash2 54)
 
 
-FENCE = re.compile(r"(?:global|buffer|flat|scratch)_store|s_barrier|buffer_gl\d_inv")   # memory ordering a wait may serve
+FENCE = re.compile(r"(?:global|buffer|flat)_store|s_barrier|buffer_gl\d_inv")   # memory ordering a wait may serve (no spill store)
 
 
 def guard_waits(ins, addr):
@@ -690,16 +690,17 @@ def guard_waits(ins, addr):
     loads issued before the branch, not needed, and younger than every needed one, so a wait of vmcnt(#victims) would have served the
     block. HRX-like E520: STAGE_LIVE x FLATADDR's guard waited vmcnt(0) for the older carried K scale and drained V(kt)'s newer
     prefetch (cover 166-203 -> 23-25). A wait whose newest retired load the block needs (a load issued in the block: in-order vmcnt
-    cannot spare the older ones) or that needs none (a wait before a store: its reason is not a register) is not one (review r1 F4).
-    A wait that retires no load the block needs, in a block holding a global store, a barrier or a cache invalidate, may order
-    memory (a store after a pending load, a fence) for a reason no register shows: not judged (live g_gdn_recurrence_pf / _rec:
-    vmcnt(0) before a guarded state store; llama.cpp soft_max: vmcnt(0) after s_barrier with buffer_gl0_inv); without one every
-    retired pre-branch load is a victim (pkg-cmb2's partial kernels: E521's residue). Each loop's body runs twice,
-    so loads carried over the back-edge are pending at its top. Returns [(wait index, innermost guard's branch index, victims)], one
-    per wait"""
+    cannot spare the older ones) is not one (review r1 F4).
+    A wait that retires no load the block needs, followed in the block by a global / buffer / flat store, an s_barrier or a
+    buffer_gl*_inv, may order that memory operation after the pending loads (release: wait, then store or barrier; acquire: wait,
+    then invalidate), a reason no register shows: not judged (live g_gdn_recurrence_pf / _rec: vmcnt(0) before a guarded state
+    store; llama.cpp soft_max: s_barrier, vmcnt(0), buffer_gl0_inv). A store or fence before the wait, or a spill store anywhere,
+    orders nothing the wait could serve: every retired pre-branch load is then a victim (pkg-cmb2's partial kernels, E521's residue,
+    fire with or without a spill in the block; review r2 F-G1 / F-G2). The queue takes every vmcnt entry (loop_census.VMCNT_ENTRY:
+    spill reloads and returning atomics too). Each loop's body runs twice, so loads carried over the back-edge are pending at its
+    top. Returns [(wait index, innermost guard's branch index, victims)], one per wait"""
     L = loops(ins, addr)
     cross = lambda b, j: any((a <= b <= z < j) or (b < a <= j - 1 < z) for a, z in L)   # leaves or enters a loop
-    is_vm = lambda x: bool(VMLOAD.match(x)) or x.startswith("scratch_load")           # spill reloads share vmcnt
     hits, rw = {}, {}
     for t, e in L:
         regions = sorted(((b, hi + 1) for b, _, hi in guarded(ins, addr, t, e)
@@ -709,7 +710,7 @@ def guard_waits(ins, addr):
         for p in range(2 * n):
             i = t + p % n
             x = ins[i]
-            if is_vm(x):
+            if VMCNT_ENTRY.match(x):                          # loads, spill reloads, returning atomics
                 q.append((p, i))
             w = re.search(r"vmcnt\((\d+)\)", x) if x.startswith("s_waitcnt") else None
             if not w:
@@ -721,12 +722,10 @@ def guard_waits(ins, addr):
                 if not b < i < j or i in hits:
                     continue
                 if (b, j) not in rw:
-                    rw[(b, j)] = (set().union(*[a | c for a, c in map(defs_uses, ins[b + 1:j])]),
-                                  any(FENCE.match(y) for y in ins[b + 1:j]))
-                regs, fence = rw[(b, j)]
-                need = [g for g in gone if defs_uses(ins[g[1]])[0] & regs]   # a load in the block writes its own registers
-                if not need and fence:
-                    continue                                    # may order memory (a store after a load, a fence): no register says why
+                    rw[(b, j)] = set().union(*[a | c for a, c in map(defs_uses, ins[b + 1:j])])
+                need = [g for g in gone if defs_uses(ins[g[1]])[0] & rw[(b, j)]]   # a load in the block writes its own registers
+                if not need and any(FENCE.match(y) for y in ins[i + 1:j]):
+                    continue                                    # may order what follows it (a store, a fence): no register says why
                 victims = [g for g in gone if g not in need and g[0] > max([-1] + [x[0] for x in need])]
                 if victims:
                     hits[i] = (i, b, len(victims))
@@ -740,11 +739,15 @@ def guardwait(r, ins, addr):
         r.setdefault("notes", []).append("guardwait")
 
 
-VOPD_X = {"fmac_f32", "fmaak_f32", "fmamk_f32", "mul_f32", "add_f32", "sub_f32", "subrev_f32", "mul_dx9_zero_f32", "mov_b32",
-          "cndmask_b32", "max_f32", "min_f32", "dot2acc_f32_f16", "dot2acc_f32_bf16"}
-VOPD_Y = VOPD_X | {"add_nc_u32", "lshlrev_b32", "and_b32"}
-VOPD_MODS = re.compile(r"\||neg\(|abs\(|clamp|op_sel|dpp|row_|quad_perm|\s-[vs]|,\s*-")   # isa_audit.py's: a modifier VOPD lacks
-INLINE = re.compile(r"-?(?:\d+|0\.5|1\.0|2\.0|4\.0|0\.15915494)$")                         # inline constants (small ints, a few floats)
+# VOPD components as Loom 0.2.0's planner reads them on amdgpu.rdna3_5.core (hrx-system v0.2.0: amdgpu_vopd_component_tables.py
+# _component_definitions; planning/vopd_plan.c read_*_component; descriptors/alu.py COMMUTABLE constraints): opcode -> (lanes,
+# form, commutable). Loom's dot2 component is the VOP3P v_dot2_f32_f16, not v_dot2acc: not modelled
+VOPD_OPS = {"fmac_f32": ("XY", "tied", True), "fmaak_f32": ("XY", "fmaak", True), "fmamk_f32": ("XY", "fmamk", False),
+            "mul_f32": ("XY", "binary", True), "add_f32": ("XY", "binary", True), "sub_f32": ("XY", "binary", False),
+            "subrev_f32": ("XY", "binary", False), "max_f32": ("XY", "binary", True), "min_f32": ("XY", "binary", True),
+            "cndmask_b32": ("XY", "binary", False), "mov_b32": ("XY", "mov", False), "add_nc_u32": ("Y", "binary", True),
+            "lshlrev_b32": ("Y", "binary", False), "and_b32": ("Y", "binary", True)}
+INLINE = re.compile(r"(?:-?(?:\d+|0\.5|1\.0|2\.0|4\.0)|0\.15915494)$")   # inline constants as the disassembler prints them
 
 
 def vnum(tok):
@@ -753,33 +756,67 @@ def vnum(tok):
 
 
 def vopd_eligible(x):
-    """('XY' | 'Y', operands) for a single VALU instruction VOPD could carry (RDNA3 guide 7.6 / tables 91-92, C5's R5 / R5b), else
-    None: an X or Y opcode in the VOP2 / VOP1 form (_e32 or unsuffixed: v_dual_* halves and VOP3 _e64 do not match), no modifier.
-    Port of C5's static-1125/isa/tools/isa_audit.py eligible(), operands split by hand instead of AMD's ISA XML (C5: the XML
-    changes no lint row, E551). Its cndmask-on-VCC and VSRC1-is-a-VGPR checks are not ported: the listing prints every VOP2
-    cndmask with vcc_lo and every VOP2 VSRC1 as a VGPR, so no test could red them (review r1 F2)"""
+    """the VOPD component Loom 0.2.0's planner would read from a single VALU instruction, or None: {"lanes", "vdst", "src0",
+    "vsrc1", "form", "comm", "lit"}. VOP2 / VOP1 form only (_e32 or unsuffixed: v_dual_* halves and VOP3 _e64 do not match); a
+    negated, absolute or clamped operand is not a bare register and fails the source checks. Binary and cndmask forms need src0 and
+    vsrc1 in VGPRs, no literal, SGPR or inline constant (vopd_plan.c read_binary_vgpr_component: immediate_count 0, single physical
+    VGPRs); fmaak / fmamk take VGPR sources and one literal (fmamk's operands are dst, src0, K, vsrc1); fmac's destination is its
+    accumulator; v_mov_b32 is a register move from a VGPR or an inline move of an inline constant (an SGPR or a non-inline literal
+    source is not eligible)"""
     mn, _, rest = x.partition(" ")
     m = re.match(r"v_(\w+?)(?:_(e32|e64|dpp|sdwa))?$", mn)
-    if not m or m.group(2) not in (None, "e32") or m.group(1) not in VOPD_Y or VOPD_MODS.search(rest):
+    if not m or m.group(2) not in (None, "e32") or m.group(1) not in VOPD_OPS:
         return None
-    return ("X" if m.group(1) in VOPD_X else "") + "Y", [o.strip() for o in re.split(r",(?![^\[]*\])", rest)] if rest.strip() else []
+    lanes, form, comm = VOPD_OPS[m.group(1)]
+    ops = [o.strip() for o in re.split(r",(?![^\[]*\])", rest)] if rest.strip() else []
+    c = {"lanes": lanes, "form": form, "comm": comm, "lit": None, "vdst": vnum(ops[0]), "src0": None, "vsrc1": None}
+    if form == "mov":
+        c["src0"] = vnum(ops[1])
+        return c if c["src0"] is not None or INLINE.match(ops[1]) else None
+    s0, s1, k = (ops[1:4] + [None])[:3] if form != "fmamk" else (ops[1], ops[3], ops[2])
+    c["src0"], c["vsrc1"] = vnum(s0), vnum(s1)
+    if c["src0"] is None or c["vsrc1"] is None:
+        return None
+    if form in ("fmaak", "fmamk"):
+        c["lit"] = k
+    return c
+
+
+def vopd_caches(c):
+    """the registers a component reads through VOPD's three source-cache ports (SRC0, VSRC1, SRC2), Loom's
+    _component_cache_registers: fmamk's vsrc1 and fmac's tied destination sit in SRC2, a register move reads SRC0 only"""
+    if c["form"] == "fmamk":
+        return (c["src0"], None, c["vsrc1"])
+    if c["form"] == "tied":
+        return (c["src0"], c["vsrc1"], c["vdst"])
+    return (c["src0"], c["vsrc1"], None)
+
+
+def vopd_registers_ok(x, y):
+    """Loom 0.2.0's register constraints for one pair on an interlock target (vopd_component.c register_constraint_flags with
+    SOURCE_PARITY, set on amdgpu.rdna3_5.core: amdgpu_vopd_component_tables.py:601-602, target_info.py rdna3_5.core): destinations
+    of opposite parity, and on each cache port both registers of opposite parity (mask 1: one register in both halves is refused);
+    a commutable component may swap SRC0 / VSRC1 (try_register_orientations: X, then Y, then both)"""
+    def ok(a, b):
+        return (a["vdst"] ^ b["vdst"]) & 1 and all(p is None or q is None or (p ^ q) & 1 for p, q in zip(vopd_caches(a), vopd_caches(b)))
+    sw = lambda c: dict(c, src0=c["vsrc1"], vsrc1=c["src0"])
+    return any(ok(a, b) for a, b in [(x, y)] + ([(sw(x), y)] if x["comm"] else []) + ([(x, sw(y))] if y["comm"] else [])
+               + ([(sw(x), sw(y))] if x["comm"] and y["comm"] else []))
 
 
 def vopd_pairs(body, lo=0, hi=None, win=8):
-    """VOPD pairs a greedy pass could form from eligible singles in body[lo..hi] as allocated (C5 isa_audit greedy(strict)): an X with
-    a Y at most WIN instructions later, independent (no def / use overlap, nothing between writing their sources or reading / writing
-    their destinations, no wait, barrier or branch between), destinations of opposite parity, SRC0 of different parity when the
-    registers differ (gfx11.5 interlock, R5a; Loom's SOURCE_PARITY), VSRC1 in different banks even when it is the same register, and
-    at most one distinct literal over both halves (R5; ROCm 10.2 llvm-mc refused flash2's shared v238 VSRC1, E580). Defs / uses from
-    defs_uses (C5: SCC / carry-out gaps change no lint row). Returns (pairs, eligible)"""
+    """VOPD pairs a greedy pass could form from eligible singles in body[lo..hi] as allocated, by Loom 0.2.0's planner rules (the
+    oracle; review r2: ROCm 10.2 llvm-mc checks banks, not the gfx11.5 interlock): one half X-capable, the other Y-capable, at most
+    WIN instructions apart, independent (no def / use overlap, nothing between writing their sources or reading / writing their
+    destinations, no wait, barrier or branch between), vopd_registers_ok, and two literals only when equal (vopd_component.c
+    resolve_pair_literal). Defs / uses from defs_uses. Returns (pairs, eligible)"""
     hi = len(body) - 1 if hi is None else hi
     el = {i: v for i in range(lo, hi + 1) for v in [vopd_eligible(body[i])] if v}
     du = {}
     f = lambda k: du.setdefault(k, defs_uses(body[k]))
-    lits = lambda ops: {o for o in ops[1:] if not re.match(r"[vs]\d|[vs]\[|vcc|exec|m0", o) and not INLINE.match(o)}
     def can(i, j):
-        (ri, oi), (rj, oj) = el[i], el[j]
-        if not (("X" in ri and "Y" in rj) or ("Y" in ri and "X" in rj)):
+        x, y = el[i], el[j]
+        if not (("X" in x["lanes"] and "Y" in y["lanes"]) or ("Y" in x["lanes"] and "X" in y["lanes"])):
             return False
         (di, ui), (dj, uj) = f(i), f(j)
         if di & uj or dj & ui or di & dj:
@@ -790,16 +827,9 @@ def vopd_pairs(body, lo=0, hi=None, win=8):
             dk, uk = f(k)
             if dk & (uj | dj) or uk & dj:
                 return False
-        a, b = vnum(oi[0]), vnum(oj[0])
-        if a is None or b is None or (a & 1) == (b & 1):
+        if x["lit"] is not None and y["lit"] is not None and x["lit"] != y["lit"]:
             return False
-        a, b = (vnum(oi[1]) if len(oi) > 1 else None), (vnum(oj[1]) if len(oj) > 1 else None)
-        if a is not None and b is not None and a != b and (a & 1) == (b & 1):
-            return False
-        a, b = (vnum(oi[2]) if len(oi) > 2 else None), (vnum(oj[2]) if len(oj) > 2 else None)
-        if a is not None and b is not None and (a & 3) == (b & 3):
-            return False
-        return len(lits(oi) | lits(oj)) <= 1
+        return vopd_registers_ok(x, y)
     used, n = set(), 0
     for i in sorted(el):
         if i in used:
@@ -915,9 +945,9 @@ def size_keys(v):
 
 
 def launch_grids(texts):
-    """kernel -> [(launching command or None, [one value per workgroup axis] or None), per launch site]: each site's grid operands
-    resolved in the definition that launches it (through dual-target selectors to the template.apply's arguments) and fed to the
-    kernel's kernel.launch.config workgroups(...). The command is the command.def holding the site (None in a func.def)"""
+    """kernel -> [[one value per workgroup axis] or None, per launch site]: each site's grid operands resolved in the definition that
+    launches it (through dual-target selectors to the template.apply's arguments) and fed to the kernel's kernel.launch.config
+    workgroups(...)"""
     blocks = []
     for t in texts:
         starts = [m.start() for m in re.finditer(r"(?m)^[a-z]\w*\.def\b", t)] + [len(t)]
@@ -946,42 +976,17 @@ def launch_grids(texts):
                 sites.append((k, [args.get(g, "?") for g in grid]))
         if not sites:
             continue
-        cmd = re.match(r"command\.def(?:\s+\w+)*(?:\s+target\(@\w+\))?\s+@(\w+)\(", b)
-        cmd = cmd.group(1) if cmd else None
         env = idx_eval(b.split("\n"), {})
         for k, ops in sites:
             if k not in configs:
                 continue
             params, head = configs[k]
             if len(ops) != len(params):
-                out[k].append((cmd, None))
+                out[k].append(None)
                 continue
             cenv = idx_eval(head.split("\n"), dict(zip(params, [env.get(o, "conflict") for o in ops])))
             w = re.search(r"workgroups\(([^)]*)\)", head)
-            out[k].append((cmd, [cenv.get(x.strip(), "conflict") for x in w.group(1).split(",")] if w else None))
-    return out
-
-
-def served_sizes(dirs):
-    """{(command or None, config key): the largest size the package admits}, from each directory's model.json presets.*.execution
-    (the largest over presets): @llm.tokens in llm_advance = prefill_capacity (the prefill chunk); in llm_verify = rows x
-    (draft_depth + 1) (every row verifies draft_depth + 1 tokens: an upper bound); @llm.spans anywhere = rows (a hypothesis: at most
-    one span per row). Nothing else has a source here (dflash's block size lives in the draft GGUF): those keys are 'size unknown'"""
-    out = {}
-    def put(k, v):
-        if isinstance(v, int) and v > 0:
-            out[k] = max(out.get(k, 0), v)
-    for d in dirs:
-        f = os.path.join(d, "model.json")
-        if not os.path.isfile(f):
-            continue
-        for p in (json.load(open(f)).get("presets") or {}).values():
-            x = (p or {}).get("execution") or {}
-            rows, depth = x.get("rows"), x.get("draft_depth")
-            put(("llm_advance", "@llm.tokens"), x.get("prefill_capacity"))
-            if isinstance(rows, int) and isinstance(depth, int):
-                put(("llm_verify", "@llm.tokens"), rows * (depth + 1))
-            put((None, "@llm.spans"), rows)
+            out[k].append([cenv.get(x.strip(), "conflict") for x in w.group(1).split(",")] if w else None)
     return out
 
 
@@ -993,94 +998,80 @@ def device_domains(target):
     return s // p if isinstance(s, int) and isinstance(p, int) and p and s % p == 0 else None
 
 
-def grid_rounds(sites, wgs, domains, sizes):
-    """rounds of workgroups at the reachable tier over a kernel's launch sites, at the largest sizes the package admits (SIZES, from
-    served_sizes(): a key is looked up at the launching command, then package-wide): {"resident", "sites": [(workgroups, rounds,
-    {key: admitted size}, one-round bound or None)], "unknown", "size_unknown"}. Unknown: an unresolved value, an empty grid, or one
-    that shrinks as its size grows (a grid grows with its sizes through add / mul / div / ceildiv). The bound, for a grid of one size
-    key, is the largest size up to ROUNDS_MAX still in one round, printed beside the figure. Never judged at size 1 (review r1 F3: the
-    decode shape is not the served maximum)"""
+def grid_rounds(sites, wgs, domains):
+    """one round's figures over a kernel's launch sites at the reachable tier: {"resident", "sites": [(size key or None, workgroups
+    at size 1, one-round bound)], "unknown"}. The bound is the largest size up to ROUNDS_MAX whose grid still fits one round (None
+    when even size 1 does not); a constant grid has key None and bound 1 when it fits. Unknown: an unresolved value, a grid of two
+    size keys, a constant empty grid, or one that shrinks as its size grows. No served size is claimed (review r2: Loom 0.2.0 admits
+    tokens and spans up to the prefill capacity, model_registration.c / schedule.c loom_serve_text_default_shapes and the package's
+    prepare.loom stage configuration)"""
     res = wgs * domains
-    out, unk, szu = [], 0, 0
-    for cmd, s in sites:
-        if not s or any(v == "conflict" for v in s):
+    out, unk = [], 0
+    for s in sites:
+        keys = set().union(*[size_keys(x) for x in s]) if s and "conflict" not in s else None
+        if keys is None or len(keys) > 1:
             unk += 1
             continue
-        keys = set().union(*[size_keys(x) for x in s])
-        at = {k: sizes.get((cmd, k), sizes.get((None, k))) for k in keys}
-        if None in at.values():
-            szu += 1
-            continue
-        total = lambda v: (lambda xs: None if None in xs else math.prod(xs))([idx_value(x, v) for x in s])
-        top, low = total(at), total(1)
-        if top is None or top <= 0 or (keys and (low is None or top < low)):
+        total = lambda n: (lambda xs: None if None in xs else math.prod(xs))([idx_value(x, n) for x in s])
+        low, top = total(1), total(ROUNDS_MAX)
+        if low is None or top is None or top < low or (not keys and low <= 0):
             unk += 1
             continue
         bound = None
-        if len(keys) == 1 and low is not None and 0 < low <= res:
+        if low <= res and not keys:
+            bound = 1
+        elif low <= res:
             lo, hi = 1, ROUNDS_MAX
             while lo < hi:
                 mid = (lo + hi + 1) // 2
-                lo, hi = (mid, hi) if (total(mid) or 0) <= res else (lo, mid - 1)
+                lo, hi = (mid, hi) if total(mid) <= res else (lo, mid - 1)
             bound = lo
-        out.append((top, -(-top // res), at, bound))
-    return {"resident": res, "sites": out, "unknown": unk, "size_unknown": szu}
+        out.append((next(iter(keys), None), low, bound))
+    return {"resident": res, "sites": out, "unknown": unk}
 
 
-def rounds(rows, texts, sizes):
-    """note `rounds` on a kernel whose every launch site runs in one round at the largest sizes the package admits, with >= 2
-    workgroups at its largest: all its workgroups are resident together, so their traversal order cannot matter (E539: a study
-    established it by hand for the GDN recurrence). r['rounds'] keeps the figures for every kernel with launch sites"""
+def rounds(rows, texts):
+    """r['rounds'] (grid_rounds) for every kernel with launch sites and a verified tier: information only, never a note (review r2,
+    option iii: an admitted-size claim is not the linter's to make). E539's question, 'are all workgroups resident at once', is
+    answered by the one-round bound in the size variable, to be read against the sizes a served profile shows"""
     grids = launch_grids(texts)
     for r in rows:
         o = r.get("occ")
         if not o or r["kernel"] not in grids:
             continue
-        dom = device_domains(o.get("target"))   # None too for an unverified tier ({"why"}: no target, no figure)
-        if not dom:
-            continue
-        g = grid_rounds(grids[r["kernel"]], o["wgs"], dom, sizes)
-        r["rounds"] = g
-        if g["sites"] and not g["unknown"] and not g["size_unknown"] and all(x[1] == 1 for x in g["sites"]) and \
-                max(x[0] for x in g["sites"]) >= 2:
-            r.setdefault("notes", []).append("rounds")
+        dom = device_domains(o.get("target"))   # also None for an unverified tier: tier_state's {"why"} carries no target
+        if dom:
+            r["rounds"] = grid_rounds(grids[r["kernel"]], o["wgs"], dom)
 
 
-def admitted(g):
-    """the admitted sizes over a kernel's sites, as text"""
-    at = {}
-    for x in g["sites"]:
-        for k, v in x[2].items():
-            at[k] = max(at.get(k, 0), v)
-    return ", ".join(f"{k.split('.')[-1]} <= {v}" for k, v in sorted(at.items()))
-
-
-def rounds_text(r):
-    """the line of a noted kernel"""
-    g, o = r["rounds"], r["occ"]
-    ws = sorted(set(x[0] for x in g["sites"]))
-    at = admitted(g)
-    return (f"rounds {r['kernel']}: {'/'.join(map(str, ws[:4]))}{' ...' if len(ws) > 4 else ''} workgroups over {len(g['sites'])} launch "
-            f"site(s){' at every admitted size (' + at + ')' if at else ''}, {g['resident']} resident ({o['wgs']} per WGP at "
-            f"{tier_text(o)} waves/SIMD{', a bound' if o['bound'] else ''}): 1 round, traversal order irrelevant")
+def rounds_info(r):
+    """the information line of a kernel every site of which fits one round at size 1 with >= 2 workgroups somewhere, or None"""
+    g, o = r.get("rounds"), r.get("occ")
+    if not g or g["unknown"] or not g["sites"] or any(x[2] is None for x in g["sites"]) or max(x[1] for x in g["sites"]) < 2:
+        return None
+    by = {}
+    for k, _, b in g["sites"]:
+        by[k] = min(by.get(k, b), b)
+    lim = "; ".join("constant grid" if k is None else f"{k.split('.')[-1]} <= {b}" for k, b in sorted(by.items(), key=str))
+    return (f"rounds {r['kernel']} (info): {len(g['sites'])} launch site(s), {max(x[1] for x in g['sites'])} workgroups at size 1, "
+            f"{g['resident']} resident ({o['wgs']} per WGP at {tier_text(o)} waves/SIMD{', a bound' if o['bound'] else ''}); one round "
+            f"while {lim}")
 
 
 def rounds_summary(rows):
-    """one line naming the kernels with launch sites that rounds could not judge, and counting those over one round (review r1 F5)"""
+    """one line naming the kernels with launch sites whose grid rounds could not resolve (review r1 F5)"""
     unk = sorted(r["kernel"] for r in rows if r.get("rounds") and r["rounds"]["unknown"])
-    szu = sorted(r["kernel"] for r in rows if r.get("rounds") and r["rounds"]["size_unknown"] and not r["rounds"]["unknown"])
-    many = sum(1 for r in rows if r.get("rounds") and any(x[1] > 1 for x in r["rounds"]["sites"]))
-    return (f"rounds: not judged: unknown ({len(unk)}): {' '.join(unk) or '-'}; size unknown ({len(szu)}): {' '.join(szu) or '-'}; "
-            f"more than one round at the admitted size: {many} kernels (no line: a branch on the size, unmodelled, may bound it)")
+    return f"rounds: not resolved ({len(unk)}): {' '.join(unk) or '-'}"
 
 
 def lesson_lines(rows):
-    """the lines of the C18 notes (rounds, guardwait, vopd), by kernel, and the rounds summary when any kernel has launch sites"""
+    """the lines of the C18 notes (guardwait, vopd) and rounds' information lines, by kernel, and the rounds summary"""
     out = []
     for r in sorted(rows, key=lambda r: r["kernel"]):
         n = r.get("notes", [])
-        if "rounds" in n:
-            out.append(rounds_text(r))
+        line = rounds_info(r)
+        if line:
+            out.append(line)
         if "guardwait" in n:
             i, b, v = r["guard_waits"][0]
             out.append(f"guardwait {r['kernel']}: {len(r['guard_waits'])} vmcnt wait(s) inside a conditional block drain loads issued "
@@ -1932,7 +1923,7 @@ def main():
         rows = [r for rs in ex.map(lambda f: lint_file(f, rga), files) for r in rs]
     outl = outliers(rows)
     tiny(rows, stats)
-    rounds(rows, texts, served_sizes(([a.package] if a.package else []) + [x for x in a.source if os.path.isdir(x)]))
+    rounds(rows, texts)
     barriers(rows, kernel_texts(texts), func_texts(texts), a.roots, a.barriers)
     mv = {k: c for k, t in kernel_texts(texts).items() if (a.roots is None or re.search(a.roots, k)) for c in [masked_v(t)] if c}
     for r in rows:

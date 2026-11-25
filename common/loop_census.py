@@ -10,6 +10,11 @@ import os
 import re
 import subprocess
 
+# every instruction that takes a vmcnt queue entry on gfx11: global / buffer / scratch (spill) / flat loads and atomics with return
+# (glc, or a _rtn name); an entry a walk missed would let a wait vmcnt(N) look like it retires fewer loads (cand_lint verify r3 B; one
+# predicate for cand_lint's cover walk and kernel_lint's guardwait, C18 review r2 F-G3)
+VMCNT_ENTRY = re.compile(r"(global|buffer|scratch|flat)_load_|(global|buffer|flat|scratch)_atomic\S*(_rtn\b|.*\bglc\b)")
+
 
 def objdump():
     """the disassembler: $OBJDUMP, else the ROCm SDK's (ROCM_SDK from the environment or the machine env file; ROCm 10.2's

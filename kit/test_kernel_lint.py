@@ -232,99 +232,78 @@ def lesson_notes():
         return b + [back(len(b), 1)]
     wm = "v_wmma_f32_16x16x16_f16 v[200:207], v[192:199], v[184:191], v[200:207]"
     notes = lambda r: r.get("notes", [])
-    # ---- (a) rounds (E539: a worker's study established that g_gdn_recurrence_pf runs one round). r2 (review F3): a runtime grid is
-    # judged at the sizes the package admits (model.json execution: prefill_capacity, rows, draft_depth), never at size 1
-    def prog(tiles=8, extra="", grid="%heads, %tiles, %spans", body=None, cmd="llm_advance", params="%spans: index"):
+    # ---- (a) rounds (E539: a worker's study established that g_gdn_recurrence_pf runs one round at spans 1). Review r2, option
+    # iii: information only (grid at size 1, resident, the one-round bound in the size variable), never a note, no served-size claim
+    def prog(tiles=8, extra="", grid="%heads, %tiles, %spans", body=None, params="%spans: index"):
         body = body if body is not None else ("  %spans = config.get @llm.spans : index\n"
                                               "  kernel.launch @g_r[%spans](%spans) : [index](index)\n")
         return (f'kernel.def export("g_r") @g_r({params}) {{\n  %c1 = index.constant 1 : index\n  %heads = index.constant 48 : index\n'
                 f"  %tiles = index.constant {tiles} : index\n  %c32 = index.constant 32 : index\n{extra}"
                 f"  kernel.launch.config workgroups({grid}) workgroup_size(%c32, %c1, %c1) : index\n}} launch(%spans_arg: index) {{\n}}\n"
-                f"command.def public target(@device) @{cmd}() launch(%x: buffer) {{\n{body}}}\n")
+                f"command.def public target(@device) @llm_advance() launch(%x: buffer) {{\n{body}}}\n")
     gdn = kl.tier_state(occ(32, 166, 9, 0, 16, 16, 9), 4)            # pkg-e480's g_gdn_recurrence_pf report rows: 36 per WGP, 720
-    sz1 = {(None, "@llm.spans"): 1, ("llm_advance", "@llm.tokens"): 4096, ("llm_verify", "@llm.tokens"): 32}
-    def rnd(text, sizes=sz1, o=gdn):
+    def rnd(text, o=gdn):
         rows = [{"kernel": "g_r", "occ": o}]
-        f = getattr(kl, "rounds", None)
         try:
-            f(rows, [text], sizes)
-        except TypeError:                                             # r1's rounds(rows, texts): no sizes
-            f(rows, [text])
-        return rows[0].get("rounds") or {}, "rounds" in notes(rows[0]), rows[0]
-    g, n, row = rnd(prog())
-    ok(n and g.get("resident") == 720 and [s[:2] for s in g.get("sites", [])] == [(384, 1)],
-       f"rounds: 48 x 8 x spans one-wave workgroups, spans admitted <= 1: one round of 720 resident (E539) ({g})")
-    txt = getattr(kl, "rounds_text", lambda r: "")(row) if n else ""
-    ok("1 round" in txt and "spans <= 1" in txt, f"rounds: the line names the admitted size it holds at ({txt[:160]})")
-    g, n, _ = rnd(prog(), {**sz1, (None, "@llm.spans"): 4})
-    ok(not n and (g.get("sites") or [()])[0][:2] == (1536, 3) and g["sites"][0][3] == 1,
-       f"rounds: the same grid with spans admitted <= 4 (rows 4) is 3 rounds there, bound spans <= 1: no note (review F3) ({g})")
-    g, n, _ = rnd(prog(), {})
-    ok(not n and g.get("size_unknown") == 1, f"rounds: no admitted size for the key: 'size unknown', no note ({g})")
-    g, n, _ = rnd(prog(tiles=16))
-    ok(not n and (g.get("sites") or [()])[0][:2] == (768, 2), f"rounds: 16 tiles (768) are two rounds: no note ({g})")
-    tok = ("  %t = config.get @llm.tokens : index\n  kernel.launch @g_r[%t](%t) : [index](index)\n")
-    g, n, row = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok), {("llm_advance", "@llm.tokens"): 600})
-    ok(n and (g.get("sites") or [()])[0][:2] == (600, 1),
-       f"rounds: tokens admitted <= 600 at prefill, 600 workgroups of 720: one round ({g})")
-    g, n, row = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok), {("llm_advance", "@llm.tokens"): 4096})
-    ok(not n and (g.get("sites") or [(0, 0, 0, 0)])[0][1:4:2] == (6, 720),
-       f"rounds: tokens <= 4096 is 6 rounds; the one-round bound is tokens <= 720, above 2 (review R12) ({g})")
-    g, n, _ = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok.replace("llm_advance", "x"), cmd="llm_dflash_propose"),
-                  {("llm_advance", "@llm.tokens"): 4096})
-    ok(not n and g.get("size_unknown") == 1, f"rounds: tokens in a command without a size source (dflash's block): size unknown ({g})")
-    g, n, _ = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok, cmd="llm_verify"), sz1)
-    ok(n and (g.get("sites") or [()])[0][:2] == (32, 1), f"rounds: tokens at verify (rows x (draft_depth + 1) = 32): "
-       f"one round ({g})")
+            kl.rounds(rows, [text])
+        except TypeError:                                             # r2's rounds(rows, texts, sizes)
+            kl.rounds(rows, [text], {})
+        line = getattr(kl, "rounds_info", lambda r: None)(rows[0])
+        return rows[0].get("rounds") or {}, line, "rounds" in notes(rows[0])
+    g, line, n = rnd(prog())
+    ok(not n and g.get("resident") == 720 and g.get("sites") == [("@llm.spans", 384, 1)] and line and "one round while spans <= 1" in line
+       and "384 workgroups at size 1" in line, f"rounds: 48 x 8 x spans one-wave workgroups, 720 resident: an information line, one "
+       f"round while spans <= 1 (E539), never a note ({g}; {line})")
+    g, line, n = rnd(prog(tiles=16))
+    ok(g.get("sites") == [("@llm.spans", 768, None)] and line is None, f"rounds: 16 tiles (768 at size 1) exceed 720: no line ({g})")
+    tok = "  %t = config.get @llm.tokens : index\n  kernel.launch @g_r[%t](%t) : [index](index)\n"
+    g, line, n = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok))
+    ok(g.get("sites") == [("@llm.tokens", 1, 720)] and line is None, f"rounds: one workgroup at size 1 has no order: no line, bound "
+       f"720 kept (above 2, review R12) ({g}; {line})")
+    g, line, n = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok.replace("[%t](%t)", "[%t2](%t2)").replace(
+        "kernel.launch", "%c2 = index.constant 2 : index\n  %t2 = index.mul %t, %c2 : index\n  kernel.launch")))
+    ok(g.get("sites") == [("@llm.tokens", 2, 360)] and line and "tokens <= 360" in line and "2 workgroups" in line,
+       f"rounds: 2 x tokens: 2 workgroups at size 1, one round while tokens <= 360 ({g}; {line})")
     sel = ("template.decl @sel1_g_r(%g0: index, %a0: index)\n"
            "template.def<@sel1_g_r> target(@rdna3) @sel1_g_r_rdna3(%g0: index, %a0: index) {\n"
            "  kernel.launch @g_r[%g0](%a0) : [index](index)\n  template.return\n}\n")
-    g, n, _ = rnd(sel + prog(body="  %two = index.constant 1 : index\n  template.apply<@sel1_g_r>(%two, %two) : (index, index)\n"))
-    ok(n and [s[:2] for s in g.get("sites", [])] == [(384, 1)], f"rounds: a constant grid through a dual-target selector ({g})")
+    g, line, n = rnd(sel + prog(body="  %two = index.constant 1 : index\n  template.apply<@sel1_g_r>(%two, %two) : (index, index)\n"))
+    ok(g.get("sites") == [(None, 384, 1)] and line and "constant grid" in line, f"rounds: a constant grid through a dual-target "
+       f"selector ({g}; {line})")
+    g, line, n = rnd(prog(extra="  %sh = index.shl %tiles, %c1 : index\n", grid="%heads, %sh, %spans"))
+    ok(g.get("unknown") == 1 and line is None, f"rounds: an op the evaluator does not model in the config: unknown ({g})")
+    g, line, n = rnd(prog(body="  %s0 = config.get @llm.spans : index\n  %spans = index.shl %s0, %s0 : index\n"
+                               "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"))
+    ok(g.get("unknown") == 1, f"rounds: an op the evaluator does not model in the launcher: unknown, never a size (R13) ({g})")
+    g, line, n = rnd(prog(body="  %spans = config.get @llm.spans : index\n  %spans = index.constant 2 : index\n"
+                               "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"))
+    ok(g.get("unknown") == 1, f"rounds: a launcher name defined twice: unknown, never either definition (R6) ({g})")
+    g, line, n = rnd(prog(body="  %c4 = index.constant 4 : index\n  kernel.launch @g_r[%c4, %c4](%c4) : [index, index](index)\n"))
+    ok(g.get("unknown") == 1, f"rounds: a launch with more grid operands than the config's parameters: unknown (R7) ({g})")
+    g, line, n = rnd(prog(grid="%heads, %c0, %c1", extra="  %c0 = index.constant 0 : index\n"))
+    ok(g.get("unknown") == 1, f"rounds: an empty constant grid: unknown (R3) ({g})")
+    g, line, n = rnd(prog(extra="  %c99 = index.constant 99 : index\n  %dn = index.sub %c99, %spans : index\n", grid="%heads, %dn, %c1"))
+    ok(g.get("unknown") == 1, f"rounds: a grid that shrinks as the size grows: unknown (R2) ({g})")
+    g, line, n = rnd(prog(params="%spans: index, %t: index", grid="%spans, %t, %c1",
+                          body="  %spans = config.get @llm.spans : index\n  %t = config.get @llm.tokens : index\n"
+                               "  kernel.launch @g_r[%spans, %t](%spans) : [index, index](index)\n"))
+    ok(g.get("unknown") == 1 and line is None, f"rounds: a grid of two size keys: unknown, no single bound ({g})")
+    g, line, n = rnd(prog(extra="  %sp = index.assume %spans [range(%spans, 1, 8)] : index\n", grid="%heads, %tiles, %sp"))
+    ok(g.get("sites") == [("@llm.spans", 384, 1)], f"rounds: index.assume passes its operand through (R8) ({g})")
     two = ("  %spans = config.get @llm.spans : index\n  kernel.launch @g_r[%spans](%spans) : [index](index)\n"
-           "  %t = config.get @llm.tokens : index\n  kernel.launch @g_r[%t](%t) : [index](index)\n")
-    g, n, _ = rnd(prog(body=two), {(None, "@llm.spans"): 1})
-    ok(not n and len(g.get("sites", [])) == 1 and g.get("size_unknown") == 1,
-       f"rounds: one site in one round, another of unknown size: no note ({g})")
-    two = two.replace("config.get @llm.tokens : index", "index.shl %spans, %spans : index")
-    g, n, _ = rnd(prog(body=two))
-    ok(not n and len(g.get("sites", [])) == 1 and g.get("unknown") == 1, f"rounds: one site in one round, another unknown: no note ({g})")
-    g, n, _ = rnd(prog(grid="%c1, %c1, %c1"))
-    ok(not n and [s[:2] for s in g.get("sites", [])] == [(1, 1)], f"rounds: one workgroup has no order: no note ({g})")
-    g, n, _ = rnd(prog(extra="  %sh = index.shl %tiles, %c1 : index\n", grid="%heads, %sh, %spans"))
-    ok(not n and g.get("unknown") == 1, f"rounds: an op the evaluator does not model in the config: unknown ({g})")
-    g, n, _ = rnd(prog(body="  %s0 = config.get @llm.spans : index\n  %spans = index.shl %s0, %s0 : index\n"
-                            "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"))
-    ok(not n and g.get("unknown") == 1, f"rounds: an op the evaluator does not model in the launcher: unknown, never runtime (R13) ({g})")
-    g, n, _ = rnd(prog(body="  %spans = config.get @llm.spans : index\n  %spans = index.constant 2 : index\n"
-                            "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"))
-    ok(not n and g.get("unknown") == 1, f"rounds: a launcher name defined twice: unknown, never either definition (R6) ({g})")
-    g, n, _ = rnd(prog(body="  %c4 = index.constant 4 : index\n  kernel.launch @g_r[%c4, %c4](%c4) : [index, index](index)\n"))
-    ok(not n and g.get("unknown") == 1, f"rounds: a launch with more grid operands than the config's parameters: unknown (R7) ({g})")
-    g, n, _ = rnd(prog(grid="%heads, %c0, %c1", extra="  %c0 = index.constant 0 : index\n"))
-    ok(not n and g.get("unknown") == 1 and not g.get("size_unknown"), f"rounds: an empty constant grid: unknown (R3) ({g})")
-    g, n, _ = rnd(prog(extra="  %c99 = index.constant 99 : index\n  %dn = index.sub %c99, %spans : index\n", grid="%heads, %dn, %c1"),
-                  {(None, "@llm.spans"): 4})
-    ok(not n and g.get("unknown") == 1, f"rounds: a grid that shrinks as the size grows: unknown (R2) ({g})")
-    g, n, _ = rnd(prog(extra="  %sp = index.assume %spans [range(%spans, 1, 8)] : index\n", grid="%heads, %tiles, %sp"))
-    ok(n, f"rounds: index.assume passes its operand through (R8) ({g})")
-    g, n, _ = rnd(prog(), sz1, kl.tier_state(occ(32, 166, 9, 0, 16, 16, 8), 4))
-    ok(not n and not g, f"rounds: an unverified tier gives no figure (R1) ({g})")
-    rows = [{"kernel": "g_a", "rounds": {"sites": [], "unknown": 1, "size_unknown": 0}},
-            {"kernel": "g_b", "rounds": {"sites": [], "unknown": 0, "size_unknown": 2}},
-            {"kernel": "g_c", "rounds": {"sites": [(5000, 7, {"@llm.tokens": 4096}, 720)], "unknown": 0, "size_unknown": 0}}]
+           "  %x = index.shl %spans, %spans : index\n  kernel.launch @g_r[%x](%x) : [index](index)\n")
+    g, line, n = rnd(prog(body=two))
+    ok(len(g.get("sites", [])) == 1 and g.get("unknown") == 1 and line is None, f"rounds: one site resolved, another unknown: no "
+       f"line ({g})")
+    g, line, n = rnd(prog(), kl.tier_state(occ(32, 166, 9, 0, 16, 16, 8), 4))
+    ok(not g and line is None, f"rounds: an unverified tier ({{'why'}}, no target) gives no figure (R1 / N14) ({g})")
+    rows = [{"kernel": "g_a", "rounds": {"sites": [], "unknown": 1, "size_unknown": 0}},     # size_unknown: r2's shape, for the red run
+            {"kernel": "g_b", "rounds": {"sites": [("@llm.tokens", 5, 1)], "unknown": 0, "size_unknown": 0}}]
     s = getattr(kl, "rounds_summary", lambda r: "")(rows)
-    ok("unknown (1): g_a;" in s and "size unknown (1): g_b;" in s and "one round at the admitted size: 1 kernels" in s,
-       f"rounds: one summary line names the kernels not judged (review F5) ({s})")
+    ok("not resolved (1): g_a" in s and "g_b" not in s, f"rounds: one summary line names the kernels not resolved (review F5) ({s})")
     ok(getattr(kl, "device_domains", lambda t: None)("gfx1151") == 20 and kl.device_domains("nonesuch") is None, "rounds: 20 WGPs")
-    import json, tempfile as tf
-    with tf.TemporaryDirectory() as t:
-        json.dump({"presets": {"chat": {"execution": {"rows": 4, "prefill_capacity": 4096, "draft_depth": 7}}}},
-                  open(os.path.join(t, "model.json"), "w"))
-        s = getattr(kl, "served_sizes", lambda d: {})([t])
-        ok(s == {("llm_advance", "@llm.tokens"): 4096, ("llm_verify", "@llm.tokens"): 32, (None, "@llm.spans"): 4},
-           f"rounds: admitted sizes from model.json (prefill_capacity; rows x (draft_depth + 1); rows) ({s})")
-        ok(getattr(kl, "served_sizes", lambda d: None)([os.path.join(t, "none")]) == {}, "rounds: no model.json, no sizes")
+    ok(not hasattr(kl, "served_sizes"), "rounds: no admitted-size reader (review r2: Loom admits tokens / spans up to the prefill "
+       "capacity; rows and draft_depth are not caps)")
     # ---- (c) guardwait (E520). r2 (review F4): a victim is younger than every load the block's wait must retire for the block
     def guard(v_after=False, read_v=False, scale_only=False, write_v=False, scratch=False):
         b = ["s_mov_b32 s0, 0"]
@@ -381,13 +360,37 @@ def lesson_notes():
        f"load; live g_gdn_recurrence_pf / _rec): no note ({w})")
     fen = [x.replace("global_store_b128 v7, v[20:23], s[38:39]", "s_barrier") for x in st]
     w, n = gw(fen)
-    ok(not n, f"guardwait: the same wait beside a barrier (a fence: llama.cpp soft_max's vmcnt(0) after s_barrier / buffer_gl0_inv): "
-       f"no note ({w})")
+    ok(not n, f"guardwait: the same wait before a barrier (release: the wait may order it): no note ({w})")
     lds = [x.replace("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(2)").replace("global_store_b128 v7, v[20:23], s[38:39]", "ds_store_b128 v7, v[20:23]")
            for x in st]
     w, n = gw(lds)
     ok(n and w == [(6, 5, 1)], f"guardwait: the same over-wait before an LDS store (no global memory to order): the oldest V load is "
        f"drained for nothing the block needs (pkg-cmb2's partial kernels, E521's residue) ({w})")
+    def blk(block, pre=()):                       # V's three loads (and PRE) before a guard holding BLOCK; V read after the join
+        b = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+        b += list(pre) + ["s_cmp_eq_u32 s1, 0", ""]
+        br = len(b) - 1
+        b += block
+        b[br] = fwd(br, len(b))
+        b += ["v_add_f32_e32 v13, v40, v44", wm]
+        b.append(back(len(b), 1))
+        return gw(b)
+    w, n = blk(["s_barrier", "s_waitcnt vmcnt(0)", "buffer_gl0_inv"])
+    ok(not n, f"guardwait: llama.cpp soft_max's shape (s_barrier, vmcnt(0), buffer_gl0_inv): the invalidate after the wait is an "
+       f"acquire the wait may serve: no note ({w})")
+    w, n = blk(["s_barrier", "s_waitcnt vmcnt(0)", "v_mov_b32_e32 v61, 0"])
+    ok(n and w and w[0][2] == 3, f"guardwait: a barrier before the wait only orders nothing the wait serves: note ({w})")
+    w, n = blk(["s_waitcnt vmcnt(0)", "buffer_gl1_inv"])
+    ok(not n, f"guardwait: a cache invalidate after the wait (N2): no note ({w})")
+    w, n = blk(["s_waitcnt vmcnt(2)", "scratch_store_b32 off, v20, s33", "ds_store_b128 v7, v[20:23]"])
+    ok(n and w and w[0][2] == 1, f"guardwait: E521's residue with an unrelated spill store in the block still fires (N1: a spill "
+       f"orders nothing) ({w})")
+    w, n = blk(["global_store_b32 v7, v20, s[38:39]", "s_waitcnt vmcnt(2)", "ds_store_b128 v7, v[20:23]"])
+    ok(n and w and w[0][2] == 1, f"guardwait: E521's residue with a global store before the wait still fires (N3: a wait cannot "
+       f"order an earlier store) ({w})")
+    w, n = blk(["s_waitcnt vmcnt(0)", "v_add_f32_e32 v61, v5, v5"], pre=["global_atomic_add_u32 v5, v1, v2, s[8:9] glc"])
+    ok(not n, f"guardwait: the wait is for a returning atomic issued after V (a vmcnt entry, loop_census.VMCNT_ENTRY, review F-G3): "
+       f"the block needs the newest entry: no note ({w})")
     aj = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
     aj += ["s_cmp_eq_u32 s1, 0", "", "v_cvt_f32_f16_e32 v11, v10"]
     aj[5] = fwd(5, len(aj))
@@ -462,10 +465,31 @@ def lesson_notes():
     neg = [f"v_add_f32 v{100 + k}, -v{1 + k}, v{51 + k}" for k in range(40)]
     ok(pairs_of(neg)[1] == 0, f"vopd: a source negation is not eligible ({pairs_of(neg)})")
     vs = [f"v_add_f32_e32 v{100 + k}, v{1 + k}, v238" for k in range(40)]
-    ok(pairs_of(vs)[0] == 0, f"vopd: both halves' VSRC1 the same register (one bank): refused, as llvm-mc refused v238 (E580) "
-       f"({pairs_of(vs)})")
-    vb = [f"v_add_f32_e32 v{100 + k}, v{1 + k}, v{60 + 4 * k}" for k in range(40)]
-    ok(pairs_of(vb)[0] == 0, f"vopd: VSRC1 in one bank (reg % 4 equal): refused ({pairs_of(vb)})")
+    ok(pairs_of(vs)[0] == 0, f"vopd: one VSRC1 register in both halves: refused, swaps or not (Loom vopd_component.c: same register "
+       f"is same parity) ({pairs_of(vs)})")
+    vb = [f"v_sub_f32_e32 v{100 + k}, v{1 + k}, v{60 + 2 * k}" for k in range(40)]
+    ok(pairs_of(vb)[0] == 0, f"vopd: VSRC1 of one parity, different banks (llvm-mc accepts; Loom's interlock rule refuses) "
+       f"({pairs_of(vb)})")
+    cases = {"shared SRC0 (fmac, llama.cpp mul_mat_q)": (["v_fmac_f32_e32 v112, v58, v21", "v_fmac_f32_e32 v113, v58, v22"], 0),
+             "SRC0 same parity, a commutable swap makes it legal": (["v_add_f32_e32 v10, v1, v2", "v_add_f32_e32 v11, v3, v4"], 1),
+             "the same with sub (not commutable)": (["v_sub_f32_e32 v10, v1, v2", "v_sub_f32_e32 v11, v3, v4"], 0),
+             "VSRC1 same parity, mul swaps cannot fix it": (["v_mul_f32_e32 v10, v1, v4", "v_mul_f32_e32 v11, v2, v6"], 0),
+             "fmamk's VSRC1 is its 4th operand, in the SRC2 port (v6 / v4 even)": (["v_fmamk_f32 v1, v2, 0x3f800000, v6",
+                                                                                   "v_fmac_f32_e32 v4, v3, v10"], 0),
+             "fmamk's VSRC1 v6 against fmac's destination v4 in SRC2, VSRC1 ports apart (N11b)": (["v_fmamk_f32 v1, v2, 0x3f800000, v6",
+                                                                                               "v_fmac_f32_e32 v4, v3, v11"], 0),
+             "fmamk with VSRC1 v7 against fmac's v4: legal (N11)": (["v_fmamk_f32 v1, v2, 0x3f800000, v7", "v_fmac_f32_e32 v4, v3, v10"], 1),
+             "a literal SRC0 is not a VGPR binary (Loom reads VGPR sources only)": (["v_mul_f32_e32 v1, 0x3db8aa3b, v2",
+                                                                                    "v_mul_f32_e32 v4, v5, v7"], 0),
+             "an SGPR SRC0 likewise": (["v_add_f32_e32 v1, s2, v3", "v_add_f32_e32 v4, v5, v7"], 0),
+             "a move from an SGPR is not eligible": (["v_mov_b32_e32 v1, s2", "v_mov_b32_e32 v4, v5"], 0),
+             "a move of a non-inline literal is not eligible": (["v_mov_b32_e32 v1, 0x400", "v_mov_b32_e32 v4, v5"], 0),
+             "a move of inline 64 pairs (N12)": (["v_mov_b32_e32 v1, 64", "v_mov_b32_e32 v4, v5"], 1),
+             "a move of inline 1.0 pairs (N13)": (["v_mov_b32_e32 v1, 1.0", "v_mov_b32_e32 v4, v5"], 1),
+             "a move of inline -16 pairs": (["v_mov_b32_e32 v1, -16", "v_mov_b32_e32 v4, v5"], 1)}
+    for name, (b2, want) in cases.items():
+        got = pairs_of(b2)[0]
+        ok(got == want, f"vopd: {name}: {want} pair(s) ({got})")
     lit = [f"v_fmamk_f32 v{100 + k}, v{1 + k}, 0x{0x3fb8aa3b + k:x}, v{51 + k}" for k in range(40)]
     ok(pairs_of(lit)[0] == 0 and pairs_of(lit)[1] == 40, f"vopd: two different literals in one pair: refused (R5) ({pairs_of(lit)})")
     lit1 = [f"v_fmamk_f32 v{100 + k}, v{1 + k}, 0x3fb8aa3b, v{51 + k}" for k in range(40)]
@@ -491,17 +515,16 @@ def lesson_notes():
         return [i for _, i in lst], [int(a, 16) for a, _ in lst]
     r = kl.lint_listing("flash2_f16o", *fx("flash2_f16o_e480_loop.listing"))
     got = (r.get("vopd_pairs"), r.get("vopd_eligible"), r.get("backedge") and r["backedge"][:2], r.get("wmma_dep1"))
-    ok(got == (56, 186, (65, 31), 16), f"vopd: live flash2_f16o: 56 pairs of 186 eligible, back-edge 65 moves -> 31 pairs, 16 WMMAs at "
-       f"D->C gap <= 1 (C5 / E551; C18 r2: a different 56 from C5's, all 56 accepted by ROCm 10.2 llvm-mc, where 54 of C5's were, E580) "
-       f"({got})")
+    ok(got == (35, 129, (65, 31), 16), f"vopd: live flash2_f16o by Loom 0.2.0's planner rules: 35 pairs of 129 eligible, back-edge 65 "
+       f"moves -> 31 pairs, 16 WMMAs at D->C gap <= 1 (C5 / E551 counted 56 of 186 under looser rules; review r2) ({got})")
     lb = fx("flash2_f16o_e480_loop.listing")[0]
     two = lambda i, j: kl.lint_listing("v2", *listing(loop_of([wm, lb[i], lb[j]]))).get("vopd_pairs")
-    ok(two(776, 777) == 0 and two(779, 780) == 0 and two(604, 605) == 1,
-       f"vopd: the two pairs llvm-mc refused in C5's set (VSRC1 v238 in both halves) are refused, a legal neighbour is not "
-       f"({two(776, 777)}, {two(779, 780)}, {two(604, 605)})")
+    got = [two(i, j) for i, j in ((776, 777), (779, 780), (514, 515), (597, 601), (667, 670), (882, 884))]
+    ok(got == [0, 0, 0, 0, 0, 1], f"vopd: live pairs refused: C5's two shared-v238 pairs, the reviewer's three VSRC1-parity pairs (one "
+       f"by parity, two by a literal SRC0); a back-edge move pair is formed ({got})")
     r = kl.lint_listing("gemm_m256", *fx("gemm_f16_store_m256_e480_loop.listing"))
     got = (r.get("vopd_pairs"), r.get("vopd_eligible"), r.get("wmma_dep1"))
-    ok(got == (0, 9, 0), f"vopd: live m256 GEMM: 0 pairs of 9 eligible, 0 at gap <= 1 ({got})")
+    ok(got == (0, 1, 0), f"vopd: live m256 GEMM: 0 pairs of 1 eligible, 0 at gap <= 1 ({got})")
     ok("ldswait" not in notes(r) and not hasattr(kl, "lds_waits"), "ldswait is deleted (the ldsser lever, refuted E293 / E309 / E335 / "
        "E340; re-add only if E534's SQ_WAIT_INST_LDS contradicts E341)")
 

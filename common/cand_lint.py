@@ -55,9 +55,7 @@ CHANGED = ("CHANGED",)        # binary_gate verdicts whose kernels are linted ag
 
 WALK = 8   # loop copies walked: a load retired up to WALK - 1 iterations after its issue gets its exact cover
 MEASURED = re.compile(r"(global|buffer)_load_")      # the loads whose cover is measured (the prefetch)
-# every instruction that takes a vmcnt queue entry on gfx11: those loads, scratch (spill) and flat loads, atomics with return (glc,
-# or a _rtn name); an entry the walk missed would let a wait vmcnt(N) look like it retires fewer prefetch loads (verify r3 B)
-VMCNT_ENTRY = re.compile(r"(global|buffer|scratch|flat)_load_|(global|buffer|flat|scratch)_atomic\S*(_rtn\b|.*\bglc\b)")
+from loop_census import VMCNT_ENTRY  # noqa: E402  (every vmcnt queue entry; shared with kernel_lint's guardwait)
 
 
 def prefetch_covers(ins, addr):
