@@ -16,6 +16,7 @@ boundary. Recurrences it prevents:
 usage: python3 kit/test_autotune.py   (needs loom-compile: VENV from the environment or the machine env file)"""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -108,6 +109,17 @@ def main():
                                   timed={"top": 2, "rounds": 2, "kernels": {"at_scale": {"workload": ["n=4096"], "buf": ["w=16384", "y=16384"], "compare": ["y:f32"]}}})
         d3 = os.path.basename(os.path.dirname(by["AT_SCALE=3.0"]["rows"]["at_scale"]["hsaco"]))
         d4 = os.path.basename(os.path.dirname(by["AT_SCALE=4.0"]["rows"]["at_scale"]["hsaco"]))
+        # the key covers the disassembly too (verify r2 V3): a copy of autotune.py beside kernel_lint.py and a touched loop_census.py
+        lv = os.path.join(t, "lv"); os.makedirs(lv)
+        for f in ("autotune.py", "kernel_lint.py", "loop_census.py"):
+            shutil.copy(os.path.join(os.path.dirname(at.__file__), f), lv)
+        ver = lambda: subprocess.run([sys.executable, "-c", f"import importlib.util as u; s = u.spec_from_file_location('a', {lv + '/autotune.py'!r}); "
+                                      "m = u.module_from_spec(s); s.loader.exec_module(m); print(m.lint_version())"],
+                                     capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=os.path.dirname(at.__file__))).stdout.strip()
+        v0 = ver()
+        open(os.path.join(lv, "loop_census.py"), "a").write("\n# touched\n")
+        v1 = ver()
+        ok(v0 == at.lint_version() and v1 and v1 != v0, f"lint_version changes when loop_census.py (the disassembly) changes ({v0} -> {v1})")
         ok(d3.endswith("." + at.lint_version()) and len(at.lint_version()) == 12, f"the compile cache is keyed by kernel_lint's version: "
            f"a lint change never reuses an older lint's row.json (review r1 F6) ({d3})")
         def timed(ms):

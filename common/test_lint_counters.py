@@ -386,6 +386,19 @@ def main():
               if x.startswith("g_mv_q5 ")]
         ok(ra and rd and " 12 bound " in ra[0] and "tier 12 bound -> 15 bound" in rd[0],
            "(a) and (d2) agree on a 160-lane matvec: 12 bound, next 15", (ra, rd))
+        # the --device file's SIMD count reaches the tiers (verify r2 V8: attach_reports used 4 whatever the device said): a 64-lane
+        # workgroup with 16 KiB LDS seats 8 workgroups = 16 waves; over 2 SIMDs that is tier 8, over 4 it would be 4
+        dv = os.path.join(t, "fake2.json")
+        json.dump({"simds_per_occupancy_domain": 2}, open(dv, "w"))
+        report(os.path.join(cd, "g_two.json"), 64, 8, [SG, vgpr(48, 16, False), lds(16384, 8), slots(16)])
+        l2 = {"g_two": {"kernel": "g_two", "flags": []}, "g_none": {"kernel": "g_none", "flags": []}}
+        lc.attach_reports(l2, cd, json.load(open(dv)).get("simds_per_occupancy_domain"))
+        ok(l2["g_two"]["occ"].get("tier") == 8 and not l2["g_two"]["occ"].get("bound"),
+           "a device file with 2 SIMDs per occupancy domain: tier 8, not 4 (the --device count is used)", l2["g_two"]["occ"])
+        sn = {("g_none", "decode"): {"ms": 1.0, "calls": 1, "shapes": {8}, "lanes": {"dec w": 1.0}}}
+        rn = [x for x in lc.build(l2, sn, 1.0, [], 240)[0] if x.startswith("g_none ")]
+        ok(rn and rn[0].split()[7] == "-", "(a): a kernel without a compile report prints '-' (no report), not '?' (unverified)", rn)
+        ok("placement caveat" in sec(verdicts, noise).split("(d2)")[1], "(d2)'s header says what 'bound' means there", "")
         ma = [x for x in txt.splitlines() if x.startswith("g_mv_a ")]
         ok(ma and "35.0 %" in ma[0], "occupancy lever shows the latency-wait share (vmem 30 + lgkm 5)", ma)
         # Loom suggest beside the ranking (C6): Loom 0.2.0 named flash2_f16o's next tier 7 and the GEMMs' 5 (E533); relayed as

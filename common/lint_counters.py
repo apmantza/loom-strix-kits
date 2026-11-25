@@ -152,7 +152,7 @@ def attach_reports(lint, codes, simds):
     count (occ): (a)'s tier column; (d2) prints occupancy(), the lever view of the same tier_state() (review r1 F1: they disagreed on g_mv_q5_k_k5120_t8_q8)"""
     for k, r in lint.items():
         r["_limit"], _, vg, r["_limits"], r["_occ"] = report_limit(os.path.join(codes, k + ".json"))
-        r["occ"] = tier_state(r["_occ"], simds)
+        r["occ"] = tier_state(r["_occ"], simds) if r["_occ"] else None   # no report: (a) prints '-', (d2) 'no compile report'
         r["vgpr"] = r.get("vgpr") if r.get("vgpr") is not None else vg
 
 
@@ -695,7 +695,9 @@ def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname, sim
             "    and to what; the tier moves only when ALL of them move. Beside it the kernel's load-counter wait share at the served",
             "    level: the latency a higher tier could hide. Every served kernel is listed except those at the best reachable tier",
             "    without a Loom residency cliff. 'Loom suggest' is its residency_cliff judged against this tier: advice, not a lever",
-            "    unless it agrees.",
+            "    unless it agrees. 'N bound' (here and in (a)) is a placement caveat, not (d)'s attribution bound: the workgroup's waves",
+            "    are not a multiple of the SIMDs, so N = ceil(resident waves / SIMDs) is Loom's own busiest-SIMD count (occupancy.c) and",
+            "    the actual placement is not documented.",
             f"{'kernel':36s} {'ms':>9s} {'share%':>6s}  next reachable tier and what must move  | load waits"]
     for k in sorted(ms, key=lambda k: -ms[k]):
         lr = lint.get(k)

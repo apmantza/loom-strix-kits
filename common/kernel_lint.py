@@ -384,6 +384,8 @@ def tier_state(occ, simds):
     out = {"tier": tier, "bound": w % simds != 0, "q": w // simds if w % simds == 0 else round(w / simds, 2), "report_tier": cur,
            "next": None, "needs": [], "blocked": None}
     m = n + 1
+    while busiest(m) <= tier:     # 1-3-wave workgroups: n + 1 can leave the busiest SIMD's ceil unchanged (verify r2 V-F1); Loom
+        m += 1                    # inverts from tier + 1 the same way (occupancy.c local_memory_budget)
     if busiest(m) > cap:
         return out                                         # the wave cap: the best tier
     block = [f"{x} (tier {t})" for x, t in fixed if n_of[x] < m]
