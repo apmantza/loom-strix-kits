@@ -98,49 +98,60 @@ def occ(wg, vgpr, vtier, lds, ltier, slots, cur, cap=16, extra=()):
 
 
 def occupancy_seam():
-    """kernel_lint.occupancy(), the one occupancy seam (review r1 F1-F3); live rows from pkg-e480's reports"""
+    """kernel_lint.tier_state() and occupancy(), its lever view: the one occupancy seam (review r1 F1-F3); live rows from pkg-e480's reports"""
     o = kl.residency(os.path.join(HERE, "fixtures", "flash2_f16o_residency.json"))     # pkg-cmb2's flash2_f16o report, trimmed
-    ok(o[0] == 237 and o[1].get("tier") == 6 and o[1].get("exact") and o[1].get("next") == 9 and
+    ok(o[0] == 237 and o[1].get("tier") == 6 and not o[1].get("bound") and o[1].get("next") == 9 and
        o[1].get("needs") == [("vgpr", 237, "registers", 168, 69), ("lds", 61952, "bytes", 43008, 18944)],
        f"occupancy: flash2_f16o (384 lanes) 6 -> 9 at -69 VGPRs and -18,944 B LDS together, not Loom's 7 at -21 ({o})")
-    o = kl.occupancy(occ(160, 114, 12, 2560, 16, 15, 12), 4)                   # g_mv_q5_k_k5120_t8_q8
-    ok(o.get("tier") == 12 and o.get("exact") is False and o.get("next") == 15 and o.get("needs") == [("vgpr", 114, "registers", 96, 18)],
+    o = kl.tier_state(occ(160, 114, 12, 2560, 16, 15, 12), 4)                   # g_mv_q5_k_k5120_t8_q8
+    ok(o.get("tier") == 12 and o.get("bound") is True and o.get("next") == 15 and o.get("needs") == [("vgpr", 114, "registers", 96, 18)],
        f"occupancy: a 160-lane matvec (5 waves over 4 SIMDs) is verified at tier 12 = ceil(9 x 5 / 4), a bound, not 'unverified' "
        f"or 11.25 ({o})")
     ok(kl.tier_text(o) == "12 bound" and kl.next_text({"occ": o}) == "15 bound:v18", f"occupancy: printed '12 bound', never a "
        f"fraction ({kl.tier_text(o)}, {kl.next_text({'occ': o})})")
-    o = kl.occupancy(occ(128, 123, 10, 0, 16, 16, 10), 4)                       # g_dfl_ctx_split
-    ok(o.get("tier") == 10 and o.get("exact") and o.get("next") == 12 and o.get("needs") == [("vgpr", 123, "registers", 120, 3)],
+    o = kl.tier_state(occ(128, 123, 10, 0, 16, 16, 10), 4)                       # g_dfl_ctx_split
+    ok(o.get("tier") == 10 and not o.get("bound") and o.get("next") == 12 and o.get("needs") == [("vgpr", 123, "registers", 120, 3)],
        f"occupancy: g_dfl_ctx_split's -3 VGPRs (123 -> 120) lands on 12 waves, not 11 (review F2) ({o})")
-    o = kl.occupancy(occ(160, 114, 12, 10240, 15, 15, 12), 4)                   # g_head_mv_t8_q8
+    o = kl.tier_state(occ(160, 114, 12, 10240, 15, 15, 12), 4)                   # g_head_mv_t8_q8
     ok(o.get("tier") == 12 and o.get("next") == 15, f"occupancy: g_head_mv_t8_q8 12 -> 15 after -18 VGPRs (review F2: was 12.5) ({o})")
-    o = kl.occupancy(occ(384, 252, 5, 61952, 6, 15, 5), 4)                      # flash2_partial
+    o = kl.tier_state(occ(384, 252, 5, 61952, 6, 15, 5), 4)                      # flash2_partial
     ok(o.get("tier") == 3 and o.get("report_tier") == 5 and o.get("next") == 6, f"occupancy: flash2_partial is 3, Loom says 5 ({o})")
-    o = kl.occupancy(occ(544, 30, 16, 544, 16, 13, 13), 4)                      # g_mv_iq4_nl_k17408_q8_r8: 3 workgroups, the wave cap
+    o = kl.tier_state(occ(544, 30, 16, 544, 16, 13, 13), 4)                      # g_mv_iq4_nl_k17408_q8_r8: 3 workgroups, the wave cap
     ok(o.get("tier") == 13 and o.get("next") is None and not o.get("blocked") and kl.next_text({"occ": o}) == "best",
        f"occupancy: a 17-wave matvec at 3 workgroups is at its best tier 13 ({o})")
-    o = kl.occupancy(occ(128, 24, 16, 0, 16, 8, 8), 4)
+    o = kl.tier_state(occ(128, 24, 16, 0, 16, 8, 8), 4)
     ok(o.get("tier") == 8 and o.get("next") is None and "workgroup_slots" in (o.get("blocked") or "") and
        kl.next_text({"occ": o}) == "blocked", f"occupancy: a slot tier below the cap blocks the next tier, named ({o})")
-    o = kl.occupancy(occ(384, 100, 12, 43500, 6, 15, 6), 4)
+    o = kl.tier_state(occ(384, 100, 12, 43500, 6, 15, 6), 4)
     ok(o.get("tier") == 6 and o.get("next") == 9 and o.get("needs") == [("lds", 43500, "bytes", 43008, 492)], f"occupancy: LDS counts in 1,024-B granules: 3 x 43,500 B would fit unrounded ({o})")
-    o = kl.occupancy(occ(160, 237, 6, 0, 16, 15, 6, extra=[{"name": "amdgpu.agpr", "kind": "pooled_resource", "allocation_scope": "wave"}]), 4)
+    o = kl.tier_state(occ(160, 237, 6, 0, 16, 15, 6, extra=[{"name": "amdgpu.agpr", "kind": "pooled_resource", "allocation_scope": "wave"}]), 4)
     ok("unverified" in o.get("why", ""), f"occupancy: an unknown resource row is unverified, never a figure ({o})")
-    o = kl.occupancy(occ(384, 240, 7, 61952, 6, 15, 6), 4)
+    o = kl.tier_state(occ(384, 240, 7, 61952, 6, 15, 6), 4)
     ok("unverified" in o.get("why", ""), f"occupancy: a resource tier that recomputes differently is unverified ({o})")
-    o = kl.occupancy(occ(384, 240, 6, 61952, 6, 15, 7), 4)
+    o = kl.tier_state(occ(384, 240, 6, 61952, 6, 15, 7), 4)
     ok("unverified" in o.get("why", "") and "says 7" in o["why"], f"occupancy: every row agrees but the report's current tier does not: "
        f"unverified ({o})")
-    ok("unverified" in kl.occupancy(occ(384, 240, 6, 61952, 6, 15, 6), None).get("why", ""), "occupancy: no SIMD count: unverified")
-    o = kl.occupancy(occ(384, 240, 6, 61952, 6, 15, 6, extra=[{"name": "amdgpu.sgpr", "kind": "pooled_resource", "allocation_scope":
+    ok("unverified" in kl.tier_state(occ(384, 240, 6, 61952, 6, 15, 6), None).get("why", ""), "occupancy: no SIMD count: unverified")
+    o = kl.tier_state(occ(384, 240, 6, 61952, 6, 15, 6, extra=[{"name": "amdgpu.sgpr", "kind": "pooled_resource", "allocation_scope":
                                                                  "subgroup", "pool_units": 800, "allocation_granularity": 16,
                                                                  "units": 106, "independent_tier": 7}]), 4)
     ok("unverified" in o.get("why", ""), f"occupancy: a pooled SGPR row (not one Loom 0.2.0 emits) is unverified, not modelled ({o})")
-    f2 = {"vgpr": 240, "occ": kl.occupancy(occ(384, 240, 6, 61952, 6, 15, 6), 4)}
+    # occupancy(): the lever contract loom_suggest (C6, suggest-1125) reads: None at the best tier, {"why"} unverified or blocked
+    # ('next tier ... blocked', its phantom test), else the dict with "bound"
+    ok(kl.occupancy(occ(544, 30, 16, 544, 16, 13, 13), 4) is None, "occupancy: None at the best tier (C6's contract)")
+    o = kl.occupancy(occ(128, 24, 16, 0, 16, 8, 8), 4)
+    ok(o.get("why", "").startswith("next tier") and "blocked" in o["why"] and o.get("tier") == 8,
+       f"occupancy: blocked is {{'why': 'next tier ... blocked ...'}} with the tier kept ({o})")
+    o = kl.occupancy(occ(160, 114, 12, 2560, 16, 15, 12), 4)
+    ok(o.get("bound") is True and o.get("next") == 15 and o.get("q") == 1.25, f"occupancy: a ceil() tier carries bound: True ({o})")
+    o = kl.occupancy(occ(384, 240, 6, 61952, 6, 15, 6), 4)
+    ok(o.get("bound") is False and o.get("q") == 3 and o.get("next") == 9, f"occupancy: whole waves per SIMD: bound False, q an int ({o})")
+    ok("why" in kl.occupancy(occ(384, 240, 7, 61952, 6, 15, 6), 4), "occupancy: unverified passes {'why'} through")
+    f2 = {"vgpr": 240, "occ": kl.tier_state(occ(384, 240, 6, 61952, 6, 15, 6), 4)}
     ok(kl.live_budget(f2) == 168, f"livereg budget: flash2's next tier (9) allows 168 VGPRs, not today's 240 ({kl.live_budget(f2)})")
-    vs = {"vgpr": 256, "occ": kl.occupancy(occ(192, 256, 5, 49664, 3, 15, 3), 4)}          # g_attention_vsplit: LDS alone holds it
+    vs = {"vgpr": 256, "occ": kl.tier_state(occ(192, 256, 5, 49664, 3, 15, 3), 4)}          # g_attention_vsplit: LDS alone holds it
     ok(kl.live_budget(vs) == 256, f"livereg budget: only LDS must move: today's VGPRs ({kl.live_budget(vs)})")
-    ok(kl.live_budget({"vgpr": 30, "occ": kl.occupancy(occ(544, 30, 16, 544, 16, 13, 13), 4)}) is None,
+    ok(kl.live_budget({"vgpr": 30, "occ": kl.tier_state(occ(544, 30, 16, 544, 16, 13, 13), 4)}) is None,
        "livereg budget: none at the best tier")
 
 

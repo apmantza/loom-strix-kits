@@ -85,7 +85,7 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
             E230: a rewrite's spill; E236: a variant's residency drop).
 Reported, not flagged: non-MMA instructions per MMA, moves, VGPRs, w/S (waves per SIMD) and 'next': the tier reached once the
 VGPRs (v) and LDS bytes (l) shown are freed together, 'best' at the wave cap, 'blocked' by the slot limit; both counted in whole
-workgroups from the summary report beside the code object, KERNEL.json (occupancy(); E533: Loom 0.2.0's own tier rounds VGPRs per
+workgroups from the summary report beside the code object, KERNEL.json (tier_state(); E533: Loom 0.2.0's own tier rounds VGPRs per
 wave and named flash2's next tier 7, unreachable); 'bound' marks a workgroup whose waves are not a multiple of the SIMDs (Loom's
 ceil convention: placement unknown), pf ('drain' when a vmcnt(0) sits between the loop's last load and
 its first WMMA), and with --package the kernel's launch sites in the package. Calibrated on 225 served kernels (E237 / E241):
@@ -307,9 +307,22 @@ def device_simds(target):
 
 
 def occupancy(occ, simds):
+    """the occupancy LEVER (lint_counters (d2), loom_suggest's cliff verdict): None at the best tier (the wave cap); {"why"} when
+    unverified or when a fixed limit blocks the next tier ('next tier blocked by ...', with "tier" and "bound" kept); else
+    tier_state()'s dict {"tier", "bound", "q", "report_tier", "next", "needs": [(name, units, unit, max, cut)]}"""
+    st = tier_state(occ, simds)
+    if "why" in st:
+        return st
+    if st["blocked"]:
+        return {"why": st["blocked"], "tier": st["tier"], "bound": st["bound"]}
+    return None if st["next"] is None else st
+
+
+def tier_state(occ, simds):
     """The residency tier in whole workgroups, the next tier a workgroup can reach and what each resource must drop to for it:
-    {"tier", "exact", "q", "report_tier", "next", "needs": [(resource, units, unit, max units, cut)], "blocked"}; {"why": reason}
-    when it cannot be verified. One seam for kernel_lint's w/S and next columns, lint_counters (a) and (d2), livereg's budget.
+    {"tier", "bound", "q", "report_tier", "next", "needs": [(resource, units, unit, max units, cut)], "blocked"}; {"why": reason}
+    when it cannot be verified. The one model behind kernel_lint's w/S and next columns, lint_counters (a) and (d2) (through
+    occupancy(), the lever view of the same result), and livereg's budget.
     A workgroup of w waves lives on one occupancy domain of SIMDS SIMDs (Loom runs WGP mode: 4); n resident workgroups put
     ceil(n w / SIMDS) waves on the busiest SIMD, Loom's own rule (v0.2.0 occupancy.c:377-383, wave_limit_for_workgroups). The tier is
     that integer; it is exact when w % SIMDS == 0 and otherwise a bound (Loom's balanced placement; how the SPI places a workgroup's
@@ -368,7 +381,7 @@ def occupancy(occ, simds):
     raw = min([rep for *_, rep in pooled] + [t for _, t in fixed] + [cap])
     if cur not in (tier, raw):   # raw: the report's own unrounded minimum (E533: flash2_partial, VGPR tier 5 at 3 waves per SIMD is 3)
         return {"why": f"tier unverified: computes to {tier} in whole workgroups ({raw} unrounded), the report says {cur}"}
-    out = {"tier": tier, "exact": w % simds == 0, "q": w // simds if w % simds == 0 else round(w / simds, 2), "report_tier": cur,
+    out = {"tier": tier, "bound": w % simds != 0, "q": w // simds if w % simds == 0 else round(w / simds, 2), "report_tier": cur,
            "next": None, "needs": [], "blocked": None}
     m = n + 1
     if busiest(m) > cap:
@@ -390,18 +403,18 @@ def occupancy(occ, simds):
 
 
 def residency(js):
-    """(VGPRs, occupancy() of the summary report beside the code object) or (None, None); the row keys follow from it (lint())"""
+    """(VGPRs, tier_state() of the summary report beside the code object) or (None, None); the row keys follow from it (lint())"""
     if not os.path.exists(js):
         return None, None
     d = json.load(open(js))
     occ = occ_inputs(d)
     return (((d.get("target_resources") or {}).get("vector") or {}).get("final") or {}).get("register_count"), \
-        occupancy(occ, device_simds(occ["target"]))
+        tier_state(occ, device_simds(occ["target"]))
 
 
 def tier_text(o, key="tier"):
     """a tier for print: the integer, plus ' bound' where the workgroup's waves are not a multiple of the SIMDs (placement unknown)"""
-    return "-" if not o or o.get(key) is None else f"{o[key]}{'' if o.get('exact') else ' bound'}"
+    return "-" if not o or o.get(key) is None else f"{o[key]}{' bound' if o.get('bound') else ''}"
 
 
 def next_text(r):
@@ -562,7 +575,7 @@ def live_text(r):
 
 
 def live_budget(r):
-    """the VGPRs a wave may hold at the next reachable tier (occupancy()'s VGPR cut, or today's count when only another resource must
+    """the VGPRs a wave may hold at the next reachable tier (tier_state()'s VGPR cut, or today's count when only another resource must
     move); None at the best tier, blocked or unverified (no over count then)"""
     o = r.get("occ")
     if not o or "why" in o or o["next"] is None:
@@ -628,7 +641,7 @@ def lint_listing(name, ins, addr, res=(None, None)):
     r = {"kernel": name, "instr": len(ins), "flags": []}
     r["vgpr"], r["occ"] = res
     o = r["occ"] if r["occ"] and "why" not in r["occ"] else None
-    r["waves"], r["waves_exact"] = (o["tier"], o["exact"]) if o else (None, None)
+    r["waves"], r["waves_bound"] = (o["tier"], o["bound"]) if o else (None, None)
     r["next_tier"], r["to_next"] = (o["next"], {n: c for n, _, _, _, c in o["needs"]}) if o else (None, None)
     h = hot(ins, addr)
     if h is None or not any(ins[j].startswith(MM) for j in common_path(ins, h[2], h[0], h[1])):

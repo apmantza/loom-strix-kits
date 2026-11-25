@@ -88,7 +88,7 @@ import ceiling  # noqa: E402
 import counter_saturation  # noqa: E402
 import events_summary  # noqa: E402
 import kernel_lint  # noqa: E402
-from kernel_lint import occ_inputs, occupancy  # noqa: E402,F401  (the one occupancy seam; lint_counters' tests call lc.occupancy)
+from kernel_lint import occ_inputs, occupancy, tier_state  # noqa: E402,F401  (the one occupancy seam; tests call lc.occupancy)
 
 MEM_MIN = 25.0       # % of wave cycles on load counters (serial, scratch, reread)
 BW_MAX = 0.70        # serial: GB/s below this fraction of the device ceiling (else bandwidth-bound)
@@ -143,11 +143,11 @@ def report_limit(js):
 
 
 def attach_reports(lint, codes, simds):
-    """each lint row's compile-report fields: limit, limits, occupancy inputs (_occ) and occupancy() with the --device file's SIMD
-    count (occ), which (a)'s tier column and (d2) both print (review r1 F1: they disagreed on g_mv_q5_k_k5120_t8_q8)"""
+    """each lint row's compile-report fields: limit, limits, occupancy inputs (_occ) and tier_state() with the --device file's SIMD
+    count (occ): (a)'s tier column; (d2) prints occupancy(), the lever view of the same tier_state() (review r1 F1: they disagreed on g_mv_q5_k_k5120_t8_q8)"""
     for k, r in lint.items():
         r["_limit"], _, vg, r["_limits"], r["_occ"] = report_limit(os.path.join(codes, k + ".json"))
-        r["occ"] = occupancy(r["_occ"], simds)
+        r["occ"] = tier_state(r["_occ"], simds)
         r["vgpr"] = r.get("vgpr") if r.get("vgpr") is not None else vg
 
 
@@ -417,7 +417,7 @@ def build(lint, srv, total, workloads, bw_ceiling):
         ln = " ".join(lr.get("flags", [])) + (" [" + " ".join(lr["notes"]) + "]" if lr.get("notes") else "") if lr else "not linted"
         lim, vg = (lr.get("_limit"), lr.get("vgpr")) if lr else (None, None)
         o = lr.get("occ") if lr else None
-        tier = kernel_lint.tier_text(o) if o and "why" not in o else "?" if o else "-"   # kernel_lint's occupancy(), as (d2): '?' unverified
+        tier = kernel_lint.tier_text(o) if o and "why" not in o else "?" if o else "-"   # kernel_lint's tier_state(), as (d2): '?' unverified
         cc, sat = counters_cell(workloads, k)
         A.append(f"{k:40s} {ph:7s} {r['ms']:9.1f} {100 * r['ms'] / total:6.2f} {r['calls']:6d} {len(r['shapes']):3d} "
                  f"{lim or '-':>9s} {tier:>8s} {str(vg if vg is not None else '-'):>4s}  {ln or '-':28s} "
@@ -683,13 +683,11 @@ def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname, sim
             f"{'kernel':36s} {'ms':>9s} {'share%':>6s}  next reachable tier and what must move  | load waits"]
     for k in sorted(ms, key=lambda k: -ms[k]):
         lr = lint.get(k)
-        o = (lr.get("occ") or occupancy(lr.get("_occ"), simds)) if lr else {"why": "not linted: no compile report"}
-        if "why" not in o and o["next"] is None and not o["blocked"]:
+        o = occupancy(lr.get("_occ"), simds) if lr else {"why": "not linted: no compile report"}
+        if o is None:
             continue                                       # the best tier (wave cap)
         if "why" in o:
-            txt = o["why"]
-        elif o["blocked"]:
-            txt = f"tier {kernel_lint.tier_text(o)}: {o['blocked']}"
+            txt = (f"tier {kernel_lint.tier_text(o)}: " if "tier" in o else "") + o["why"]
         else:
             txt = (f"tier {kernel_lint.tier_text(o)}" + (f" (report: {o['report_tier']}, not whole workgroups, E533)" if o["report_tier"] != o["tier"] else "")
                    + f" -> {kernel_lint.tier_text(o, 'next')} ({o['q']} waves/SIMD per workgroup): " +

@@ -224,7 +224,7 @@ def main():
         ok(o.get("tier") == 3 and o.get("report_tier") == 5 and o.get("next") == 6 and o.get("needs") == [("vgpr", 252, "registers", 240, 12)],
            "the report's unrounded tier (flash2_partial: VGPR 5 at 3 waves per workgroup) is really 3; next 6 needs VGPR <= 240", o)
         o = lc.occupancy(lc.report_limit(report(os.path.join(t, "m.json"), 160, 12, [SG, vgpr(114, 12)]))[4], 4)
-        ok(o.get("tier") == 12 and o.get("exact") is False and o.get("next") == 15, "160 lanes (5 waves over 4 SIMDs): verified at "
+        ok(o.get("tier") == 12 and o.get("bound") is True and o.get("next") == 15, "160 lanes (5 waves over 4 SIMDs): verified at "
            "ceil(9 x 5 / 4) = 12, a bound (Loom's convention), next 15 at VGPR <= 96 (review r1 F1/F2: was 'unverified')", o)
         o = lc.occupancy(lc.report_limit(report(os.path.join(t, "n.json"), None, 6, [SG, vgpr(240, 6)]))[4], 4)
         ok("tier unverified" in o.get("why", ""), "no workgroup size in the report: tier unverified", o)
@@ -233,8 +233,9 @@ def main():
         o = lc.occupancy(lc.report_limit(report(os.path.join(t, "d.json"), 384, 7, [SG, vgpr(240, 6), lds(61952, 6)]))[4], 4)
         ok("tier unverified" in o.get("why", "") and "report" in o["why"], "computed tier disagrees with the report: unverified", o)
         o = lc.occupancy(lc.report_limit(report(os.path.join(t, "s.json"), 384, 6, [SG, vgpr(240, 6), lds(61952, 6), slots(7)]))[4], 4)
-        ok(o.get("next") is None and "workgroup_slots" in (o.get("blocked") or ""), "a fixed limit below the next tier blocks it (named)", o)
-        best = lambda o: o.get("tier") == 16 and o.get("next") is None and not o.get("blocked")
+        ok("workgroup_slots" in o.get("why", "") and o["why"].startswith("next tier") and "blocked" in o["why"] and o.get("tier") == 6,
+           "a fixed limit below the next tier blocks it (named; 'next tier ... blocked' is loom_suggest's phantom test)", o)
+        best = lambda o: o is None                     # the contract loom_suggest (C6) relies on: None at the best tier
         ok(best(lc.occupancy(lc.report_limit(report(os.path.join(t, "b.json"), 128, 16, [SG, vgpr(24, 16, False)]))[4], 4)),
            "at the wave cap: no occupancy lever", "")
         ok(best(lc.occupancy(lc.report_limit(report(os.path.join(t, "z.json"), 256, 16, [SG, vgpr(24, 16, False), lds(0, 16, False)]))[4], 4)),
