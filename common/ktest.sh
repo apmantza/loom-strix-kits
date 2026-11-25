@@ -8,13 +8,16 @@ P=${2:?package dir}; T=${3:?test dir}
 # KTEST_BASE=PKG (optional): judge the delta (common/ktest_delta.py). A red candidate runs the base package's tests from the same
 # kit tree; a case red on both is INHERITED, not a stop (E445). Unset: every FAIL stops, as before.
 # KTEST_CHANGED=BGATE.json (optional; binary_gate rows against a base, e.g. PKG.lint/bgate.json from build.sh LINT_BASE): generate
-# and run only the cases launching a kernel the gate reports CHANGED or NEW, plus the smoke set (kit/ktest_select.py SMOKE); the
-# full generation costs ~35 GB / ~100 s / 18 GB of inputs (HRX-like E532). Fails closed: a changed set the file cannot give
-# (unreadable, a kernel the gate could not judge) or a selection without a smoke case or a case of a changed kernel runs the full
-# suite. Go-live candidates run without it (the full suite).
+# and run only the cases testing a kernel the gate reports CHANGED, NEW or text-only (directly or through a test copy), plus the
+# smoke set (kit/ktest_select.py SMOKE); the full generation costs ~35 GB / ~100 s / 18 GB of inputs (HRX-like E532). Fails closed
+# to the full suite: a changed set the file cannot give (unreadable, a kernel the gate could not judge, a verdict.json beside it that
+# names another candidate than PKG or another base than KTEST_BASE, or none), or a selection without a smoke case or with a changed
+# kernel no case tests (make_kernel_tests.py exit 3). With KTEST_BASE the base's run uses the same selection. Go-live candidates
+# run without KTEST_CHANGED (the full suite).
 KS=""; FULL=1
 if [ -n "${KTEST_CHANGED:-}" ]; then
-  if KS=$(python3 "$KIT_SRC/ktest_select.py" changed "$KTEST_CHANGED"); then FULL=0; echo "ktest: selected (changed vs base: ${KS:-none})"
+  idargs=(--cand "$P"); [ -n "${KTEST_BASE:-}" ] && idargs+=(--base "$KTEST_BASE")
+  if KS=$(python3 "$KIT_SRC/ktest_select.py" changed "$KTEST_CHANGED" "${idargs[@]}"); then FULL=0; echo "ktest: selected (changed vs base: ${KS:-none})"
   else echo "ktest: changed set unknown: full suite"; fi
 fi
 run_one() {   # PKG_DIR TESTDIR -> TESTDIR.run.log; the switches come from PKG_DIR.cmd

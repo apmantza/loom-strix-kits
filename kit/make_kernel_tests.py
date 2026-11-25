@@ -106,18 +106,27 @@ KT_ONLY = {k for k in os.environ["KTEST_KERNELS"].split(",") if k} if "KTEST_KER
 KT_SKIPPED = []   # the declarations of the sections a selected generation skipped
 
 
+_KT_DEFINED = []
+
+
+def kt_defined():
+    """the package's kernel names (ktest_select.kernel_of places launched copies with them), or None without a package"""
+    if not _KT_DEFINED:
+        t = _pkg_llm_text()
+        _KT_DEFINED.append(ktest_select.defined_kernels(t) if t else None)
+    return _KT_DEFINED[0]
+
+
 def kt_section(kernels, build):
-    """Run case builder BUILD unless a selected generation wants none of KERNELS, the package kernels its cases launch (kt_K copies
-    as K). The declaration is checked on every run that builds the section: a case launching a package kernel outside it stops the
-    generation, so a skipped section cannot hide a case of a selected kernel for long (test_ helper kernels are the file's own)."""
+    """Run case builder BUILD unless a selected generation wants none of KERNELS, the package kernels its cases test (copies
+    count as their kernel). The declaration is checked on every run that builds the section (ktest_select.check_declared): a case
+    testing a package kernel outside it stops the generation, so a skipped section cannot hide a case of a selected kernel for long."""
     if KT_ONLY is not None and not KT_ONLY & set(kernels):
         KT_SKIPPED.append(kernels)
         return
     n = len(cases)
     build()
-    extra = {k for c in cases[n:] for k in ktest_select.launches(c) if not k.startswith("test_")} - set(kernels)
-    if extra:
-        sys.exit(f"make_kernel_tests: kt_section({sorted(kernels)}) also launches {sorted(extra)}: add them to its declaration")
+    ktest_select.check_declared(cases[n:], kernels, kt_defined() or set(kernels))
 def save(n, a): np.save(os.path.join(out, n + KS + ".npy"), a)
 
 
@@ -5231,15 +5240,10 @@ KNOWN_DEFECTS = {"E444": ("" if os.environ.get("KV8", "0") == "1" or os.environ.
                           "stale_kv_split_decode_nan stale_kv_split_decode_inf").split()}
 text = "\n".join(cases)
 if KT_ONLY is not None:
-    _all = len(re.findall(r"(?m)^check\.case public @", text))
-    text, _kept, _smoke = ktest_select.by_kernels(text, KT_ONLY)
     print(f"selected generation: skipped {len(KT_SKIPPED)} sections (" + "; ".join(",".join(sorted(k)) for k in KT_SKIPPED[:3])
           + (" ..." if len(KT_SKIPPED) > 3 else "") + ")")
-    print(f"selected generation: {len(_kept)} of {_all} cases launch {', '.join(sorted(KT_ONLY)) or 'no listed kernel'} or are smoke "
-          f"({', '.join(_smoke) or 'none'})")
-    if not KS and (not _smoke or (KT_ONLY and not ktest_select.launches(text) & KT_ONLY)):
-        print("selected generation: no smoke case, or no case launches a selected kernel: refusing (run the full suite)")
-        sys.exit(3)
+    text, _lines = ktest_select.finish_selection(text, KT_ONLY, kt_defined(), child=bool(KS))   # exit 3: refused (full suite)
+    print("\n".join(_lines))
     cases = [text]
 if not KS:
     _have = set(re.findall(r"(?m)^check\.case public @(\w+) \{", "\n".join(cases)))
