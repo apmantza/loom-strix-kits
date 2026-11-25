@@ -13,9 +13,10 @@ being prepared on), the `--help=all` text (`--help` where =all is refused) of ev
 and of each argparse subcommand, plus the docs/workflows file list at tag v<version> of an hrx-system checkout
 (--hrx-system). Snapshots are cached per hrx-loom version (--surface-cache); each run prints the flags, binaries and workflows
 that are new or removed against the cached snapshot of the same version (or, on a version's first run, the newest older one)
-and between the installed and the next venv. A Loom release once shipped a sanitizer and a profiling filter nobody here used
-for weeks. The diff sees help text only: an option accepted but not listed (loom-compile 0.2.0 accepts `--sanitizer=race`
-while its help lists access / value / operation) is invisible to it; changed description lines are counted per tool.
+and between the installed and the next venv. Loom 0.2.0 shipped an LDS race sanitizer and a one-function profiling filter
+that went unused here until a survey found them (HRX-like E530). The diff sees help text only: an option accepted but not
+listed (loom-compile 0.2.0 accepts `--sanitizer=race` while its help lists access / value / operation) is invisible to it;
+changed description lines are counted per tool.
 usage: fresh.py KIT [--venv DIR] [--venv-next DIR] [--hrx-system CHECKOUT] [--surface-cache DIR]"""
 import argparse
 import concurrent.futures
