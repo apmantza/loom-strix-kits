@@ -103,7 +103,17 @@ def main():
         case("a parenthetical note after the rows is admitted and its terms searched", not lt.preflight(note, log)[0])
         note2 = w("q308.sh", "#!/bin/bash\n# prior: E11 (a note on why) (searched: tile order)\necho\n")
         case("... and the terms in it still find E10", any("E10" in x for x in lt.preflight(note2, log)[0]))
-        case("a grandfathered step passes with a note", lt.preflight(reopen, log, grandfather=300)[1][0].endswith("written before this check)"))
+        # grandfathering by a sha256 list (HRX-like C16 verify r3: a digit-run cut let 'q1_flash.sh' skip both checks, and a listed
+        # step rewritten in place, e.g. W/q137.sh, would have run a new lever with every check skipped)
+        import hashlib
+        gl = w("grandfathered.sha256", "# steps before the check\n" + hashlib.sha256(open(reopen, "rb").read()).hexdigest()
+               + "  " + os.path.basename(reopen) + "\n")
+        pr, notes = lt.preflight(reopen, log, grandfather=gl)
+        case(f"a listed step with its sha256 passes with a note ({notes})", not pr and "grandfathered" in notes[0])
+        rew = open(reopen).read()
+        open(reopen, "a").write("# rewritten in place\n")
+        case("a listed step rewritten in place (sha256 differs): checked, refused", bool(lt.preflight(reopen, log, grandfather=gl)[0]))
+        open(reopen, "w").write(rew)
 
         # probe card. Recurrence: results believed with no prediction made before the run (a harness 2x where serving gave 3-8 %).
         good = w("q200.sh", CARD)
@@ -121,7 +131,28 @@ def main():
             case(f"{bad!r}: MISSING ({why})", rc == 1 and why in out)
         p = w("q211.sh", CARD.replace("all ([0-9.]+)", "all [0-9.]+"))
         case("a result regex without a capture group: MISSING", cli("probe-card", "check", p)[0] == 1)
-        case("grandfathered: PROBE: OK", cli("probe-card", "check", "--grandfather", "200", w("q199.sh", "#!/bin/bash\n"))[0] == 0)
+        q199 = w("q199.sh", "#!/bin/bash\n")
+        q1f = w("q1_flash.sh", "#!/bin/bash\n")
+        gl2 = w("gf2.sha256", hashlib.sha256(b"#!/bin/bash\n").hexdigest() + "  q199.sh\n")
+        rc, out = cli("probe-card", "check", "--grandfather-list", gl2, q199)
+        case(f"probe-card: a listed step with its sha256: PROBE: OK ({out.strip()[:70]})", rc == 0 and "grandfathered" in out)
+        rc, out = cli("probe-card", "check", "--grandfather-list", gl2, q1f)
+        case(f"probe-card: q1_flash.sh (same content, not listed): MISSING ({out.strip()[-14:]})", rc == 1)
+        open(q199, "a").write("echo new lever\n")
+        rc, out = cli("probe-card", "check", "--grandfather-list", gl2, q199)
+        case("probe-card: the listed step rewritten in place: MISSING", rc == 1)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = cli("probe-card", "check", "--grandfather", "167", q1f)[0]
+        except SystemExit as e:
+            rc = e.code
+        case(f"probe-card: the old '--grandfather 167' (window.sh's call before r4) exits 2, never a pass (rc {rc})", rc == 2)
+        rc, out = cli("probe-card", "check", "--grandfather-list", w("gf3.sha256", "deadbeef  q199.sh\n"), q199)
+        case(f"probe-card: a malformed list line: exit 2 ({out.strip()[:60]})", rc == 2 and "ERROR" in out)
+        rc, out = cli("probe-card", "check", "--grandfather-list", os.path.join(t, "nolist"), q199)
+        case("probe-card: an unreadable list: exit 2", rc == 2)
+        rc, out = cli("probe-card", "check", "--grandfather-list", w("gf4.sha256", hashlib.sha256(b"#!/bin/bash\n").hexdigest() + "  sub/q199.sh\n"), q199)
+        case("probe-card: a list row naming a path, not a file name: exit 2", rc == 2)
         # Recurrence (HRX-like E508): q201 ran a timed measurement as `events_ab.sh ... && events_summary.py ...; sed ...`: a failed
         # measurement skipped its own judgement and the step went on green. A measurement in an && chain must stop the step on failure.
         silent = w("q212.sh", CARD + "bash $E/scripts/events_ab.sh $LA 100000 a b b a > abl.log 2>&1 \\\n  && python3 events_summary.py $LA/1-a > g.txt; sed -n 1p g.txt\n")
@@ -264,6 +295,13 @@ def main():
                 ("g_attention_flash2_f16o|g_attention_flash2_partial_f16o selects 113 -> 113", True, "two live alternatives, both checked")):
             rc, out = cli("compiler-check", w("q241.sh", CARD.replace("# result:", "# compiler: " + line + "\n# result:")), cmb2, base)
             case(f"compiler-check, {what}: {'OK' if ok_ else 'refused'} ({out.strip().splitlines()[-2][-70:] if not ok_ else out.strip()[-12:]})", (rc == 0) == ok_)
+        # N7: per-MMA ratios have their own band (0.05), not the instruction-count band (2)
+        for built_t, line, ok_, what in ((base, "28.8 -> 28.8", True, "base against itself"),
+                                         (w("lint-r1.txt", LINT_BASE.replace("   28.8 ", "  28.84 ", 1)), "28.8 -> 28.8", True, "28.84 inside 0.05"),
+                                         (w("lint-r2.txt", LINT_BASE.replace("   28.8 ", "   28.9 ", 1)), "28.8 -> 28.8", False, "28.9 outside 0.05"),
+                                         (cmb2, "28.8 -> 28.8", False, "27.2 read (1.6 off, inside a count band of 2)")):
+            rc, out = cli("compiler-check", w("q247.sh", CARD.replace("# result:", "# compiler: g_attention_flash2_f16o non_mma_per_mma " + line + "\n# result:")), built_t, base)
+            case(f"compiler-check N7 ratio band, unchanged predicted, {what}: {'OK' if ok_ else 'refused'}", (rc == 0) == ok_)
         # V14: kernel-level rows (no loop) are read like loop rows
         krow = "g_rmsnorm_f16                                kernel   120   120    0      0.0    4   0    0    0   10    4   48  16    -     -     0     0    0   0     0        -\n"
         rc, out = cli("compiler-check", w("q242.sh", CARD.replace("# result:", "# compiler: g_rmsnorm_f16 vgpr 48 -> 40\n# result:")),
