@@ -107,6 +107,17 @@ def main():
         p = w("q211.sh", CARD.replace("all ([0-9.]+)", "all [0-9.]+"))
         case("a result regex without a capture group: MISSING", cli("probe-card", "check", p)[0] == 1)
         case("grandfathered: PROBE: OK", cli("probe-card", "check", "--grandfather", "200", w("q199.sh", "#!/bin/bash\n"))[0] == 0)
+        # Recurrence (HRX-like E508): q201 ran a timed measurement as `events_ab.sh ... && events_summary.py ...; sed ...`: a failed
+        # measurement skipped its own judgement and the step went on green. A measurement in an && chain must stop the step on failure.
+        silent = w("q212.sh", CARD + "bash $E/scripts/events_ab.sh $LA 100000 a b b a > abl.log 2>&1 \\\n  && python3 events_summary.py $LA/1-a > g.txt; sed -n 1p g.txt\n")
+        rc, out = cli("probe-card", "check", silent)
+        case(f"a measurement in an && chain with no stop on failure: MISSING ({out.strip()[:70]})", rc == 1 and "&& chain" in out)
+        stops = w("q213.sh", CARD + "bash $E/scripts/agent_ab.sh a b out && python3 s.py out || { echo 'STOP'; exit 1; }\n")
+        case("... the same chain ending in '|| { ...; exit 1; }': OK", cli("probe-card", "check", stops)[0] == 0)
+        plain = w("q214.sh", CARD + "bash $K/common/counters.sh o waits -- x > o.log 2>&1 || fail counters\n[ -f a ] && echo ok\n")
+        case("a measurement with its own stop, and an && chain with no measurement: OK", cli("probe-card", "check", plain)[0] == 0)
+        quoted = w("q215.sh", CARD + "# events_ab.sh a && b (a comment)\necho 'hsaco_run.py && x'\n")
+        case("a comment or a quoted string naming a tool is not a measurement", cli("probe-card", "check", quoted)[0] == 0)
 
         # verdict. Recurrence: a measured figure outside its prediction was taken as the lever's effect, not checked as the measurement.
         summ = "paired decode time pkg-b/pkg-a (95 % CI over turns): all {} [0.9, 1.0]; h1 0.95\n"

@@ -252,6 +252,24 @@ def card(step):
     return f, probs
 
 
+# a timed or judged GPU measurement (HRX-like E508: q201's `events_ab.sh ... && events_summary.py ...; sed` skipped its judgement when
+# the measurement failed and the step went on green): in an && chain, the logical line must end the step on failure
+MEASURE = re.compile(r"\b(events_ab\.sh|agent_ab\.sh|counters\.sh|hsaco_run\.py|replay\.py|eq\.sh|gates\.sh|ktest\.sh|serve_as\.sh)\b")
+STOPS = re.compile(r"\|\|\s*(\{[^}]*\b(exit|fail|die)\b|exit\b|fail\b|die\b)")
+
+
+def chains(text):
+    """Problems: logical lines (continuations joined; comments and quoted strings blanked) that run a measurement inside an && chain
+    and do not end the step when it fails. Known-good form only: a '|| exit / fail / die' (or '|| { ...; exit ...; }') on the line."""
+    probs = []
+    for line in re.sub(r"\\\n", " ", text).split("\n"):
+        code = re.sub(r"'[^']*'|\"[^\"]*\"", "''", line)
+        code = re.sub(r"(^|\s)#.*", "", code)
+        if MEASURE.search(code) and "&&" in code and not STOPS.search(code):
+            probs.append(f"a measurement in an && chain with no stop on failure (a failed run skips its judgement, E508): {line.strip()[:100]!r}")
+    return probs
+
+
 def verdict(step, result=None):
     """(line, exit code, detail lines)"""
     f, probs = card(step)
@@ -341,6 +359,7 @@ def main(argv=None):
                 print(f"PROBE: OK ({name}: grandfathered, number <= {a.grandfather})")
                 return 0
             f, probs = card(a.step)
+            probs += chains(open(a.step).read())
             for x in probs:
                 print(f"PROBE MISSING {name}: {x}")
             if probs:
