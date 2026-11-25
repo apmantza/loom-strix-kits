@@ -852,6 +852,13 @@ def barrier_check(text, funcs=None, races=False):
             K.pop(d, None)
             region.pop(d, None)
             vinfo.pop(d, None)
+    def scope():                                          # a block's bindings end with it (Loom lets an inner name shadow an outer one)
+        saved = (dict(K), dict(region), dict(vinfo))
+        def close():
+            for m, v in zip((K, region, vinfo), saved):
+                m.clear()
+                m.update(v)
+        return close
     try:
         T = _taint(tree, funcs)
         nodes = [("entry", None, None)]                   # (kind, line, info): entry | bar | col | head | acc
@@ -882,7 +889,8 @@ def barrier_check(text, funcs=None, races=False):
                     raise NotAnalysed(f"line {it[1]}: a workgroup view flows through an scf.{it[0]}")
                 if it[0] == "for":
                     h = re.match(r"(?:(.*?)=\s*)?scf\.for\s+(%\w+)\s*=\s*\[([^\]]*)\](?:\((.*?)\))?", it[2])
-                    bind(re.findall(r"%\w+", h.group(1) or "") + [h.group(2)] + re.findall(r"(%\w+)\s*=", h.group(4) or ""))
+                    close = scope()
+                    bind([h.group(2)] + re.findall(r"(%\w+)\s*=", h.group(4) or ""))
                     b = re.split(r"\s+(?:to|step)\s+", h.group(3).strip())
                     trip = None
                     if re.search(r"\bunroll\s*\{$", it[2]) and len(b) == 3 and all(const(x) is not None for x in b):
@@ -893,19 +901,24 @@ def barrier_check(text, funcs=None, races=False):
                              ctl + ([it[1]] if set(re.findall(r"%\w+", h.group(3))) & T else []))
                     for p in ex:
                         succ[p].add(hd[0])
+                    close()
+                    bind(re.findall(r"%\w+", h.group(1) or ""))
                     preds = hd
                     continue
                 if it[0] == "if":
                     c = re.match(r"(?:(.*?)=\s*)?scf\.if\s+(%\w+)", it[2])
                     if not c:
                         raise NotAnalysed(f"line {it[1]}: scf.if condition not parsed")
-                    bind(re.findall(r"%\w+", c.group(1) or ""))
                     nonuni = c.group(2) in T
                     c2 = ctl + ([it[1]] if nonuni else [])
                     n0 = len(nodes)
+                    close = scope()
                     t_ex = seq(it[3], preds, mult, c2)
+                    close()
                     n1 = len(nodes)
                     e_ex = seq(it[4], preds, mult, c2) if it[4] is not None else list(preds)
+                    close()
+                    bind(re.findall(r"%\w+", c.group(1) or ""))
                     if nonuni and races:                    # one invocation in each arm at once
                         for x in range(n0, n1):
                             cross[x].update(range(n1, len(nodes)))

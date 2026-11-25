@@ -466,6 +466,37 @@ def main():
                             "  %hi = buffer.view %t[%c128] : buffer -> view<32xf32>\n  %r = view.load %hi[%c0] : view<32xf32> -> f32\n"), shift)
     ok(wanted(b) == ["orders", "orders"], f"barrier: a buffer a callee returns has no known base: a view of it overlaps every view "
        f"of the region ({wanted(b)})")
+    # shadowing (verify r2 V-B1: Loom allows an inner name to shadow an outer one, hrx-system v0.2.0 parser_test.py
+    # test_child_shadows_parent; r2's walk-order binding erased the outer binding for the rest of the walk -> 'orders nothing')
+    u = "  %u = index.cmp ult, %n, %c32 : index\n"
+    SH = {
+        "S1 an if arm shadows the region view's name with an index": st + bar + u + "  scf.if %u {\n  %tv = index.constant 3 : index\n  }\n" + nb,
+        "S1b an if arm shadows it with a view of a global buffer": st + bar + u + "  scf.if %u {\n  %tv = buffer.view %x[%c0] : buffer -> "
+            "view<64xf32>\n  %q = view.load %tv[%c0] : view<64xf32> -> f32\n  }\n" + nb,
+        "S1c a loop body shadows it": st + bar + "  scf.for %i = [%c0 to %n step %c1] {\n  %tv = index.add %i, %c1 : index\n  }\n" + nb,
+        "S1d an if arm shadows the alloca root": st + bar + u + "  scf.if %u {\n  %t = index.constant 3 : index\n  }\n"
+            "  %tv2 = buffer.view %t[%c0] : buffer -> view<64xf32>\n  %nb = index.sub %c32, %tid : index\n"
+            "  %r = view.load %tv2[%nb] : view<64xf32> -> f32\n",
+        "S2 an if arm shadows an offset constant (outer 0, arm 128)": "  %c128 = index.constant 128 : index\n  %off = index.constant 0 : index\n"
+            "  %lo = buffer.view %t[%c0] : buffer -> view<32xf32>\n  view.store %v, %lo[%tid] : f32, view<32xf32>\n" + bar + u +
+            "  scf.if %u {\n  %off = index.constant 128 : index\n  }\n  %hi = buffer.view %t[%off] : buffer -> view<32xf32>\n"
+            "  %r = view.load %hi[%tid] : view<32xf32> -> f32\n",
+        "S3 an if arm shadows a view by one at another offset": "  %c128 = index.constant 128 : index\n  %w = buffer.view %t[%c0] : buffer -> "
+            "view<32xf32>\n  view.store %v, %w[%tid] : f32, view<32xf32>\n" + bar + u + "  scf.if %u {\n  %w = buffer.view %t[%c128] : "
+            "buffer -> view<32xf32>\n  }\n  %r = view.load %w[%tid] : view<32xf32> -> f32\n",
+    }
+    for k, t in SH.items():
+        b = kl.barrier_check(bk(t))
+        ok(b["status"] == "analysed" and wanted(b) == ["orders"], f"barrier: {k}: the outer binding holds after the scope: orders "
+           f"({b['status']}, {wanted(b)})")
+    t = bk(st + bar + nb).replace("  %c0 = index.constant 0 : index\n", "  %c0 = index.constant 0 : index\n  %c64 = index.constant 8 : index\n", 1)
+    b = kl.barrier_check(t)
+    ok(b["status"] == "analysed", f"barrier: workgroup_size reads the launch config's constants, not a launch-body name reuse "
+       f"(%c64 = 8 in the body is not 'single wave') ({b['status']})")
+    b = kl.barrier_check(bk("  %c124 = index.constant 124 : index\n  %lo = buffer.view %t[%c0] : buffer -> view<32xf32>\n"
+                            "  %hi = buffer.view %t[%c124] : buffer -> view<32xf32>\n  view.store %v, %lo[%tid] : f32, view<32xf32>\n"
+                            + bar + "  %r = view.load %hi[%tid] : view<32xf32> -> f32\n"))
+    ok(wanted(b) == ["orders"], f"barrier: views [0, 128) and [124, 252) overlap by one f32: orders ({wanted(b)})")
     row = {"kernel": "g_b", "s_barrier": 3}
     kl.barriers([row], {"g_b": bk(st + "  %s = kernel.workgroup.reduce<maxnumf> %v : f32\n" + bar + nb)}, {})
     ok(row["barrier"]["status"] == "analysed", f"barrier: a workgroup reduce is two s_barriers in the binary (GEMM: 3 + 2) "
