@@ -96,6 +96,37 @@ def ffn_act(g):
     return g / (1 + np.exp(-g))
 cases = []
 KS = os.environ.get("KTEST_HEADS_SFX", "")   # a child run for a narrower query-head count (see the end): _h<heads>
+import ktest_select  # noqa: E402
+# Selected generation (common/ktest.sh KTEST_CHANGED, from binary_gate's changed kernels against a base package): KTEST_KERNELS, a
+# comma-separated list (empty: the smoke set only), keeps the cases that launch one of them plus ktest_select.SMOKE (by_kernels, at
+# the end) and skips the costly sections (kt_section) whose cases launch none of them. Unset: every case (go-live candidates).
+KT_ONLY = {k for k in os.environ["KTEST_KERNELS"].split(",") if k} if "KTEST_KERNELS" in os.environ else None
+
+
+KT_SKIPPED = []   # the declarations of the sections a selected generation skipped
+
+
+_KT_DEFINED = []
+
+
+def kt_defined():
+    """the package's kernel names (ktest_select.kernel_of places launched copies with them), or None without a package"""
+    if not _KT_DEFINED:
+        t = _pkg_llm_text()
+        _KT_DEFINED.append(ktest_select.defined_kernels(t) if t else None)
+    return _KT_DEFINED[0]
+
+
+def kt_section(kernels, build):
+    """Run case builder BUILD unless a selected generation wants none of KERNELS, the package kernels its cases test (copies
+    count as their kernel). The declaration is checked on every run that builds the section (ktest_select.check_declared): a case
+    testing a package kernel outside it stops the generation, so a skipped section cannot hide a case of a selected kernel for long."""
+    if KT_ONLY is not None and not KT_ONLY & set(kernels):
+        KT_SKIPPED.append(kernels)
+        return
+    n = len(cases)
+    build()
+    ktest_select.check_declared(cases[n:], kernels, kt_defined() or set(kernels))
 def save(n, a): np.save(os.path.join(out, n + KS + ".npy"), a)
 
 
@@ -3000,7 +3031,7 @@ def skv_vsplit_cases():
 # and read back NaN: the 6 failures carried since E46/E57); with vsplit live the vsplit cases replace them (LEDGER E70).
 _lib = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "program", "llm.loom")
 L17_LIVE = os.path.exists(_lib) and 'export("g_attention_vsplit")' in open(_lib).read()
-if L17_LIVE or os.environ.get("L17_VSPLIT_TESTS") == "1":
+def _vsplit_cases():
     for _p0, _T in ((4109, 8), (4109, 3), (20013, 8), (4156, 8), (2043, 8)):   # 2043: the span crosses the L17_FROM = 2048 threshold
         attention_vsplit_case(f"vsplit_{_p0}_{_T}", _p0, _T)
     attention_vsplit_case("vsplit_4109_8", 4109, 8, neg=True)
@@ -3020,6 +3051,10 @@ if L17_LIVE or os.environ.get("L17_VSPLIT_TESTS") == "1":
     for _tag, _p0, _T in (("vscat_300_8", 300, 8), ("vscat_300_1", 300, 1), ("vscat_4109_8", 4109, 8)):
         attention_vsplit_case(_tag, _p0, _T, scatter=True)
     skv_vsplit_cases()   # E431: NaN / -0.0 / +Inf in the unwritten slots must not change a bit (E146's stale pages were finite)
+
+
+if L17_LIVE or os.environ.get("L17_VSPLIT_TESTS") == "1":
+    kt_section(("g_attention_split", "g_attention_vsplit", "g_attention_combine"), _vsplit_cases)
 
 if _gqa and not L17_LIVE and os.environ.get("L17_TESTS", "1") == "1":   # head_dim 256 drafting builds (the K/V-once body): spans that cross a 16-key block
     # (4156, 8) and (20030, 8): visible crosses a multiple of 64, so the span's tokens get different split lengths
@@ -3575,7 +3610,7 @@ def dflash_attention_case():
     cases.extend(skv_cases())
 
 
-dflash_attention_case()
+kt_section(("g_dfl_attention", "g_dfl_ctx_split"), dflash_attention_case)
 # Prefill flash attention (gen_flash2.py / gen_flash2s.py): 64 uniform tokens at the end of a 1024-key context,
 # paged arena filled directly (identity page map), layer 0, causal; q scaled so attention is sharp (a kernel that
 # drops part of the score sum fails). Reference in float64 from f16 Q/K/V, times sigmoid(gate) when gated.
@@ -4819,15 +4854,17 @@ def mv_cover_case(kern, m, crng):
 
 if True:   # coverage: a case for every kernel the package launches
     _crng = np.random.default_rng(11)
-    for _k in sorted(pkg_launched() - cases_launched()):
-        _m = MV_NAME.match(_k)
-        if not _m or (_m["q8"] and _m["fmt"] not in IQ_FMTS):
-            continue
+    def _cover(_k, _m):
         _c = mv_cover_case(_k, _m, _crng)
         if _c:
             cases.append(_c)
         else:
             print(f"coverage: no {_m['fmt']} tensor with K={_m['K']} maps to {_k}")
+    for _k in sorted(pkg_launched() - cases_launched()):
+        _m = MV_NAME.match(_k)
+        if not _m or (_m["q8"] and _m["fmt"] not in IQ_FMTS):
+            continue
+        kt_section((_k, "g_quant_q8") if _m["q8"] else (_k,), lambda: _cover(_k, _m))
     import ktest_spec  # noqa: E402  speculative-decoding bookkeeping (token info, spec rows / acceptance, the MTP drafter's kernels)
     cases += ktest_spec.cases(_pkg_llm_text(), save, np.random.default_rng(13), KS)
     _todo = pkg_launched() - cases_launched()
@@ -5201,6 +5238,13 @@ for h in sorted(set(cfg.get("layer_heads") or []) - {QH}):
 KNOWN_DEFECTS = {"E444": ("" if os.environ.get("KV8", "0") == "1" or os.environ.get("KV8_SPLIT_VZERO", "0") == "1" else
                           "stale_kv_flash_nan stale_kv_flash_inf stale_kv_split_listed_nan stale_kv_split_listed_inf "
                           "stale_kv_split_decode_nan stale_kv_split_decode_inf").split()}
+text = "\n".join(cases)
+if KT_ONLY is not None:
+    print(f"selected generation: skipped {len(KT_SKIPPED)} sections (" + "; ".join(",".join(sorted(k)) for k in KT_SKIPPED[:3])
+          + (" ..." if len(KT_SKIPPED) > 3 else "") + ")")
+    text, _lines = ktest_select.finish_selection(text, KT_ONLY, kt_defined(), child=bool(KS))   # exit 3: refused (full suite)
+    print("\n".join(_lines))
+    cases = [text]
 if not KS:
     _have = set(re.findall(r"(?m)^check\.case public @(\w+) \{", "\n".join(cases)))
     json.dump({n: ref for ref, ns in KNOWN_DEFECTS.items() for n in ns if n in _have},
@@ -5208,4 +5252,10 @@ if not KS:
 # hrx-loom 0.1.0: float comparison is check.expect.approximate with the actual and expected types.
 text = re.sub(r"check\.expect\.close (actual\(.*\)) : (.*)$", r"check.expect.approximate \1 : \2, \2", "\n".join(cases), flags=re.M)
 open(os.path.join(out, f"cases{KS}.loom-test"), "w", newline="\n").write(text)
-print("wrote", len(cases), "cases")
+if KT_ONLY is not None and not KS:   # the inputs of the cases left out (the sections that ran anyway wrote them)
+    _used = set(re.findall(r'path\("([^"]+)"\)', text))
+    _drop = [f for f in os.listdir(out) if f.endswith(".npy") and f not in _used]
+    for f in _drop:
+        os.remove(os.path.join(out, f))
+    print(f"selected generation: removed {len(_drop)} input files no kept case reads")
+print("wrote", len(re.findall(r"(?m)^check\.case public @", text)), "cases")
