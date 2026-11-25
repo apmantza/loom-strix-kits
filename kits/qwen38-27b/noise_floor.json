@@ -1,3 +1,1 @@
-{"decode: target weight matvecs": 0.2, "decode: verify attention": 0.4, "decode: drafter": 1.1, "decode: GDN": 1.1,
- "decode: other": 6.0, "prefill: GEMMs": 0.6, "prefill: attention": 4.2, "prefill: weight dequant": 0.5, "prefill: GDN": 0.4,
- "prefill: drafter context": 2.6, "prefill: other": 0.3}
+{"decode: target weight matvecs": 0.13, "decode: verify attention": 0.26, "decode: drafter": 0.87, "decode: GDN": 0.85, "decode: other": 3.92, "prefill: GEMMs": 0.33, "prefill: attention": 2.54, "prefill: weight dequant": 0.35, "prefill: GDN": 0.22, "prefill: drafter context": 1.96, "prefill: other": 0.22}

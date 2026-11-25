@@ -47,7 +47,9 @@ The README's table lists what each switch in kit.env's KIT_RECIPE does. Off-reci
 pending), `F16O11=1` (the f16 swiglu GEMM writes the row-scaled f16 copy itself).
 
 ## Served-profile noise floors (noise_floor.json, 11-25)
-Per-lane spread (max - min over mean, %) of one package over 8 heat-soaked starts at 81,432 tokens (pkg-e379 vs its copy, held 2.15 GHz
-at 85-86 C; HRX-like E485, W/static-1125/q194/all.md cycles table). For `events_summary.py --noise-floor`. These are single-start
-ranges: a gate comparing the mean of 2 starts per arm overstates its noise with them (flash2's 4.2 % includes one +3 % start), so the
-lane gates do not pass them yet; a per-arm-mean floor needs the same A/A cut into 2-start means.
+Per-lane floor for a gate that compares the mean of 2 starts per arm (ABBA): the 95th percentile of |mean(A) - mean(B)| / mean over
+all 420 splits of one package's 8 heat-soaked starts at 81,432 tokens into two disjoint 2-start sets (pkg-e379 vs its copy, held
+2.15 GHz at 85-86 C; HRX-like E485 data, W/static-1125/aa-2start/cut.py, cut.txt). For `events_summary.py --noise-floor`. The
+single-start ranges it replaces were wider (flash2 4.25 % -> 2.54 %, GEMMs 0.57 -> 0.33). Checked so far: on the A/A starts, without
+a floor the gate falsely passed flash2 and dequant on the first split; with it, 6 of 6 gate runs stopped. The full false-pass sweep
+(4 splits x 8 lanes) was cut by an OOM on 11-25 and is owed before the floor is wired into q-steps.
