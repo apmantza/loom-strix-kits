@@ -219,7 +219,8 @@ def livereg():
 
 
 def lesson_notes():
-    """C18's notes (11-25 lessons), each with a fixture that fires, near misses that do not, and the recurrence it names"""
+    """C18's notes (11-25 lessons; r2 after review E581), each with a fixture that fires, near misses that do not, and a test for
+    every guard (a guard no test can red is deleted)"""
     def listing(body):
         return body, [4 * i for i in range(len(body))]
     def back(i, target):
@@ -230,144 +231,279 @@ def lesson_notes():
         b = ["s_mov_b32 s0, 0"] + body
         return b + [back(len(b), 1)]
     wm = "v_wmma_f32_16x16x16_f16 v[200:207], v[192:199], v[184:191], v[200:207]"
-    # (a) rounds (E539: a worker's study established that g_gdn_recurrence_pf runs one round): 48 x 8 x spans one-wave workgroups at
-    # 166 VGPRs (9 waves / SIMD, 36 per WGP, 720 resident) are one round at spans = 1; 16 tiles (768) are two
-    def prog(tiles=8, extra="", grid="%heads, %tiles, %spans", caller="  %spans = config.get @llm.spans : index\n"
-             "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"):
-        return (f'kernel.def export("g_r") @g_r(%spans: index) {{\n  %c1 = index.constant 1 : index\n  %heads = index.constant 48 : index\n'
+    notes = lambda r: r.get("notes", [])
+    # ---- (a) rounds (E539: a worker's study established that g_gdn_recurrence_pf runs one round). r2 (review F3): a runtime grid is
+    # judged at the sizes the package admits (model.json execution: prefill_capacity, rows, draft_depth), never at size 1
+    def prog(tiles=8, extra="", grid="%heads, %tiles, %spans", body=None, cmd="llm_advance", params="%spans: index"):
+        body = body if body is not None else ("  %spans = config.get @llm.spans : index\n"
+                                              "  kernel.launch @g_r[%spans](%spans) : [index](index)\n")
+        return (f'kernel.def export("g_r") @g_r({params}) {{\n  %c1 = index.constant 1 : index\n  %heads = index.constant 48 : index\n'
                 f"  %tiles = index.constant {tiles} : index\n  %c32 = index.constant 32 : index\n{extra}"
                 f"  kernel.launch.config workgroups({grid}) workgroup_size(%c32, %c1, %c1) : index\n}} launch(%spans_arg: index) {{\n}}\n"
-                f"func.def @run() {{\n{caller}}}\n")
-    gdn = kl.tier_state(occ(32, 166, 9, 0, 16, 16, 9), 4)            # pkg-e480's g_gdn_recurrence_pf report rows
-    def rnd(text, o=gdn):
+                f"command.def public target(@device) @{cmd}() launch(%x: buffer) {{\n{body}}}\n")
+    gdn = kl.tier_state(occ(32, 166, 9, 0, 16, 16, 9), 4)            # pkg-e480's g_gdn_recurrence_pf report rows: 36 per WGP, 720
+    sz1 = {(None, "@llm.spans"): 1, ("llm_advance", "@llm.tokens"): 4096, ("llm_verify", "@llm.tokens"): 32}
+    def rnd(text, sizes=sz1, o=gdn):
         rows = [{"kernel": "g_r", "occ": o}]
-        getattr(kl, "rounds", lambda rows, texts: None)(rows, [text])
-        return rows[0].get("rounds") or {}, "rounds" in rows[0].get("notes", [])
-    g, n = rnd(prog())
-    ok(n and g and g.get("resident") == 720 and g.get("sites") == [(384, 1, True, 1)],
-       f"rounds: 48 x 8 x spans one-wave workgroups at 9 waves/SIMD are one round at spans = 1 (720 resident), two at 2 (E539) ({g})")
-    ok("1 round, traversal order irrelevant" in getattr(kl, "rounds_text", lambda r: "")({"kernel": "g_r", "rounds": g, "occ": gdn}),
-       "rounds: the line says the order cannot matter")
-    g, n = rnd(prog(tiles=16))
-    ok(not n and g and g.get("sites") == [(768, 2, True, None)], f"rounds: 16 tiles (768 workgroups) are two rounds: no note ({g})")
+        f = getattr(kl, "rounds", None)
+        try:
+            f(rows, [text], sizes)
+        except TypeError:                                             # r1's rounds(rows, texts): no sizes
+            f(rows, [text])
+        return rows[0].get("rounds") or {}, "rounds" in notes(rows[0]), rows[0]
+    g, n, row = rnd(prog())
+    ok(n and g.get("resident") == 720 and [s[:2] for s in g.get("sites", [])] == [(384, 1)],
+       f"rounds: 48 x 8 x spans one-wave workgroups, spans admitted <= 1: one round of 720 resident (E539) ({g})")
+    txt = getattr(kl, "rounds_text", lambda r: "")(row) if n else ""
+    ok("1 round" in txt and "spans <= 1" in txt, f"rounds: the line names the admitted size it holds at ({txt[:160]})")
+    g, n, _ = rnd(prog(), {**sz1, (None, "@llm.spans"): 4})
+    ok(not n and (g.get("sites") or [()])[0][:2] == (1536, 3) and g["sites"][0][3] == 1,
+       f"rounds: the same grid with spans admitted <= 4 (rows 4) is 3 rounds there, bound spans <= 1: no note (review F3) ({g})")
+    g, n, _ = rnd(prog(), {})
+    ok(not n and g.get("size_unknown") == 1, f"rounds: no admitted size for the key: 'size unknown', no note ({g})")
+    g, n, _ = rnd(prog(tiles=16))
+    ok(not n and (g.get("sites") or [()])[0][:2] == (768, 2), f"rounds: 16 tiles (768) are two rounds: no note ({g})")
+    tok = ("  %t = config.get @llm.tokens : index\n  kernel.launch @g_r[%t](%t) : [index](index)\n")
+    g, n, row = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok), {("llm_advance", "@llm.tokens"): 600})
+    ok(n and (g.get("sites") or [()])[0][:2] == (600, 1),
+       f"rounds: tokens admitted <= 600 at prefill, 600 workgroups of 720: one round ({g})")
+    g, n, row = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok), {("llm_advance", "@llm.tokens"): 4096})
+    ok(not n and (g.get("sites") or [(0, 0, 0, 0)])[0][1:4:2] == (6, 720),
+       f"rounds: tokens <= 4096 is 6 rounds; the one-round bound is tokens <= 720, above 2 (review R12) ({g})")
+    g, n, _ = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok.replace("llm_advance", "x"), cmd="llm_dflash_propose"),
+                  {("llm_advance", "@llm.tokens"): 4096})
+    ok(not n and g.get("size_unknown") == 1, f"rounds: tokens in a command without a size source (dflash's block): size unknown ({g})")
+    g, n, _ = rnd(prog(params="%t: index", grid="%t, %c1, %c1", body=tok, cmd="llm_verify"), sz1)
+    ok(n and (g.get("sites") or [()])[0][:2] == (32, 1), f"rounds: tokens at verify (rows x (draft_depth + 1) = 32): "
+       f"one round ({g})")
     sel = ("template.decl @sel1_g_r(%g0: index, %a0: index)\n"
            "template.def<@sel1_g_r> target(@rdna3) @sel1_g_r_rdna3(%g0: index, %a0: index) {\n"
            "  kernel.launch @g_r[%g0](%a0) : [index](index)\n  template.return\n}\n")
-    g, n = rnd(sel + prog(caller="  %two = index.constant 1 : index\n  template.apply<@sel1_g_r>(%two, %two) : (index, index)\n"))
-    ok(n and g.get("sites") == [(384, 1, False, None)], f"rounds: a constant grid through a dual-target selector resolves ({g})")
-    g, n = rnd(prog(grid="%c1, %c1, %c1"))
-    ok(not n and g.get("sites") == [(1, 1, False, None)],
-       f"rounds: one workgroup has no order: no note ({g})")
-    g, n = rnd(prog(extra="  %pt = index.div %spans, %c32 : index\n", grid="%heads, %pt, %c1"))
-    ok(not n and g.get("runtime") == 1 and not g.get("sites"), f"rounds: a runtime grid empty at size 1 (a prefill tile count) is "
-       f"'grid: runtime', judged nowhere ({g})")
-    g, n = rnd(prog(extra="  %pt = index.div %spans, %c32 : index\n", grid="%heads, %pt, %c1") +
-               "func.def @run2() {\n  %c64 = index.constant 64 : index\n  kernel.launch @g_r[%c64](%c64) : [index](index)\n}\n")
-    ok(not n and g.get("runtime") == 1 and g.get("sites") == [(96, 1, False, None)], f"rounds: one site one round, another 'grid: runtime': no note (the kernel is not shown to be "
-       f"one round) ({g})")
-    g, n = rnd(prog(extra="  %sh = index.shl %tiles, %c1 : index\n", grid="%heads, %sh, %spans"))
-    ok(not n and g.get("unknown") == 1, f"rounds: an op the evaluator does not model is unknown, never a figure ({g})")
-    g, n = rnd(prog(caller="  %spans = config.get @llm.spans : index\n  %spans = index.constant 2 : index\n"
-                           "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"))
-    ok(not n or (g.get("sites") or [[0, 0, 0]])[0][2], f"rounds: a name defined twice is a runtime size, never the last constant ({g})")
-    ok(getattr(kl, "device_domains", lambda t: None)("gfx1151") == 20 and kl.device_domains("nonesuch") is None, "rounds: 20 WGPs from the device file")
-    # (b) ldswait (E534: the m256 GEMMs wait lgkmcnt(0) 1-7 instructions after each ds_load pair and keep none in flight across a
-    # wait; hipBLASLt keeps up to 16): ds_load pairs each drained before their WMMAs fire; the same loads waited with lgkmcnt(2)
-    # (two kept in flight) or issued far ahead do not
-    def pairs(cnt, gap=0):
-        b = []
-        for k in range(8):
-            b += [f"ds_load_b128 v[{100 + 8 * k}:{103 + 8 * k}], v1 offset:{32 * k}", f"ds_load_b128 v[{104 + 8 * k}:{107 + 8 * k}], v1 offset:{32 * k + 16}"]
-            b += ["v_add_f32_e32 v3, v3, v4"] * gap + [f"s_waitcnt lgkmcnt({cnt})", wm]
-        return b
-    r = kl.lint_listing("ldsw", *listing(loop_of(pairs(0))))
-    ok("ldswait" in r.get("notes", []) and r.get("lds_dist") == 1.5 and r.get("lds_kept") == 0 and r.get("lds_dist_n") == 16,
-       f"ldswait: 8 ds_load pairs each drained before their WMMA (median 1.5) get the note ({r.get('lds_dist')}, {r.get('notes')})")
-    r = kl.lint_listing("ldsk", *listing(loop_of(pairs(2))))
-    ok("ldswait" not in r.get("notes", []) and r.get("lds_kept") == 2, f"ldswait: two kept in flight across each wait: no note "
-       f"({r.get('lds_kept')}, {r.get('notes')})")
-    r = kl.lint_listing("ldsf", *listing(loop_of(pairs(0, gap=12))))
-    ok("ldswait" not in r.get("notes", []) and r.get("lds_dist") == 13.5, f"ldswait: loads issued 13-14 instructions ahead of their "
-       f"wait: no note ({r.get('lds_dist')})")
-    # (c) guardwait (E520: STAGE_LIVE x FLATADDR, the carried K scale's vmcnt(0) inside the K guard drained V(kt)'s prefetch): V's loads
-    # issued before the guard, the guard waits for the carried scale, V is read only after the join
-    def guard(v_after=False, read_v=False, scale_only=False):
+    g, n, _ = rnd(sel + prog(body="  %two = index.constant 1 : index\n  template.apply<@sel1_g_r>(%two, %two) : (index, index)\n"))
+    ok(n and [s[:2] for s in g.get("sites", [])] == [(384, 1)], f"rounds: a constant grid through a dual-target selector ({g})")
+    two = ("  %spans = config.get @llm.spans : index\n  kernel.launch @g_r[%spans](%spans) : [index](index)\n"
+           "  %t = config.get @llm.tokens : index\n  kernel.launch @g_r[%t](%t) : [index](index)\n")
+    g, n, _ = rnd(prog(body=two), {(None, "@llm.spans"): 1})
+    ok(not n and len(g.get("sites", [])) == 1 and g.get("size_unknown") == 1,
+       f"rounds: one site in one round, another of unknown size: no note ({g})")
+    two = two.replace("config.get @llm.tokens : index", "index.shl %spans, %spans : index")
+    g, n, _ = rnd(prog(body=two))
+    ok(not n and len(g.get("sites", [])) == 1 and g.get("unknown") == 1, f"rounds: one site in one round, another unknown: no note ({g})")
+    g, n, _ = rnd(prog(grid="%c1, %c1, %c1"))
+    ok(not n and [s[:2] for s in g.get("sites", [])] == [(1, 1)], f"rounds: one workgroup has no order: no note ({g})")
+    g, n, _ = rnd(prog(extra="  %sh = index.shl %tiles, %c1 : index\n", grid="%heads, %sh, %spans"))
+    ok(not n and g.get("unknown") == 1, f"rounds: an op the evaluator does not model in the config: unknown ({g})")
+    g, n, _ = rnd(prog(body="  %s0 = config.get @llm.spans : index\n  %spans = index.shl %s0, %s0 : index\n"
+                            "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"))
+    ok(not n and g.get("unknown") == 1, f"rounds: an op the evaluator does not model in the launcher: unknown, never runtime (R13) ({g})")
+    g, n, _ = rnd(prog(body="  %spans = config.get @llm.spans : index\n  %spans = index.constant 2 : index\n"
+                            "  kernel.launch @g_r[%spans](%spans) : [index](index)\n"))
+    ok(not n and g.get("unknown") == 1, f"rounds: a launcher name defined twice: unknown, never either definition (R6) ({g})")
+    g, n, _ = rnd(prog(body="  %c4 = index.constant 4 : index\n  kernel.launch @g_r[%c4, %c4](%c4) : [index, index](index)\n"))
+    ok(not n and g.get("unknown") == 1, f"rounds: a launch with more grid operands than the config's parameters: unknown (R7) ({g})")
+    g, n, _ = rnd(prog(grid="%heads, %c0, %c1", extra="  %c0 = index.constant 0 : index\n"))
+    ok(not n and g.get("unknown") == 1 and not g.get("size_unknown"), f"rounds: an empty constant grid: unknown (R3) ({g})")
+    g, n, _ = rnd(prog(extra="  %c99 = index.constant 99 : index\n  %dn = index.sub %c99, %spans : index\n", grid="%heads, %dn, %c1"),
+                  {(None, "@llm.spans"): 4})
+    ok(not n and g.get("unknown") == 1, f"rounds: a grid that shrinks as the size grows: unknown (R2) ({g})")
+    g, n, _ = rnd(prog(extra="  %sp = index.assume %spans [range(%spans, 1, 8)] : index\n", grid="%heads, %tiles, %sp"))
+    ok(n, f"rounds: index.assume passes its operand through (R8) ({g})")
+    g, n, _ = rnd(prog(), sz1, kl.tier_state(occ(32, 166, 9, 0, 16, 16, 8), 4))
+    ok(not n and not g, f"rounds: an unverified tier gives no figure (R1) ({g})")
+    rows = [{"kernel": "g_a", "rounds": {"sites": [], "unknown": 1, "size_unknown": 0}},
+            {"kernel": "g_b", "rounds": {"sites": [], "unknown": 0, "size_unknown": 2}},
+            {"kernel": "g_c", "rounds": {"sites": [(5000, 7, {"@llm.tokens": 4096}, 720)], "unknown": 0, "size_unknown": 0}}]
+    s = getattr(kl, "rounds_summary", lambda r: "")(rows)
+    ok("unknown (1): g_a;" in s and "size unknown (1): g_b;" in s and "one round at the admitted size: 1 kernels" in s,
+       f"rounds: one summary line names the kernels not judged (review F5) ({s})")
+    ok(getattr(kl, "device_domains", lambda t: None)("gfx1151") == 20 and kl.device_domains("nonesuch") is None, "rounds: 20 WGPs")
+    import json, tempfile as tf
+    with tf.TemporaryDirectory() as t:
+        json.dump({"presets": {"chat": {"execution": {"rows": 4, "prefill_capacity": 4096, "draft_depth": 7}}}},
+                  open(os.path.join(t, "model.json"), "w"))
+        s = getattr(kl, "served_sizes", lambda d: {})([t])
+        ok(s == {("llm_advance", "@llm.tokens"): 4096, ("llm_verify", "@llm.tokens"): 32, (None, "@llm.spans"): 4},
+           f"rounds: admitted sizes from model.json (prefill_capacity; rows x (draft_depth + 1); rows) ({s})")
+        ok(getattr(kl, "served_sizes", lambda d: None)([os.path.join(t, "none")]) == {}, "rounds: no model.json, no sizes")
+    # ---- (c) guardwait (E520). r2 (review F4): a victim is younger than every load the block's wait must retire for the block
+    def guard(v_after=False, read_v=False, scale_only=False, write_v=False, scratch=False):
         b = ["s_mov_b32 s0, 0"]
         vl = [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+        if scratch:
+            vl = ["scratch_load_b128 v[40:43], off, s33 offset:16"]
         b += ([] if v_after or scale_only else vl) + ["s_cmp_eq_u32 s1, 0"]
         br = len(b); b.append("")
-        b += ["s_waitcnt vmcnt(0)", "v_cvt_f32_f16_e32 v11, v10"] + (["v_add_f32_e32 v12, v40, v44", "v_add_f32_e32 v12, v48, v12"] if read_v else [])
+        b += ["s_waitcnt vmcnt(0)", "v_cvt_f32_f16_e32 v11, v10"]
+        b += ["v_add_f32_e32 v12, v40, v44", "v_add_f32_e32 v12, v48, v12"] if read_v else []
+        b += ["v_mov_b32_e32 v40, 0", "v_mov_b32_e32 v44, 0", "v_mov_b32_e32 v48, 0"] if write_v else []
         b[br] = fwd(br, len(b))
         b += ([] if not v_after or scale_only else vl + ["s_waitcnt vmcnt(0)"]) + ["v_add_f32_e32 v13, v40, v44", wm,
                                                                                   "global_load_b32 v10, v3, s[8:9]"]
         b.append(back(len(b), 1))
         return b
-    r = kl.lint_listing("gw", *listing(guard()))
-    ok("guardwait" in r.get("notes", []) and r.get("guard_waits") == [(6, 5, 3)],
-       f"guardwait: the guard's vmcnt(0) retires V's three prefetched loads, read only after the join (E520) ({r.get('guard_waits')})")
-    r = kl.lint_listing("gw_after", *listing(guard(v_after=True)))
-    ok("guardwait" not in r.get("notes", []), f"guardwait: V's loads issued after the join (STAGE_LIVE alone): no note ({r.get('guard_waits')})")
-    r = kl.lint_listing("gw_scale", *listing(guard(scale_only=True)))
-    ok("guardwait" not in r.get("notes", []), f"guardwait: the wait retires only the carried scale the block reads: no note "
-       f"({r.get('guard_waits')})")
-    inb = ["s_mov_b32 s0, 0", "s_cmp_eq_u32 s1, 0", ""]
-    inb += ["global_load_b128 v[60:63], v2, s[8:9]", "s_waitcnt vmcnt(0)", "global_store_b32 v0, v0, s[32:33]"]
-    inb[2] = fwd(2, len(inb))
-    inb += ["v_add_f32_e32 v13, v60, v61", wm]
+    gw = lambda b: (lambda r: (r.get("guard_waits"), "guardwait" in notes(r)))(kl.lint_listing("gw", *listing(b)))
+    w, n = gw(guard())
+    ok(n and w == [(6, 5, 3)], f"guardwait: the guard waits for the older carried scale; V's three newer loads, read after the "
+       f"join, are drained (E520) ({w})")
+    gs = guard()
+    gs.insert(gs.index("v_cvt_f32_f16_e32 v11, v10") + 1, "global_store_b32 v7, v11, s[38:39]")
+    gs[5] = fwd(5, gs.index("v_add_f32_e32 v13, v40, v44"))
+    gs[-1] = back(len(gs) - 1, 1)
+    w, n = gw(gs)
+    ok(n and w == [(6, 5, 3)], f"guardwait: a global store in the block does not excuse a wait that needs the carried scale (only "
+       f"the loads carried over the back-edge, seen on the second pass, show the need) ({w})")
+    w, n = gw(guard(v_after=True))
+    ok(not n, f"guardwait: V's loads issued after the join (STAGE_LIVE alone): no note ({w})")
+    w, n = gw(guard(scale_only=True))
+    ok(not n, f"guardwait: the wait retires only the scale the block reads: no note ({w})")
+    w, n = gw(guard(read_v=True))
+    ok(not n, f"guardwait: the block reads V itself: no note ({w})")
+    w, n = gw(guard(write_v=True))
+    ok(not n, f"guardwait: the block overwrites V's registers (a write counts as a read, review F4 / b023): no note ({w})")
+    w, n = gw(guard(scratch=True))
+    ok(n and w and w[0][2] == 1, f"guardwait: a spill reload drained the same way counts (scratch loads share vmcnt) ({w})")
+    inb = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    inb += ["s_cmp_eq_u32 s1, 0", ""]
+    inb += ["global_load_b32 v60, v2, s[8:9]", "s_waitcnt vmcnt(0)", "v_mov_b32_e32 v61, 0"]
+    inb[5] = fwd(5, len(inb))
+    inb += ["ds_store_b32 v1, v60", "v_add_f32_e32 v13, v40, v44", wm]
     inb.append(back(len(inb), 1))
-    r = kl.lint_listing("gw_inside", *listing(inb))
-    ok("guardwait" not in r.get("notes", []), f"guardwait: the wait retires only a load issued inside the block: no note "
-       f"({r.get('guard_waits')})")
-    r = kl.lint_listing("gw_read", *listing(guard(read_v=True)))
-    ok("guardwait" not in r.get("notes", []), f"guardwait: the block reads V itself (the wait is its own): no note ({r.get('guard_waits')})")
+    w, n = gw(inb)
+    ok(not n, f"guardwait: the wait is for a load issued inside the block, the newest; in-order vmcnt cannot spare the older V "
+       f"loads (llama.cpp sample, review F4): no note ({w})")
+    st = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    st += ["s_cmp_eq_u32 s1, 0", "", "s_waitcnt vmcnt(0)", "global_store_b128 v7, v[20:23], s[38:39]"]
+    st[5] = fwd(5, len(st))
+    st += ["v_add_f32_e32 v13, v40, v44", wm]
+    st.append(back(len(st), 1))
+    w, n = gw(st)
+    ok(not n, f"guardwait: a wait that retires no load the block needs, before a global store (may order the store after a pending "
+       f"load; live g_gdn_recurrence_pf / _rec): no note ({w})")
+    fen = [x.replace("global_store_b128 v7, v[20:23], s[38:39]", "s_barrier") for x in st]
+    w, n = gw(fen)
+    ok(not n, f"guardwait: the same wait beside a barrier (a fence: llama.cpp soft_max's vmcnt(0) after s_barrier / buffer_gl0_inv): "
+       f"no note ({w})")
+    lds = [x.replace("s_waitcnt vmcnt(0)", "s_waitcnt vmcnt(2)").replace("global_store_b128 v7, v[20:23], s[38:39]", "ds_store_b128 v7, v[20:23]")
+           for x in st]
+    w, n = gw(lds)
+    ok(n and w == [(6, 5, 1)], f"guardwait: the same over-wait before an LDS store (no global memory to order): the oldest V load is "
+       f"drained for nothing the block needs (pkg-cmb2's partial kernels, E521's residue) ({w})")
+    aj = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    aj += ["s_cmp_eq_u32 s1, 0", "", "v_cvt_f32_f16_e32 v11, v10"]
+    aj[5] = fwd(5, len(aj))
+    aj += ["s_waitcnt vmcnt(0)", "v_add_f32_e32 v13, v40, v44", wm]
+    aj.append(back(len(aj), 1))
+    w, n = gw(aj)
+    ok(not n, f"guardwait: a wait after the join is not judged against the block it follows ({w})")
     ex = guard()
-    ex[5] = fwd(5, len(ex))                                             # the guard's branch now targets past the back-edge
-    r = kl.lint_listing("gw_exit", *listing(ex + ["s_endpgm"]))
-    ok("guardwait" not in r.get("notes", []), f"guardwait: a branch out of the loop (its exit) is not a guard ({r.get('guard_waits')})")
+    ex[5] = fwd(5, len(ex))
+    w, n = gw(ex + ["s_endpgm"])
+    ok(not n, f"guardwait: a branch out of the loop (its exit) is not a guard ({w})")
     nest = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
     it = len(nest)
-    nest += ["s_cmp_lt_i32 s16, s22", ""]                               # g_spec_accept's shape: an inner loop's exit test
-    nest += ["s_waitcnt vmcnt(0)", "global_store_b32 v0, v0, s[32:33]", "s_add_u32 s16, s16, 1"]
+    nest += ["s_cmp_lt_i32 s16, s22", "", "s_waitcnt vmcnt(0)", "v_add_f32_e32 v11, v10, v10", "s_add_u32 s16, s16, 1"]
     nest.append(back(len(nest), it))
-    nest[it + 1] = fwd(it + 1, len(nest))                               # to just past the inner back-edge: the loop's exit
-    nest += ["v_add_f32_e32 v13, v40, v44", wm]
+    nest[it + 1] = fwd(it + 1, len(nest))
+    nest += ["v_add_f32_e32 v13, v40, v44", wm, "global_load_b32 v10, v3, s[8:9]"]
     nest.append(back(len(nest), 1))
-    r = kl.lint_listing("gw_inner_exit", *listing(nest))
-    ok("guardwait" not in r.get("notes", []), f"guardwait: an inner loop's exit test seen from the outer loop is not a guard "
-       f"(g_spec_accept, review of the first fire run) ({r.get('guard_waits')})")
-    # (d) vopd (C5 / E551: flash2's back-edge block, 65 single v_mov, 31 VOPD pairs as allocated; 56 over the loop)
+    w, n = gw(nest)
+    ok(not n, f"guardwait: an inner loop's exit test seen from the outer loop is not a guard (g_spec_accept) ({w})")
+    # an else block: s_cbranch to the else, the then block issues V and jumps over the else with s_branch; the else's wait is not
+    # after V on any executed path (review G3: only s_cbranch opens a guard)
+    el = ["s_mov_b32 s0, 0", "s_cmp_eq_u32 s1, 0", ""]
+    el += [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    sb = len(el); el.append("")
+    el[2] = fwd(2, len(el))
+    el += ["s_waitcnt vmcnt(0)", "v_cvt_f32_f16_e32 v11, v10"]
+    el[sb] = fwd(sb, len(el), "s_branch")
+    el += ["v_add_f32_e32 v13, v40, v44", wm, "global_load_b32 v10, v3, s[8:9]"]
+    el.append(back(len(el), 1))
+    w, n = gw(el)
+    ok(not n, f"guardwait: an else block (behind an unconditional s_branch) is not judged against the then block's loads ({w})")
+    two = ["s_mov_b32 s0, 0"] + [f"global_load_b128 v[{40 + 4 * k}:{43 + 4 * k}], v2, s[8:9] offset:{16 * k}" for k in range(3)]
+    two += ["s_cmp_eq_u32 s1, 0", "", "s_cmp_eq_u32 s2, 0", "", "s_waitcnt vmcnt(0)", "v_cvt_f32_f16_e32 v11, v10"]
+    two[7] = fwd(7, len(two))
+    two[5] = fwd(5, len(two) + 1)
+    two += ["v_add_f32_e32 v12, v11, v11", "v_add_f32_e32 v13, v40, v44", wm, "global_load_b32 v10, v3, s[8:9]"]
+    two.append(back(len(two), 1))
+    w, n = gw(two)
+    ok(n and w == [(8, 7, 3)], f"guardwait: nested guards: one hit per wait, named by the innermost guard (review G5) ({w})")
+    # ---- (d) vopd (C5 / E551, corrected by q210's llvm-mc build, E580: shared VSRC1 and two literals are refused)
     mv = lambda k: f"v_mov_b32_e32 v{100 + k}, v{1 + k}"
     r = kl.lint_listing("vopd", *listing(loop_of([wm] + [mv(k) for k in range(40)])))
-    ok("vopd" in r.get("notes", []) and r.get("vopd_pairs") == 20 and r.get("backedge") and r["backedge"][:2] == (40, 20),
-       f"vopd: 40 single copies at the back-edge (dsts and sources of alternating parity) form 20 pairs: note "
-       f"({r.get('vopd_pairs')}, {r.get('backedge') and r['backedge'][:2]})")
-    same = lambda k: f"v_mov_b32_e32 v{100 + 2 * k}, v{1 + 2 * k}"
-    r = kl.lint_listing("vopd_par", *listing(loop_of([wm] + [same(k) for k in range(40)])))
-    ok("vopd" not in r.get("notes", []) and r.get("vopd_pairs") == 0, f"vopd: destinations of one parity (and sources of one parity) "
-       f"cannot pair as allocated (R5 / R5a): no note ({r.get('vopd_pairs')})")
-    sd = lambda k: f"v_mov_b32_e32 v{100 + 2 * k}, v{1 + k}"
-    r = kl.lint_listing("vopd_dst", *listing(loop_of([wm] + [sd(k) for k in range(40)])))
-    ok("vopd" not in r.get("notes", []) and r.get("vopd_pairs") == 0, f"vopd: destinations of one parity, sources alternating: no "
-       f"pair (R5: one destination even, one odd) ({r.get('vopd_pairs')})")
+    ok("vopd" in notes(r) and r.get("vopd_pairs") == 20 and r.get("backedge") and r["backedge"][:2] == (40, 20),
+       f"vopd: 40 single copies at the back-edge (alternating parity) form 20 pairs: note ({r.get('vopd_pairs')}, {r.get('backedge')})")
+    r = kl.lint_listing("vopd15", *listing(loop_of([wm] + [mv(k) for k in range(30)])))
+    ok("vopd" not in notes(r) and r.get("vopd_pairs") == 15, f"vopd: 15 pairs, under VOPD_MIN: no note ({r.get('vopd_pairs')})")
+    def pairs_of(body):
+        r = kl.lint_listing("v", *listing(loop_of([wm] + body)))
+        return r.get("vopd_pairs"), r.get("vopd_eligible")
+    same = [f"v_mov_b32_e32 v{100 + 2 * k}, v{1 + 2 * k}" for k in range(40)]
+    ok(pairs_of(same)[0] == 0, f"vopd: destinations and sources of one parity: no pair ({pairs_of(same)})")
+    sd = [f"v_mov_b32_e32 v{100 + 2 * k}, v{1 + k}" for k in range(40)]
+    ok(pairs_of(sd)[0] == 0, f"vopd: destinations of one parity (R5): no pair ({pairs_of(sd)})")
+    sp = [f"v_mov_b32_e32 v{100 + k}, v{1 + 2 * k}" for k in range(40)]
+    ok(pairs_of(sp)[0] == 0, f"vopd: SRC0 of one parity (gfx11.5 interlock, R5a): no pair ({pairs_of(sp)})")
     dual = [f"v_dual_mov_b32 v{100 + 2 * k}, v{1 + 2 * k} :: v_dual_mov_b32 v{101 + 2 * k}, v{2 + 2 * k}" for k in range(20)]
-    r = kl.lint_listing("vopd_dual", *listing(loop_of([wm] + dual)))
-    ok("vopd" not in r.get("notes", []) and r.get("vopd_eligible") == 0, f"vopd: moves already paired: no note ({r.get('vopd_eligible')})")
+    ok(pairs_of(dual) == (0, 0), f"vopd: moves already paired are not eligible ({pairs_of(dual)})")
     dep = [mv(0)] + [f"v_mov_b32_e32 v{100 + k}, v{99 + k}" for k in range(1, 40)]
-    r = kl.lint_listing("vopd_dep", *listing(loop_of([wm] + dep)))
-    ok("vopd" not in r.get("notes", []) and r.get("vopd_pairs") == 0, f"vopd: each move reads the one before it (a chain): no pair "
-       f"({r.get('vopd_pairs')})")
-    r = kl.lint_listing("vopd_mod", *listing(loop_of([wm] + [f"v_add_f32_e64 v{100 + k}, v{1 + k}, v{50 + k} clamp" for k in range(40)])))
-    ok(r.get("vopd_eligible") == 0, f"vopd: VOP3 forms with a modifier are not eligible ({r.get('vopd_eligible')})")
-    r = kl.lint_listing("vopd_neg", *listing(loop_of([wm] + [f"v_add_f32 v{100 + k}, -v{1 + k}, v{50 + k}" for k in range(40)])))
-    ok(r.get("vopd_eligible") == 0, f"vopd: an unsuffixed form with a source negation is not eligible ({r.get('vopd_eligible')})")
+    ok(pairs_of(dep)[0] == 0, f"vopd: a dependent chain: no pair ({pairs_of(dep)})")
+    mid = sum(([mv(2 * k), f"v_mov_b32_e32 v{1 + 2 * k + 1}, v90", mv(2 * k + 1), "s_waitcnt vmcnt(0)"] for k in range(20)), [])
+    ok(pairs_of(mid)[0] == 0, f"vopd: an instruction between writes the second half's source: no pair ({pairs_of(mid)})")
+    yy = [f"v_add_nc_u32_e32 v{100 + k}, v{1 + k}, v{51 + k}" if k % 2 == 0 else f"v_lshlrev_b32_e32 v{100 + k}, v{1 + k}, v{51 + k}"
+          for k in range(40)]
+    ok(pairs_of(yy)[0] == 0 and pairs_of(yy)[1] == 40, f"vopd: two Y-only opcodes cannot pair (R5b: one half must be X) ({pairs_of(yy)})")
+    wt = sum(([mv(2 * k), "s_waitcnt vmcnt(0)", mv(2 * k + 1), "s_barrier"] for k in range(20)), [])
+    ok(pairs_of(wt)[0] == 0, f"vopd: a wait between the halves: no pair ({pairs_of(wt)})")
+    far = sum(([mv(2 * k)] + ["s_nop 0"] * 8 + [mv(2 * k + 1)] + ["s_nop 0"] * 8 for k in range(20)), [])
+    ok(pairs_of(far)[0] == 0, f"vopd: halves 9 instructions apart, past the window: no pair ({pairs_of(far)})")
+    e64 = [f"v_add_f32_e64 v{100 + k}, v{1 + k}, v{51 + k}" for k in range(40)]
+    ok(pairs_of(e64)[1] == 0, f"vopd: VOP3 forms are not eligible (C5's port) ({pairs_of(e64)})")
+    neg = [f"v_add_f32 v{100 + k}, -v{1 + k}, v{51 + k}" for k in range(40)]
+    ok(pairs_of(neg)[1] == 0, f"vopd: a source negation is not eligible ({pairs_of(neg)})")
+    vs = [f"v_add_f32_e32 v{100 + k}, v{1 + k}, v238" for k in range(40)]
+    ok(pairs_of(vs)[0] == 0, f"vopd: both halves' VSRC1 the same register (one bank): refused, as llvm-mc refused v238 (E580) "
+       f"({pairs_of(vs)})")
+    vb = [f"v_add_f32_e32 v{100 + k}, v{1 + k}, v{60 + 4 * k}" for k in range(40)]
+    ok(pairs_of(vb)[0] == 0, f"vopd: VSRC1 in one bank (reg % 4 equal): refused ({pairs_of(vb)})")
+    lit = [f"v_fmamk_f32 v{100 + k}, v{1 + k}, 0x{0x3fb8aa3b + k:x}, v{51 + k}" for k in range(40)]
+    ok(pairs_of(lit)[0] == 0 and pairs_of(lit)[1] == 40, f"vopd: two different literals in one pair: refused (R5) ({pairs_of(lit)})")
+    lit1 = [f"v_fmamk_f32 v{100 + k}, v{1 + k}, 0x3fb8aa3b, v{51 + k}" for k in range(40)]
+    ok(pairs_of(lit1)[0] == 20, f"vopd: the same literal in both halves is one literal: pairs ({pairs_of(lit1)})")
+    r = kl.lint_listing("bfar", *listing(loop_of([wm] + [mv(k) for k in range(40)] + ["s_nop 0"] * 9)))
+    ok(r.get("backedge") is None and "backedge" in r, f"vopd: a copy run ending 10 instructions before the back-edge is not its block "
+       f"({r.get('backedge')})")
+    r = kl.lint_listing("bgap", *listing(loop_of([wm] + [mv(k) for k in range(20)] + ["s_nop 0"] * 4 + [mv(20 + k) for k in range(10)])))
+    ok(r.get("backedge") and r["backedge"][:2] == (10, 5), f"vopd: the back-edge block is the last run (moves <= 3 apart), not the one "
+       f"before a gap of 5 ({r.get('backedge')})")
+    r = kl.lint_listing("nomm", *listing(["s_mov_b32 s0, 0"] + [mv(k) for k in range(40)] + ["s_endpgm"]))
+    ok("vopd" not in notes(r) and r.get("vopd_pairs") is None, f"vopd: no MMA loop, no figure ({r.get('vopd_pairs')})")
     chain = ["v_wmma_f32_16x16x16_f16 v[0:7], v[8:15], v[16:23], v[0:7]", "v_wmma_f32_16x16x16_f16 v[24:31], v[8:15], v[16:23], v[24:31]",
              "v_wmma_f32_16x16x16_f16 v[0:7], v[8:15], v[16:23], v[0:7]", "v_wmma_f32_16x16x16_f16 v[24:31], v[8:15], v[16:23], v[24:31]"]
     r = kl.lint_listing("dep1", *listing(loop_of(chain)))
-    ok(r.get("wmma_dep1") == 4 and "vopd" not in r.get("notes", []), f"vopd: two interleaved accumulators: every WMMA's C written one "
-       f"WMMA earlier (informational, R6a) ({r.get('wmma_dep1')})")
+    ok(r.get("wmma_dep1") == 4, f"vopd: two interleaved accumulators: 4 of 4 WMMAs at D->C gap 1 (informational, R6a) ({r.get('wmma_dep1')})")
     chain16 = [f"v_wmma_f32_16x16x16_f16 v[{8 * k}:{8 * k + 7}], v[200:207], v[208:215], v[{8 * k}:{8 * k + 7}]" for k in range(16)]
     r = kl.lint_listing("dep16", *listing(loop_of(chain16)))
-    ok(r.get("wmma_dep1") == 0, f"vopd: 16 independent accumulators (the m256 GEMM's) count 0 ({r.get('wmma_dep1')})")
+    ok(r.get("wmma_dep1") == 0, f"vopd: 16 independent accumulators count 0 ({r.get('wmma_dep1')})")
+    # live pins (review F1): pkg-e480's flash2_f16o hot loop (C5's 56 corrected to 54 by q210's llvm-mc build, E580) and the m256 GEMM
+    def fx(name):
+        lst = [x.split("\t", 1) for x in open(os.path.join(HERE, "fixtures", name)).read().split("\n") if x]
+        return [i for _, i in lst], [int(a, 16) for a, _ in lst]
+    r = kl.lint_listing("flash2_f16o", *fx("flash2_f16o_e480_loop.listing"))
+    got = (r.get("vopd_pairs"), r.get("vopd_eligible"), r.get("backedge") and r["backedge"][:2], r.get("wmma_dep1"))
+    ok(got == (56, 186, (65, 31), 16), f"vopd: live flash2_f16o: 56 pairs of 186 eligible, back-edge 65 moves -> 31 pairs, 16 WMMAs at "
+       f"D->C gap <= 1 (C5 / E551; C18 r2: a different 56 from C5's, all 56 accepted by ROCm 10.2 llvm-mc, where 54 of C5's were, E580) "
+       f"({got})")
+    lb = fx("flash2_f16o_e480_loop.listing")[0]
+    two = lambda i, j: kl.lint_listing("v2", *listing(loop_of([wm, lb[i], lb[j]]))).get("vopd_pairs")
+    ok(two(776, 777) == 0 and two(779, 780) == 0 and two(604, 605) == 1,
+       f"vopd: the two pairs llvm-mc refused in C5's set (VSRC1 v238 in both halves) are refused, a legal neighbour is not "
+       f"({two(776, 777)}, {two(779, 780)}, {two(604, 605)})")
+    r = kl.lint_listing("gemm_m256", *fx("gemm_f16_store_m256_e480_loop.listing"))
+    got = (r.get("vopd_pairs"), r.get("vopd_eligible"), r.get("wmma_dep1"))
+    ok(got == (0, 9, 0), f"vopd: live m256 GEMM: 0 pairs of 9 eligible, 0 at gap <= 1 ({got})")
+    ok("ldswait" not in notes(r) and not hasattr(kl, "lds_waits"), "ldswait is deleted (the ldsser lever, refuted E293 / E309 / E335 / "
+       "E340; re-add only if E534's SQ_WAIT_INST_LDS contradicts E341)")
 
 
 def main():
