@@ -615,22 +615,36 @@ def masked_v(text):
     return sorted({s[1] for s in score})
 
 
-BAR_LOAD = ("vector.load", "view.load", "vector.fragment.load")
-BAR_STORE = ("vector.store", "view.store", "vector.fragment.store")
-BAR_ATOMIC = ("view.atomic.rmw",)
-# the kernel.* value producers whose result is the same for every invocation of a workgroup (Loom 0.2.0 kernel/defs.py); every other
-# kernel.* result (ids, lanes, shuffles, broadcasts, subgroup reductions / votes, workgroup.scan) and every atomic's result may differ
-UNIFORM_KERNEL = ("kernel.workgroup.id", "kernel.workgroup.size", "kernel.workgroup.count", "kernel.subgroup.count",
-                  "kernel.subgroup.size", "kernel.workgroup.reduce", "kernel.workgroup.vote.")
+# The barrier check's allowlists (Loom 0.2.0 dialect defs; review 11-25: every spelling the r1 model did not recognise read as
+# "no access" or "disjoint"). An op not listed here that takes a workgroup region or a view of one is a read-write access of the
+# whole region, and its results join the region.
+BAR_ACCESS = {"view.load": "r", "vector.load": "r", "vector.fragment.load": "r", "view.store": "w", "vector.store": "w",
+              "vector.fragment.store": "w", "view.atomic.rmw": "a"}
+BAR_VIEW = ("buffer.view", "view.subview", "view.refine", "view.bitcast", "view.duplicate", "buffer.duplicate", "buffer.assume.alignment",
+            "buffer.assume.memory_space", "buffer.assume.noalias", "buffer.assume.same_root", "buffer.restrict.begin", "scf.select")
+# uniformity: results the same for every invocation of a workgroup whatever their operands (kernel/defs.py), and ops whose result
+# is uniform when all their operands are (arithmetic, views, plain loads; scf.for / scf.if inside a callee). Every other op's result
+# may differ: ids, lanes, shuffles, broadcasts, subgroup reductions / votes, scans, fragments / mma (lane-distributed), atomics and
+# loads with an attribute such as <volatile> (the value depends on when each invocation ran), and anything unlisted.
+UNIFORM_SOURCE = ("kernel.workgroup.id", "kernel.workgroup.size", "kernel.workgroup.count", "kernel.subgroup.count",
+                  "kernel.subgroup.size", "kernel.workgroup.reduce")
+UNIFORM_PURE = re.compile(r"(?:index|scalar|buffer|view|vector)\.[\w.]+$|scf\.(?:select|for|if)$")
+UNIFORM_NOT = re.compile(r"vector\.fragment|vector\.mma|(?:view|vector|buffer)\.atomic")
 
 
-def nonuniform_op(op):
-    """True when an op's result may differ between a workgroup's invocations by itself (fail closed: an unlisted kernel.* op does)"""
-    return (op.startswith("kernel.") and not op.startswith(UNIFORM_KERNEL)) or op.startswith(("view.atomic", "buffer.atomic"))
+def uniform_op(op, s):
+    """'source' (uniform whatever its operands), 'pure' (uniform when its operands are) or None (may differ: fail closed)"""
+    if op.startswith(UNIFORM_SOURCE):
+        return "source"
+    if UNIFORM_PURE.match(op) and not UNIFORM_NOT.match(op) and not (op.startswith(("view.load", "vector.load", "vector.gather"))
+                                                                       and re.search(re.escape(op) + "<", s)):
+        return "pure"                                     # a load with an attribute (<volatile> ...) may read another value per wave
+    return None
 
 
 def _calls_nonuniform(text):
-    return any(nonuniform_op(o) for o in re.findall(r"=\s*((?:kernel|view|buffer)\.[\w.]+)", text))
+    """a callee whose result may differ for uniform arguments: any result-producing op of it outside the uniform allowlist"""
+    return any(uniform_op(m.group(1), m.group(0)) is None for m in re.finditer(r"(?m)^\s*%[\w\s,%]*=\s*([\w.]+).*$", text))
 OP_LINE = re.compile(r"(?:(%\w+(?:\s*,\s*%\w+)*)\s*=\s*)?([\w.]+)")
 
 
@@ -711,57 +725,56 @@ def _yields(block):
 
 
 def _taint(tree, funcs=None):
-    """names whose value may differ between the workgroup's invocations (the workitem / lane / subgroup ids and everything
-    computed from them, loads at such addresses, a loop's iteration variable over such bounds, a region's result under such a
-    condition or yielding such a value): a fixpoint over the tree"""
+    """names whose value may differ between the workgroup's invocations: every result of an op off the uniform allowlist
+    (uniform_op) and everything computed from one, a callee's result unless its text is found and all uniform, a loop's
+    variable, carried values and results under a non-uniform bound, a region's result under a non-uniform condition or yielding
+    such a value: a fixpoint over the tree"""
     T = set()
     def walk(block):
         ch = False
         for it in block:
-            if it[0] == "op":
-                m = OP_LINE.match(it[2])
-                defs = re.findall(r"%\w+", m.group(1) or "") if m else []
-                rest = it[2][m.end():] if m else it[2]
-                bad = (m and nonuniform_op(m.group(2))) or bool(set(re.findall(r"%\w+", rest)) & T)
-                if m and m.group(2).startswith(UNIFORM_KERNEL):
-                    bad = False                               # a workgroup reduce / vote of lane values is the same for all
-                if m and m.group(2) == "func.call":           # a callee reading an invocation id returns a non-uniform value
-                    callee = (funcs or {}).get((re.search(r"@(\w+)", rest) or [None, ""])[1])
-                    bad = bad or callee is None or _calls_nonuniform(callee)
-                if bad and not set(defs) <= T:
-                    T.update(defs)
-                    ch = True
-                continue
             m = OP_LINE.match(it[2])
+            if not m:
+                continue                                  # seq refuses the line
             res = re.findall(r"%\w+", m.group(1) or "")
-            if it[0] == "for":
+            new = set()
+            if it[0] == "op":
+                rest = it[2][m.end():]
+                tainted_in = bool(set(re.findall(r"%\w+", rest)) & T)
+                if m.group(2) == "func.call":           # a callee reading an invocation id returns a non-uniform value
+                    callee = (funcs or {}).get((re.search(r"@(\w+)", rest) or [None, ""])[1])
+                    bad = tainted_in or callee is None or _calls_nonuniform(callee)
+                else:
+                    u = uniform_op(m.group(2), it[2])
+                    bad = u is None or (u == "pure" and tainted_in)
+                if bad:
+                    new.update(res)
+            elif it[0] == "for":
                 h = re.match(r"(?:.*?=\s*)?scf\.for\s+(%\w+)\s*=\s*\[([^\]]*)\](?:\((.*?)\))?", it[2])
                 if not h:
                     raise NotAnalysed(f"line {it[1]}: scf.for header not parsed")
-                iv, bounds = h.group(1), set(re.findall(r"%\w+", h.group(2)))
-                if bounds & T and iv not in T:
-                    T.add(iv)
-                    ch = True
                 args = re.findall(r"(%\w+)\s*=\s*(%\w+|[-\w.]+)", h.group(3) or "")
+                if set(re.findall(r"%\w+", h.group(2))) & T:      # a non-uniform trip count: everything the loop carries
+                    new.update([h.group(1)] + [a for a, _ in args] + res)
                 ys = _yields(it[3])
                 for k, (a, init) in enumerate(args):
-                    if (init in T or (k < len(ys) and ys[k] in T)) and a not in T:
-                        T.add(a)
-                        ch = True
-                    if a in T and k < len(res) and res[k] not in T:
-                        T.add(res[k])
-                        ch = True
+                    if init in T or (k < len(ys) and ys[k] in T) or a in T:
+                        new.add(a)
+                        if k < len(res):
+                            new.add(res[k])
                 ch |= walk(it[3])
             else:
                 c = re.match(r"(?:.*?=\s*)?scf\.if\s+(%\w+)", it[2])
                 cond = c.group(1) if c else None
                 ys, ye = _yields(it[3]), _yields(it[4] or [])
                 for k, r in enumerate(res):
-                    if r not in T and (cond in T or (k < len(ys) and ys[k] in T) or (k < len(ye) and ye[k] in T)):
-                        T.add(r)
-                        ch = True
+                    if cond in T or (k < len(ys) and ys[k] in T) or (k < len(ye) and ye[k] in T):
+                        new.add(r)
                 ch |= walk(it[3])
                 ch |= walk(it[4] or [])
+            if not new <= T:
+                T.update(new)
+                ch = True
         return ch
     while walk(tree):
         pass
@@ -772,143 +785,39 @@ ELEM_BYTES = {"f64": 8, "i64": 8, "f32": 4, "i32": 4, "f16": 2, "bf16": 2, "i16"
 
 
 def view_shape(ty):
-    """(static dims, element bytes) of a 'view<AxBxT>' type text, or None (a dynamic or unknown shape)"""
-    m = re.search(r"view<([\dx]+)x(\w+)>", ty)
+    """(static dims, element bytes) of a 'view<AxBxT>' type text, or None (a dynamic or unknown shape, a layout)"""
+    m = re.fullmatch(r"view<([\dx]+)x(\w+)>", ty)
     if not m or m.group(2) not in ELEM_BYTES:
         return None
     return [int(x) for x in m.group(1).split("x")], ELEM_BYTES[m.group(2)]
 
 
-def footprint(op, s, ndim):
-    """per dimension, the elements one invocation's access covers from its index, or None where unknown: scalar view ops 1;
-    a 1-D vector N along the last dimension (Loom refuses a vector footprint outside the view: SUBRANGE/010); fragments: the
-    last two dimensions unknown"""
-    fp = [1] * ndim
-    if op.startswith("vector.fragment"):
-        for d in range(max(0, ndim - 2), ndim):
-            fp[d] = None
-    elif op.startswith("vector."):
-        v = re.search(r"vector<(\d+)x\w+>", s)
-        if not v or not ndim:
-            return [None] * ndim
-        fp[-1] = int(v.group(1))
-    return fp
-
-
-ANY = (1, 0, 1)
-
-
-def lat_join(a, b):
-    """the smallest lattice holding both value sets"""
-    return (math.gcd(math.gcd(a[0], b[0]), abs(a[1] - b[1])), a[1], max(a[2], b[2]))
-
-
-def index_lattices(tree, consts):
-    """SSA index name -> (g, c, w): its value lies in {g*k + c + t : any integer k, 0 <= t < w} (g = 0: the interval [c, c + w)),
-    for every invocation; ANY when not derived. Rules: constants; add / sub (gcd of strides, widths add); mul / scale by a
-    constant; madd with a constant factor; rem by a constant [0, n); min / max / select join; assume / cast pass through; a loop
-    variable over a constant start and step. Sound as an over-approximation: disjoint() only trusts a proof over these sets."""
-    L = {k: (0, v, 1) for k, v in consts.items()}
-    get = lambda t: (0, int(t), 1) if t.isdigit() else L.get(t, ANY)
-    def scale(a, n):
-        return (a[0] * n, a[1] * n, (a[2] - 1) * n + 1) if n > 0 else ANY
-    def walk(block):
-        for it in block:
-            if it[0] == "for":
-                h = re.match(r"(?:.*?=\s*)?scf\.for\s+(%\w+)\s*=\s*\[([^\]]*)\]", it[2])
-                b = re.split(r"\s+(?:to|step)\s+", h.group(2).strip())
-                lo, st = get(b[0]), (get(b[2]) if len(b) == 3 else ANY)
-                hi = get(b[1]) if len(b) == 3 else ANY
-                if lo[0] == hi[0] == 0 and lo[2] == hi[2] == 1 and st[0] == 0 and st[2] == 1 and st[1] > 0:
-                    L[h.group(1)] = (0, lo[1], max(1, hi[1] - lo[1]))     # constant bounds: the interval [lo, hi)
-                else:
-                    L[h.group(1)] = (math.gcd(lo[0], st[1]), lo[1], lo[2]) if st[0] == 0 and st[2] == 1 else ANY
-                walk(it[3])
-                continue
-            if it[0] == "if":
-                walk(it[3])
-                walk(it[4] or [])
-                continue
-            m = re.match(r"(%\w+)\s*=\s*(index\.\w+|scf\.select)\s+([^:\[]*)", it[2])
-            if not m:
-                continue
-            d, op, args = m.group(1), m.group(2), [x.strip() for x in m.group(3).split(",")]
-            if op == "index.constant":
-                continue
-            a = [get(x) for x in args]
-            r = ANY
-            if op in ("index.assume", "index.cast") and a:
-                r = a[0]
-            elif op in ("index.add", "index.sub") and len(a) == 2:
-                g = math.gcd(a[0][0], a[1][0])
-                c = a[0][1] + a[1][1] if op == "index.add" else a[0][1] - a[1][1] - (a[1][2] - 1)
-                r = (g, c, a[0][2] + a[1][2] - 1)
-            elif op in ("index.mul", "index.scale") and len(a) == 2:
-                if a[1][0] == 0 and a[1][2] == 1:
-                    r = scale(a[0], a[1][1])
-                elif a[0][0] == 0 and a[0][2] == 1:
-                    r = scale(a[1], a[0][1])
-            elif op == "index.madd" and len(a) == 3:
-                p = scale(a[0], a[1][1]) if a[1][0] == 0 and a[1][2] == 1 else (scale(a[1], a[0][1]) if a[0][0] == 0 and a[0][2] == 1 else ANY)
-                if p != ANY:
-                    r = (math.gcd(p[0], a[2][0]), p[1] + a[2][1], p[2] + a[2][2] - 1)
-            elif op == "index.rem" and len(a) == 2 and a[1][0] == 0 and a[1][2] == 1 and a[1][1] > 0:
-                r = (0, 0, a[1][1])
-            elif op in ("index.min", "index.max") and len(a) == 2:
-                r = lat_join(a[0], a[1])
-            elif op == "scf.select" and len(a) == 3:
-                r = lat_join(a[1], a[2])
-            if r[0] < 0:
-                r = ANY
-            L[d] = r
-    walk(tree)
-    return L
-
-
-def _apart(a, fa, b, fb):
-    """True when an index in lattice a covering fa elements and one in lattice b covering fb never share an element"""
-    if fa is None or fb is None:
-        return False
-    wa, wb = a[2] + fa - 1, b[2] + fb - 1
-    g = math.gcd(a[0], b[0])
-    if g == 0:
-        return a[1] + wa <= b[1] or b[1] + wb <= a[1]
-    if wa + wb > g:
-        return False
-    x, y = a[1] % g, b[1] % g
-    return not (x < y + wb and y < x + wa) and not (x < y + wb - g) and not (y < x + wa - g)
-
-
-def disjoint(x, y):
-    """True only when two accesses of one region provably touch different bytes, for any two invocations: views with constant,
-    non-overlapping byte extents, or the same view with indices that never meet in some dimension (index_lattices)"""
-    if x["ext"] and y["ext"] and (x["ext"][1] <= y["ext"][0] or y["ext"][1] <= x["ext"][0]):
-        return True
-    if x["view"] is None or x["view"] != y["view"] or x["idx"] is None or y["idx"] is None or len(x["idx"]) != len(y["idx"]):
-        return False
-    return any(_apart(i, f, j, g) for i, j, f, g in zip(x["idx"], y["idx"], x["fp"], y["fp"]))
-
-
-def barrier_check(text, funcs=None):
+def barrier_check(text, funcs=None, races=False):
     """the workgroup-memory hazards each kernel.barrier<workgroup> orders, from the kernel's Loom text (HRX-like E504: one extra
-    barrier per tile cost +1.4 % of flash2 time). Model (fail closed throughout):
-      memory: one region per buffer.alloca<workgroup>; every view derived from it, by any op, is in it; an op on a region that is
-        not a known load / store / atomic reads and writes it. Two accesses of one region overlap unless provably disjoint:
-        constant non-overlapping byte extents of their views (buffer.view at a constant offset with a static shape), or one view
-        with constant indices whose footprints differ in a dimension. Anything else (lane- or wave-dependent indices) overlaps.
+    barrier per tile cost +1.4 % of flash2 time). Model (fail closed throughout: what it does not recognise is an access of the
+    whole region or 'not analysed', never no access and never disjoint):
+      memory: one region per buffer.alloca<workgroup> / view.alloca<workgroup>; an alloca in a space other than workgroup /
+        private / global, or buffer.alloca.init<workgroup> (a collective), is not analysed. Views derive from a region through
+        the BAR_VIEW ops only; BAR_ACCESS ops read / write / update it; any other op with a region operand (masked, gather,
+        expand, vector atomics, func.call, copies ...) reads and writes the whole region, and its results join the region.
+        kernel.async.* / kernel.tensor.* (data lands after issue) are not analysed. Two accesses of one region overlap unless
+        their views are buffer.views of the region at constant offsets with static shapes and disjoint byte extents (indices
+        assumed in bounds, as Loom requires); there is no per-index model (r1's index lattice bound names regardless of scope
+        and decided no live verdict, review 11-25 B3). Names bind in walk order, so a name reused in a sibling scope is rebound
+        before its uses there.
       control: the structured body as a graph; a loop has a back-edge and a zero-trip exit, an if both arms (even under a
         constant condition), so its paths cover every executed one. A barrier or workgroup collective under control that may
-        differ between invocations (an id-derived condition or bound) makes the kernel 'not analysed'.
+        differ between invocations (_taint: only allowlisted uniform sources and ops on them are uniform) is 'divergent'.
       ordering: barrier B orders (a, b) when a reaches B and B reaches b with no other barrier on the way, they overlap and one
-        writes (RAW / WAR / WAW; an atomic writes). No such pair: B 'orders nothing'. A workgroup collective
+        writes (RAW / WAR / WAW; an atomic or an unlisted op writes). No such pair: B 'orders nothing'. A workgroup collective
         (kernel.workgroup.reduce, two s_barriers in the binary) is not counted as a barrier, so pairs it also orders stay B's.
-      races: two different accesses that overlap, one writing, reachable from one another with no barrier between them (arms of
-        an if whose condition differs between invocations are concurrent with each other); 'collective only' when a workgroup
-        collective lies between them on every such path. A store racing with itself across invocations is not checked.
+      races (only with races=True, --barriers: super-linear, detail only): two different accesses that overlap, one writing,
+        reachable from one another with no barrier between them (arms of an if whose condition differs between invocations are
+        concurrent with each other); 'collective only' when a workgroup collective lies between them on every such path.
       scope: a kernel.barrier<workgroup> fences workgroup memory only (Loom 0.2.0 kernel/defs.py kernel_barrier: 'fence a named
         memory space'), so global accesses are not its hazards; any other barrier form is 'not analysed'.
-    Returns {'status': 'analysed' | 'single wave' | 'no barriers' | 'not analysed: why', 'barriers': [{'line', 'pairs':
-    [(writer-or-first line, second line, kind, region)], 'verdict'}], 'races': [(line, line, kind, region, label)],
+    Returns {'status': 'analysed' | 'single wave' | 'no barriers' | 'not analysed: why' | 'divergent: why', 'barriers': [{'line',
+    'pairs': [(writer-or-first line, second line, kind, region)], 'verdict'}], 'races': [(line, line, kind, region, label)],
     'collectives': n, 'expected_isa': s_barriers the binary should hold}; lines count from the kernel.def line (0)"""
     out = {"status": "analysed", "barriers": [], "races": [], "collectives": 0, "expected_isa": None}
     try:
@@ -919,29 +828,34 @@ def barrier_check(text, funcs=None):
     if "kernel.barrier" not in text:
         out["status"] = "no barriers"
         return out
-    consts = {k: int(v) for k, v in re.findall(r"(%\w+)\s*=\s*index\.constant\s+(\d+)\s*:", text)}
-    ws = re.search(r"workgroup_size\(([^)]*)\)", text)
+    head = text.split("\n} launch(", 1)[0]                # the launch config's own constants (the body may reuse a name)
+    hc = {k: int(v) for k, v in re.findall(r"(%\w+)\s*=\s*index\.constant\s+(\d+)\s*:", head)}
+    ws = re.search(r"workgroup_size\(([^)]*)\)", head)
     if ws:
-        dims = [consts.get(x.strip()) for x in ws.group(1).split(",")]
+        dims = [hc.get(x.strip()) for x in ws.group(1).split(",")]
         if all(d is not None for d in dims) and dims[0] * dims[1] * dims[2] <= 32:
             out["status"] = "single wave"               # one wave32 per workgroup: no other wave to order (Loom drops the s_barrier)
             return out
     funcs = funcs or {}
-    const = lambda t: int(t) if t.isdigit() else consts.get(t)
+    K, region, vinfo = {}, {}, {}                         # name -> index constant / set of regions / byte extent, bound in walk order
+    const = lambda t: int(t) if t.isdigit() else K.get(t)
+    def bind(names):
+        for d in names:
+            K.pop(d, None)
+            region.pop(d, None)
+            vinfo.pop(d, None)
     try:
         T = _taint(tree, funcs)
-        lat = index_lattices(tree, consts)
-        region = {}                                       # SSA name -> set of region names
-        vinfo = {}                                        # view SSA name -> (byte extent or None, static shape or None)
         nodes = [("entry", None, None)]                   # (kind, line, info): entry | bar | col | head | acc
         succ = collections.defaultdict(set)
-        cross = collections.defaultdict(set)              # extra concurrency edges between the arms of a non-uniform if
+        cross = collections.defaultdict(set)              # extra concurrency edges between the arms of a non-uniform if (races only)
         def callee_bad(name, seen=()):
             t = funcs.get(name)
             if t is None:
                 return f"func {name}: text not found"
-            if re.search(r"kernel\.barrier|kernel\.workgroup\.(?!id)\w+|alloca<workgroup>", t):
-                return f"func {name} synchronises or allocates workgroup memory"
+            if re.search(r"kernel\.barrier|kernel\.workgroup\.(?!id)\w+|kernel\.(?:async|tensor)\.|kernel\.exit|"
+                         r"\.alloca(?:\.\w+)*(?![\w.])(?!<(?:private|global)>)", t):
+                return f"func {name} synchronises, allocates workgroup memory or copies asynchronously"
             for c in re.findall(r"func\.call(?:\s+\w+)?\s+@(\w+)", t):
                 if c not in seen and c != name:
                     r = callee_bad(c, seen + (name,))
@@ -959,38 +873,46 @@ def barrier_check(text, funcs=None):
                 if it[0] in ("for", "if") and set(re.findall(r"%\w+", it[2].split("=", 1)[-1])) & set(region):
                     raise NotAnalysed(f"line {it[1]}: a workgroup view flows through an scf.{it[0]}")
                 if it[0] == "for":
-                    h = re.match(r"(?:.*?=\s*)?scf\.for\s+%\w+\s*=\s*\[([^\]]*)\]", it[2])
-                    b = [x for x in re.split(r"\s+(?:to|step)\s+", h.group(1).strip())]
+                    h = re.match(r"(?:(.*?)=\s*)?scf\.for\s+(%\w+)\s*=\s*\[([^\]]*)\](?:\((.*?)\))?", it[2])
+                    bind(re.findall(r"%\w+", h.group(1) or "") + [h.group(2)] + re.findall(r"(%\w+)\s*=", h.group(4) or ""))
+                    b = re.split(r"\s+(?:to|step)\s+", h.group(3).strip())
                     trip = None
                     if re.search(r"\bunroll\s*\{$", it[2]) and len(b) == 3 and all(const(x) is not None for x in b):
                         lo, hi, st = (const(x) for x in b)
                         trip = max(0, -(-(hi - lo) // st))
                     hd = add("head", it[1], None, preds)
                     ex = seq(it[3], hd, mult * (trip if trip is not None else 1),
-                             ctl + ([it[1]] if set(re.findall(r"%\w+", h.group(1))) & T else []))
+                             ctl + ([it[1]] if set(re.findall(r"%\w+", h.group(3))) & T else []))
                     for p in ex:
                         succ[p].add(hd[0])
                     preds = hd
                     continue
                 if it[0] == "if":
-                    c = re.match(r"(?:.*?=\s*)?scf\.if\s+(%\w+)", it[2])
-                    nonuni = bool(c and c.group(1) in T)
+                    c = re.match(r"(?:(.*?)=\s*)?scf\.if\s+(%\w+)", it[2])
+                    if not c:
+                        raise NotAnalysed(f"line {it[1]}: scf.if condition not parsed")
+                    bind(re.findall(r"%\w+", c.group(1) or ""))
+                    nonuni = c.group(2) in T
                     c2 = ctl + ([it[1]] if nonuni else [])
                     n0 = len(nodes)
                     t_ex = seq(it[3], preds, mult, c2)
                     n1 = len(nodes)
                     e_ex = seq(it[4], preds, mult, c2) if it[4] is not None else list(preds)
-                    if nonuni:                              # one invocation in each arm at once
+                    if nonuni and races:                    # one invocation in each arm at once
                         for x in range(n0, n1):
-                            for y in range(n1, len(nodes)):
-                                cross[x].add(y)
+                            cross[x].update(range(n1, len(nodes)))
                     preds = sorted(set(t_ex) | set(e_ex))    # deduplicated: a list doubled per if, 2^k for k ifs (OOM 11-25)
                     continue
                 s = it[2]
                 m = OP_LINE.match(s)
+                if not m:
+                    raise NotAnalysed(f"line {it[1]}: op not parsed: {s[:40]}")
                 op = m.group(2)
                 defs = re.findall(r"%\w+", m.group(1) or "")
                 uses = re.findall(r"%\w+", s[m.end():])
+                bind(defs)
+                if op.startswith(("kernel.async.", "kernel.tensor.")) or op == "kernel.exit":
+                    raise NotAnalysed(f"line {it[1]}: {op} not modelled (asynchronous data or an early exit)")
                 if op == "kernel.barrier" or op.startswith("kernel.barrier."):
                     if not re.match(r"kernel\.barrier<workgroup>\s+scope\(workgroup\)", s):
                         raise NotAnalysed(f"line {it[1]}: barrier form not modelled: {s[:60]}")
@@ -1013,9 +935,18 @@ def barrier_check(text, funcs=None):
                     expected[0] += 2 * mult                 # a workgroup.reduce lowers to two s_barriers (GEMM: 3 + 2, dfl_topk 3 + 8)
                     preds = add("col", it[1], None, preds)
                     continue
-                if op == "buffer.alloca":
-                    if "<workgroup>" in s:
+                if re.search(r"\.alloca(?:\.|$)", op):
+                    sp = re.match(r"[\w.]+<(\w+)>", s[m.start(2):])
+                    space = sp.group(1) if sp else None
+                    if space == "workgroup" and op in ("buffer.alloca", "view.alloca"):
                         region[defs[0]] = {defs[0]}
+                    elif space not in ("private", "global"):
+                        raise NotAnalysed(f"line {it[1]}: {op}<{space}> not modelled")
+                    continue
+                if op == "index.constant":
+                    v = re.search(r"index\.constant\s+(\d+)\s*:", s)
+                    if v and defs:
+                        K[defs[0]] = int(v.group(1))
                     continue
                 if op == "func.call":
                     why = callee_bad(re.search(r"@(\w+)", s).group(1))
@@ -1026,26 +957,23 @@ def barrier_check(text, funcs=None):
                 rs = set().union(*[region[u] for u in uses if u in region])
                 if op == "scf.yield":
                     raise NotAnalysed(f"line {it[1]}: a workgroup view is yielded")
-                mode = {**dict.fromkeys(BAR_LOAD, "r"), **dict.fromkeys(BAR_STORE, "w"), **dict.fromkeys(BAR_ATOMIC, "a")}.get(op)
-                if mode is None and defs and re.search(r"\bview<|\bbuffer\b", s.split("->")[-1] if "->" in s else s.rsplit(":", 1)[-1]):
+                if op in BAR_VIEW:
                     for d in defs:
-                        region[d] = rs                      # a view or buffer derived from a region (buffer.view, scf.select ...)
+                        region[d] = rs
                     vm = re.match(r"buffer\.view\s+(%\w+)\[(%?\w+)\]\s*:\s*buffer\s*->\s*(view<[^>]*>)$", s[m.start(2):])
-                    if op == "buffer.view" and vm and vm.group(1) in region and region[vm.group(1)] == {vm.group(1)}:
+                    if op == "buffer.view" and vm and region.get(vm.group(1)) == {vm.group(1)}:
                         sh, off = view_shape(vm.group(3)), const(vm.group(2))
-                        ext = (off, off + sh[1] * eval("*".join(map(str, sh[0])))) if sh and off is not None else None
-                        vinfo[defs[0]] = (ext, sh)
+                        if sh and off is not None:
+                            vinfo[defs[0]] = (off, off + sh[1] * math.prod(sh[0]))
                     continue
-                acc = {"regions": frozenset(rs), "mode": mode or "rw", "view": None, "ext": None, "idx": None, "fp": None}
-                if mode:                                    # a known access: its view, indices and footprint
-                    vv = re.search(r"(%\w+)\[([^\]]*)\]", s[m.end():])
-                    if vv and vv.group(1) in vinfo:
-                        ext, sh = vinfo[vv.group(1)]
-                        acc.update(view=vv.group(1), ext=ext)
-                        idx = [(0, int(x.strip()), 1) if x.strip().isdigit() else lat.get(x.strip(), ANY)
-                               for x in vv.group(2).split(",")]
-                        if sh and len(idx) == len(sh[0]):
-                            acc.update(idx=idx, fp=footprint(op, s, len(idx)))
+                mode = BAR_ACCESS.get(op)
+                acc = {"regions": frozenset(rs), "mode": mode or "rw", "ext": None}
+                if mode:                                    # a listed access: the byte extent of the view it indexes
+                    vv = re.search(r"(%\w+)\[", s[m.end():])
+                    acc["ext"] = vinfo.get(vv.group(1)) if vv else None
+                else:
+                    for d in defs:
+                        region[d] = rs                      # an unlisted op's results may carry the region (F3: a callee's view)
                 preds = add("acc", it[1], acc, preds)
             return preds
         seq(tree, [0], 1, [])
@@ -1072,8 +1000,10 @@ def barrier_check(text, funcs=None):
         return seen
     def conflict(x, y):
         a, b = nodes[x][2], nodes[y][2]
-        return bool(a["regions"] & b["regions"]) and (a["mode"] != "r" or b["mode"] != "r") and not (
-            len(a["regions"]) == len(b["regions"]) == 1 and disjoint(a, b))
+        if not a["regions"] & b["regions"] or a["mode"] == b["mode"] == "r":
+            return False
+        ea, eb = a["ext"], b["ext"]
+        return not (ea and eb and (ea[1] <= eb[0] or eb[1] <= ea[0]))
     def kind(x, y):
         a, b = nodes[x][2]["mode"], nodes[y][2]["mode"]
         return "WAW" if a != "r" and b != "r" else ("RAW" if a != "r" else "WAR")
@@ -1084,10 +1014,11 @@ def barrier_check(text, funcs=None):
         after = [y for y in reach(succ[b], succ, ("bar",)) if nodes[y][0] == "acc"]
         pairs = sorted({(nodes[x][1], nodes[y][1], kind(x, y), reg(x, y)) for x in before for y in after if conflict(x, y)})
         out["barriers"].append({"line": nodes[b][1], "pairs": pairs, "verdict": "orders" if pairs else "orders nothing"})
-    conc = {k: v | cross[k] for k, v in succ.items()}
+    if not races:
+        return out
+    conc = collections.defaultdict(set, {k: v | cross[k] for k, v in succ.items()})
     for k, v in cross.items():
-        conc.setdefault(k, set()).update(v)
-    conc = collections.defaultdict(set, conc)
+        conc[k] |= v
     strict = {x: reach(conc[x], conc, ("bar",)) for x in acc}
     lenient = {x: reach(conc[x], conc, ("bar", "col")) for x in acc}
     for i, x in enumerate(acc):
@@ -1101,7 +1032,7 @@ def barrier_check(text, funcs=None):
     return out
 
 
-def barriers(rows, texts, funcs, roots=None):
+def barriers(rows, texts, funcs, roots=None, races=False):
     """attach barrier_check to each row whose kernel text is known, cross-checked against the binary: when the text's barriers
     (plus two per workgroup collective, times constant unroll counts) are not the binary's s_barrier count, the text is not
     what runs and no verdict is given (fail closed). Notes: 'barrier' (a barrier orders nothing; races are listed, not noted),
@@ -1116,7 +1047,7 @@ def barriers(rows, texts, funcs, roots=None):
                 r["barrier"] = {"status": "not analysed: no Loom text for this kernel", "barriers": [], "races": [],
                                 "collectives": 0, "expected_isa": None}
             continue
-        b = barrier_check(t, funcs)
+        b = barrier_check(t, funcs, races)
         if b["status"] == "analysed" and b["expected_isa"] != r.get("s_barrier"):
             b = dict(b, status=f"not analysed: the binary has {r.get('s_barrier')} s_barrier, the text implies {b['expected_isa']}",
                      barriers=[], races=[])
@@ -1285,7 +1216,7 @@ def main():
         rows = [r for rs in ex.map(lint_file, files) for r in rs]
     outl = outliers(rows)
     tiny(rows, stats)
-    barriers(rows, kernel_texts(texts), func_texts(texts), a.roots)
+    barriers(rows, kernel_texts(texts), func_texts(texts), a.roots, a.barriers)
     mv = {k: c for k, t in kernel_texts(texts).items() if (a.roots is None or re.search(a.roots, k)) for c in [masked_v(t)] if c}
     for r in rows:
         if r["kernel"] in mv:

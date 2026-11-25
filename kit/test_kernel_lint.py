@@ -259,13 +259,13 @@ def main():
     # nothing kept silently; a barrier under a lane-dependent branch (some waves never arrive) passed; a construct the model cannot
     # read reported clean instead of 'not analysed'; a predecessor list doubled per scf.if (11-25: 2^k entries, the draft fire run
     # took 47.9 GB and was OOM-killed); report lines one off the program file's (11-25 draft: L4298 for the barrier at 4299)
-    def bk(body, wg="%c64"):
+    def bk(body, wg="%c64", alloc=None):
+        alloc = alloc or "  %t = buffer.alloca<workgroup> align(16) %bytes : buffer\n  %tv = buffer.view %t[%c0] : buffer -> view<64xf32>\n"
         return ('kernel.def export("g_b") @g_b(%n: index) {\n  %c1 = index.constant 1 : index\n  %c64 = index.constant 64 : index\n'
                 "  %c32 = index.constant 32 : index\n"
                 f"  kernel.launch.config workgroups(%n, %c1, %c1) workgroup_size({wg}, %c1, %c1) : index\n"
                 "} launch(%x: buffer, %y: buffer) {\n  %c0 = index.constant 0 : index\n  %c1 = index.constant 1 : index\n"
-                "  %c32 = index.constant 32 : index\n  %tid = kernel.workitem.id x : index\n"
-                "  %t = buffer.alloca<workgroup> align(16) %bytes : buffer\n  %tv = buffer.view %t[%c0] : buffer -> view<64xf32>\n"
+                "  %c32 = index.constant 32 : index\n  %tid = kernel.workitem.id x : index\n" + alloc +
                 "  %xv = buffer.view %x[%c0] : buffer -> view<64xf32>\n  %v = view.load %xv[%tid] : view<64xf32> -> f32\n"
                 + body + "  kernel.return\n}\n")
     st = "  view.store %v, %tv[%tid] : f32, view<64xf32>\n"
@@ -279,26 +279,20 @@ def main():
     b = kl.barrier_check(bk(st + bar + nb))
     ok([x["verdict"] for x in b["barriers"]] == ["orders"] and not b["races"] and b["barriers"][0]["pairs"][0][2] == "RAW",
        f"barrier: write, barrier, neighbour read: the barrier orders the RAW ({b['barriers']})")
-    b = kl.barrier_check(bk(st + nb))
-    ok(b["status"] == "no barriers", "barrier: (the same race without any barrier is out of scope: 'no barriers')")
-    b = kl.barrier_check(bk(st + bar + nb + "  view.store %v, %tv[%c1] : f32, view<64xf32>\n"))
+    b = kl.barrier_check(bk(st + bar + nb + "  view.store %v, %tv[%c1] : f32, view<64xf32>\n"), races=True)
     ok(len(b["races"]) == 1 and b["races"][0][2] == "WAR", f"barrier: a store after the read with no barrier is a WAR race ({b['races']})")
-    b = kl.barrier_check(bk("  scf.for %i = [%c0 to %n step %c1] {\n" + st + bar + nb + "  }\n"))
+    b = kl.barrier_check(bk("  scf.for %i = [%c0 to %n step %c1] {\n" + st + bar + nb + "  }\n"), races=True)
     ok(any(r[2] == "WAR" for r in b["races"]), f"barrier: a tile loop without its end barrier races the next store with this "
        f"read across the back-edge (WAR) ({b['races']})")
-    b = kl.barrier_check(bk("  scf.for %i = [%c0 to %n step %c1] {\n" + st + bar + nb + bar + "  }\n"))
+    b = kl.barrier_check(bk("  scf.for %i = [%c0 to %n step %c1] {\n" + st + bar + nb + bar + "  }\n"), races=True)
     ok(not b["races"] and [x["verdict"] for x in b["barriers"]] == ["orders", "orders"],
        f"barrier: with the end barrier the loop is clean and both barriers order a pair ({b['barriers']}, {b['races']})")
-    dis = ("  view.store %v, %tv[%c0] : f32, view<64xf32>\n  %r = view.load %tv[%c1] : view<64xf32> -> f32\n" + bar)
-    b = kl.barrier_check(bk(dis))
-    ok(not b["races"] and b["barriers"][0]["verdict"] == "orders nothing",
-       f"barrier: disjoint constant elements [0] and [1] neither race nor need the barrier ({b})")
     two = ("  %c128 = index.constant 128 : index\n  %lo = buffer.view %t[%c0] : buffer -> view<32xf32>\n"
            "  %hi = buffer.view %t[%c128] : buffer -> view<32xf32>\n  view.store %v, %lo[%tid] : f32, view<32xf32>\n"
            "  %r = view.load %hi[%tid] : view<32xf32> -> f32\n" + bar)
-    b = kl.barrier_check(bk(two))
+    b = kl.barrier_check(bk(two), races=True)
     ok(not b["races"], f"barrier: views at disjoint constant byte extents of one buffer do not race ({b['races']})")
-    b = kl.barrier_check(bk(two.replace("%t[%c128]", "%t[%c64]")))
+    b = kl.barrier_check(bk(two.replace("%t[%c128]", "%t[%c64]")), races=True)
     ok(len(b["races"]) == 1, f"barrier: the same views overlapping (offset 64 < 128 bytes) race ({b['races']})")
     div = "  %lt = index.cmp ult, %tid, %c32 : index\n  scf.if %lt {\n" + st + bar + "  }\n" + nb
     b = kl.barrier_check(bk(div))
@@ -350,7 +344,7 @@ def main():
     ok(any(x.startswith(f"  L{want}: orders") for x in rep), f"barrier: report lines are the program file's (kernel.def at 100, "
        f"barrier at {want}): {rep[1:3]}")
     row = {"kernel": "g_b", "s_barrier": 2}
-    kl.barriers([row], {"g_b": bk(st + bar + bar + nb + "  view.store %v, %tv[%c1] : f32, view<64xf32>\n")}, {})
+    kl.barriers([row], {"g_b": bk(st + bar + bar + nb + "  view.store %v, %tv[%c1] : f32, view<64xf32>\n")}, {}, races=True)
     ok("race" not in row.get("notes", []) and row["barrier"]["races"] and kl.barrier_report(row)
        and not any("potential race" in x for x in kl.barrier_report(row))
        and any("potential race" in x for x in kl.barrier_report(row, full=True)),
@@ -358,6 +352,107 @@ def main():
     row = {"kernel": "g_other", "s_barrier": 3}
     kl.barriers([row], {"g_b": bk(st)}, {})
     ok(row.get("barrier", {}).get("status", "").startswith("not analysed"), "barrier: a binary with barriers and no text is 'not analysed'")
+    # fail closed (review 11-25, static-1125/barrier-lint/review: B1 / B2 / B3 / N1 / N3). Recurrence: an LDS access, region,
+    # footprint or name binding the check did not recognise was read as "no access" / "disjoint", so a barrier ordering a real
+    # hazard was called removable (probes P1-P8, F3). Each row ends "orders" or "not analysed" / "divergent", never "orders nothing".
+    wanted = lambda b: [x["verdict"] for x in b["barriers"]]
+    rd = "  %nb = index.sub %c32, %tid : index\n"
+    msk = "  %m = vector.splati 1 : vector<4xi1>\n  %old = vector.splatf 0.0 : vector<4xf32>\n"
+    iota = "  %o = vector.iota %c0 step %c1 : vector<4xindex>\n"
+    P = {
+        "P1 a view.alloca<workgroup> is a region": (bk(st + bar + nb, alloc="  %tv = view.alloca<workgroup> align(16) : view<64xf32>\n"),),
+        "P2 vector.load.mask reads the region": (bk(st + bar + rd + msk +
+            "  %r = vector.load.mask %tv[%nb], %m, %old : view<64xf32>, vector<4xi1>, vector<4xf32>\n"),),
+        "P2b vector.gather.mask reads it": (bk(st + bar + rd + msk + iota +
+            "  %r = vector.gather.mask %tv[%nb][%o], %m, %old : view<64xf32>, vector<4xindex>, vector<4xi1>, vector<4xf32>\n"),),
+        "P2c vector.load.expand reads it": (bk(st + bar + rd + msk +
+            "  %r = vector.load.expand %tv[%nb], %m, %old : view<64xf32>, vector<4xi1>, vector<4xf32>\n"),),
+        "P3 vector.atomic.rmw writes it": (bk(st + bar + rd + "  %w = vector.splatf 1.0 : vector<4xf32>\n" + iota +
+            "  %old = vector.atomic.rmw<addf> %w, %tv[%nb][%o] {ordering = relaxed, scope = workgroup} : vector<4xf32>, view<64xf32>, "
+            "vector<4xindex>\n"),),
+        "P4 a 2-D vector<4x8> store overlaps a row-1 read": (bk("  %w = vector.splatf 1.0 : vector<4x8xf32>\n"
+            "  vector.store %w, %tv[%c0, %c0] : vector<4x8xf32>, view<8x8xf32>\n" + bar + "  %r = view.load %tv[%c1, %c0] : view<8x8xf32> -> f32\n",
+            alloc="  %t = buffer.alloca<workgroup> align(16) %bytes : buffer\n  %tv = buffer.view %t[%c0] : buffer -> view<8x8xf32>\n"),),
+        "P5 a name reused in sibling if arms (then reads tv[tid], overlapping the store)": (bk(
+            "  %c8 = index.constant 8 : index\n  %c40 = index.constant 40 : index\n"
+            "  %k = index.rem %tid, %c8 : index\n  view.store %v, %tv[%k] : f32, view<64xf32>\n" + bar +
+            "  %u = index.cmp ult, %n, %c32 : index\n  scf.if %u {\n  %j = index.add %tid, %c0 : index\n  %r = view.load %tv[%j] : view<64xf32> -> f32\n"
+            "  } else {\n  %j = index.add %c40, %c1 : index\n  %r = view.load %tv[%j] : view<64xf32> -> f32\n  }\n"),),
+        "P6 a name constant in one arm, computed in the other": (bk(
+            "  %c8 = index.constant 8 : index\n  %k = index.rem %tid, %c8 : index\n  view.store %v, %tv[%k] : f32, view<64xf32>\n" + bar +
+            "  %u = index.cmp ult, %n, %c32 : index\n  scf.if %u {\n  %j = scalar.fptosi %v : f32 to index\n  %r = view.load %tv[%j] : view<64xf32> -> f32\n"
+            "  } else {\n  %j = index.constant 50 : index\n  %r = view.load %tv[%j] : view<64xf32> -> f32\n  }\n"),),
+        "P5b an offset name constant 0 in one arm and 128 in the other (extents bind names in walk order)": (bk(
+            "  %u = index.cmp ult, %n, %c32 : index\n"
+            "  scf.if %u {\n  %off = index.constant 0 : index\n  %lo = buffer.view %t[%off] : buffer -> view<32xf32>\n"
+            "  view.store %v, %lo[%c0] : f32, view<32xf32>\n  } else {\n  %off = index.constant 128 : index\n  }\n" + bar +
+            "  %hi = buffer.view %t[%c0] : buffer -> view<32xf32>\n  %r = view.load %hi[%c0] : view<32xf32> -> f32\n"),),
+        "F3 a callee writing the region and returning a view": (bk(st + bar + rd +
+            "  %w2 = func.call @fill(%tv, %v) : (view<64xf32>, f32) -> view<64xf32>\n"),),
+    }
+    fill = {"fill": "func.def @fill(%w: view<64xf32>, %val: f32) -> view<64xf32> {\n  %c3 = index.constant 3 : index\n"
+                    "  view.store %val, %w[%c3] : f32, view<64xf32>\n  func.return %w : view<64xf32>\n}\n"}
+    for k, (t,) in P.items():
+        b = kl.barrier_check(t, fill)
+        ok(b["status"] == "analysed" and wanted(b) == ["orders"], f"barrier: {k}: orders ({b['status']}, {wanted(b)})")
+    NA = {
+        "P7 kernel.async.copy into the region (data lands at the wait, not at issue)": bk(
+            "  %tok = kernel.async.copy %xv[%tid], %tv[%tid] : view<64xf32>, view<64xf32> -> kernel.async.token\n" + bar +
+            "  kernel.async.wait %tok : kernel.async.token\n" + bar + nb),
+        "buffer.alloca.init<workgroup> (a collective initialisation)": bk(st + bar + nb,
+            alloc="  %t = buffer.alloca.init<workgroup> align(16) dense<0> : buffer\n  %tv = buffer.view %t[%c0] : buffer -> view<64xf32>\n"),
+        "an alloca in a memory space the check does not know": bk(st + bar + nb,
+            alloc="  %t = buffer.alloca<generic> align(16) %bytes : buffer\n  %tv = buffer.view %t[%c0] : buffer -> view<64xf32>\n"),
+        "a barrier form other than <workgroup> scope(workgroup)": bk(st + "  kernel.barrier.arrive<workgroup> scope(workgroup)\n" + bar + nb),
+        "a workgroup view through an scf.for": bk(st + bar + "  scf.for %i = [%c0 to %n step %c1](%w = %tv : view<64xf32>) {\n" + nb + "  }\n"),
+        "a yielded workgroup view": bk(st + bar + "  %u = index.cmp ult, %n, %c32 : index\n  %w = scf.if %u -> (view<64xf32>) {\n"
+                                      "  scf.yield %tv : view<64xf32>\n  } else {\n  scf.yield %tv : view<64xf32>\n  }\n" + nb),
+        "a callee that synchronises": bk(st + bar + "  func.call @sync() : () -> ()\n" + nb),
+        "a callee calling one that synchronises": bk(st + bar + "  func.call @outer() : () -> ()\n" + nb),
+        "a conditional kernel.exit (later barriers not reached by all)": bk(st + "  %u = index.cmp ult, %n, %c32 : index\n  kernel.exit %u\n" + bar + nb),
+    }
+    cal = {"sync": "func.def @sync() {\n" + bar + "  func.return\n}\n",
+           "outer": "func.def @outer() {\n  func.call @sync() : () -> ()\n  func.return\n}\n"}
+    for k, t in NA.items():
+        b = kl.barrier_check(t, cal)
+        ok(b["status"].startswith("not analysed"), f"barrier: {k} is 'not analysed' ({b['status']})")
+    DV = {
+        "P8 a barrier under a fragment-derived condition": st + "  %c16 = index.constant 16 : index\n"
+            "  %gv = buffer.view %x[%c0] : buffer -> view<16x16xf16>\n"
+            "  %f = vector.fragment.load<lhs> %gv[%c0, %c0] shape [%c16, %c16] : view<16x16xf16> -> vector<16xf16>\n"
+            "  %e = vector.extract %f[%c0] : vector<16xf16> -> f16\n  %z = scalar.constant 0.0 : f16\n  %p = scalar.cmpf ogt, %e, %z : f16\n"
+            "  scf.if %p {\n" + bar + "  }\n" + nb,
+        "P8b a barrier under a volatile-load flag (other workgroups write it)": st +
+            "  %fl = view.load<volatile> %xv[%c0] : view<64xf32> -> f32\n  %z = scalar.constant 0.0 : f32\n  %p = scalar.cmpf ogt, %fl, %z : f32\n"
+            "  scf.if %p {\n" + bar + "  }\n" + nb,
+        "a condition from a callee that reads the invocation id": st + "  %w = func.call @lane() : () -> index\n"
+            "  %lt = index.cmp ult, %w, %c32 : index\n  scf.if %lt {\n" + bar + "  }\n" + nb,
+        "a loop result counting a lane-dependent trip count": st + "  %cnt = scf.for %i = [%c0 to %tid step %c1](%a = %c0 : index) -> (index) {\n"
+            "  %a2 = index.add %a, %c1 : index\n  scf.yield %a2 : index\n  }\n  %lt = index.cmp ult, %cnt, %c32 : index\n"
+            "  scf.if %lt {\n" + bar + "  }\n" + nb,
+    }
+    lane = {"lane": "func.def @lane() -> index {\n  %l = kernel.workitem.id x : index\n  func.return %l : index\n}\n"}
+    for k, t in DV.items():
+        b = kl.barrier_check(bk(t), lane)
+        ok(b["status"].startswith("divergent"), f"barrier: {k} is divergent ({b['status']})")
+    b = kl.barrier_check(bk(st + "  scf.for %i = [%c0 to %n step %c1] {\n" + bar + "  }\n" + bar + nb))
+    ok(wanted(b) == ["orders nothing", "orders"], f"barrier: a barrier after a loop holding a barrier still orders the store before the loop "
+       f"(the loop may run zero times) ({wanted(b)})")
+    row = {"kernel": "g_b", "s_barrier": 3}
+    kl.barriers([row], {"g_b": bk(st + "  %s = kernel.workgroup.reduce<maxnumf> %v : f32\n" + bar + nb)}, {})
+    ok(row["barrier"]["status"] == "analysed", f"barrier: a workgroup reduce is two s_barriers in the binary (GEMM: 3 + 2) "
+       f"({row['barrier']['status']})")
+    row = {"kernel": "g_b", "s_barrier": 2}
+    kl.barriers([row], {"g_b": NA["P7 kernel.async.copy into the region (data lands at the wait, not at issue)"]}, {})
+    ok(any("not analysed" in x for x in kl.barrier_report(row)), "barrier: a kernel the check cannot model is printed without "
+       "--barriers (fail closed, never silent)")
+    arms = "  %lt = index.cmp ult, %tid, %c32 : index\n  scf.if %lt {\n" + st + "  } else {\n" + nb + "  }\n" + bar
+    b = kl.barrier_check(bk(arms), races=True)
+    ok(len(b["races"]) == 1, f"barrier: the two arms of a lane-dependent if run at once: a store in one races a read in the other "
+       f"({b['races']})")
+    b = kl.barrier_check(bk(st + bar + nb + "  view.store %v, %tv[%c1] : f32, view<64xf32>\n"))
+    ok(b["races"] == [], f"barrier: races are computed only when asked (--barriers): super-linear, detail only (review N2: "
+       f"187 s / 2 GB at 4,000 accesses) ({b['races']})")
     import json, tempfile as tf
     with tf.TemporaryDirectory() as t:
         js = os.path.join(t, "k.json")
