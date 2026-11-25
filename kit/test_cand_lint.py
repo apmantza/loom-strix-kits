@@ -15,6 +15,8 @@ binary_gate-shaped rows. Recurrences it prevents:
   - verify r2 V2: an already-exposed load decaying further with the exposed count unchanged ([3, 4] -> [0, 4]);
   - verify r2 V6: the cover walk not following a load across the back-edge, or stopping before a deep pipeline's wait;
   - verify r2 V13: a NEW kernel with scratch passing;
+  - pairs taking pins (coordinator r3): the residue's sets pass and every other set fails on the unmatched pin, so pairs names the
+    singles; pairs refuses --accept / LINT_ACCEPT and clears LINT_ACCEPT for its builds;
   - binary_gate's own failures not judged with --allow (R6); pairs taking a failed build or a missing verdict as built (R8, F8);
   - the pairwise mode naming a pair whose failure a single switch already explains, or missing the pair: the first failing set is
     the smallest one none of whose subsets fails.
@@ -178,6 +180,36 @@ def main():
     r = subprocess.run([sys.executable, os.path.join(HERE, "..", "common", "cand_lint.py"), "check", "/nonexistent/a", "/nonexistent/b",
                         "--out", os.devnull, "--accept", "."], capture_output=True, text=True)
     ok(r.returncode == 2 and "malformed pin" in r.stderr, f"V1: the CLI refuses a malformed pin before the gate runs, exit 2 ({r.returncode})")
+    # coordinator r3: pairs is a diagnostic; a pin there passes the residue's sets and fails every other (the singles were named)
+    with tempfile.TemporaryDirectory() as t:
+        envf = os.path.join(t, "env")
+        with open(envf, "w") as fh:
+            fh.write(f"WORK={t}/work\nSTATE={t}/state\nLOOM_KB_ROOT={t}\n")
+        cli = [sys.executable, os.path.join(HERE, "..", "common", "cand_lint.py"), "pairs", "nokit", "base", "zz", "A=1", "B=1"]
+        env = {k: v for k, v in os.environ.items() if k not in ("LINT_ACCEPT", "WORK", "STATE", "KIT_SRC")}
+        env.update(LSK_ENV=envf, HOME=t)
+        for how, extra, e in (("--accept", ["--accept", "k:exposed:1->3"], env), ("LINT_ACCEPT", [], dict(env, LINT_ACCEPT="k:exposed:1->3"))):
+            r = subprocess.run(cli + extra, capture_output=True, text=True, env=e)
+            ok(r.returncode == 2 and "pins judge one candidate" in r.stderr, f"pairs refuses pins given by {how}, exit 2 ({r.returncode})")
+    seen = []
+    old_env = os.environ.get("LINT_ACCEPT")
+    os.environ["LINT_ACCEPT"] = "k:exposed:1->3"
+    try:
+        with tempfile.TemporaryDirectory() as w, open(os.devnull, "w") as quiet:
+            def spy(kit, pkg, env):
+                seen.append(env.get("LINT_ACCEPT"))
+                return 1, "", ""
+            old, sys.stdout = sys.stdout, quiet
+            try:
+                cl.pairs("kit", "base", "p", ["A=1", "B=1"], build=spy, work=w)
+            finally:
+                sys.stdout = old
+    finally:
+        if old_env is None:
+            del os.environ["LINT_ACCEPT"]
+        else:
+            os.environ["LINT_ACCEPT"] = old_env
+    ok(seen and all(x == "" for x in seen), f"pairs' builds run with LINT_ACCEPT cleared, not an inherited one ({seen})")
     ok(cl.parse_pins(["a:exposed:1->3,b:pf:kept->drain"]) == {"a": {("exposed", "1", "3")}, "b": {("pf", "kept", "drain")}},
        "pins are comma-separated")
     lines, f = cl.judge([gate_row("t", "text-only")], {}, {})

@@ -31,10 +31,11 @@ check BASE_PKG CAND_PKG --out DIR: common/binary_gate.py between the packages (i
 pairs KIT BASE_PKG PREFIX SWITCH=V ...: build every single switch, every pair and (for three or more) the whole set on top of the
   kit's recipe with common/build.sh (packages WORK/PREFIX-<ids>, about 16 s and 0.9 GB each), each checked as above against
   BASE_PKG, and name the smallest switch sets that fail while none of their subsets do (where the collapse first appears).
-  Exit 1 when any set fails, 0 when none does, 2 when a build fails or leaves no readable verdict.
+  Exit 1 when any set fails, 0 when none does, 2 when a build fails or leaves no readable verdict, or when given pins (--accept
+  or LINT_ACCEPT): pins judge one candidate; pairs reports every loss.
 
 usage: cand_lint.py check BASE_PKG CAND_PKG --out DIR [--allow REGEX ...] [--allow-missing REGEX ...] [--accept PINS ...] [--jobs N]
-       cand_lint.py pairs KIT BASE_PKG PREFIX SWITCH=V SWITCH=V ... [--allow REGEX ...] [--accept PINS ...] [--jobs N]"""
+       cand_lint.py pairs KIT BASE_PKG PREFIX SWITCH=V SWITCH=V ... [--allow REGEX ...] [--jobs N]   (no --accept: exit 2)"""
 import argparse
 import itertools
 import json
@@ -292,14 +293,19 @@ def run_build(kit, pkg, env):
     return r.returncode, r.stdout, r.stderr
 
 
-def pairs(kit, base, prefix, sw, allow=(), jobs=2, pins=(), build=run_build, work=None):
+PAIRS_NO_PINS = "pins judge one candidate; pairs reports every loss"
+
+
+def pairs(kit, base, prefix, sw, allow=(), jobs=2, build=run_build, work=None):
     """build and check every switch set; returns the exit code: 0 no set fails, 1 a set fails, 2 a build failed or left no verdict
-    (BUILD: the builder, a test double in the tests; WORK: where build.sh puts the packages)"""
+    (BUILD: the builder, a test double in the tests; WORK: where build.sh puts the packages). Takes no pins: a pin judges one
+    candidate, and pairs is the diagnostic that names interacting switches with every loss (E521's residue named as STAGE_LIVE x
+    FLATADDR, exposed 1->3, is its right output); the builds run with LINT_ACCEPT cleared."""
     names = {s: f"s{i + 1}" for i, s in enumerate(sw)}
     results, report = {}, []
     for s in switch_sets(sw):
         pkg = prefix + "-" + "".join(names[x] for x in s)
-        env = dict(os.environ, EXTRA=" ".join(s), LINT_BASE=base, LINT_ALLOW=" ".join(allow), LINT_ACCEPT=",".join(pins),
+        env = dict(os.environ, EXTRA=" ".join(s), LINT_BASE=base, LINT_ALLOW=" ".join(allow), LINT_ACCEPT="",
                    LINT_JOBS=str(jobs))
         rc, out, err = build(kit, pkg, env)
         print(out.strip())
@@ -350,8 +356,9 @@ def main():
     p.add_argument("switches", nargs="+")
     for x in (c, p):
         x.add_argument("--allow", action="append", default=[])
-        x.add_argument("--accept", action="append", default=[], help="KERNEL:KIND:FROM->TO[,...]: a loss a ledger row accepted "
-                       "(cite it); a kernel passes only when its pins equal its losses, and every pin must match")
+        x.add_argument("--accept", action="append", default=[], help="check: KERNEL:KIND:FROM->TO[,...]: a loss a ledger row "
+                       "accepted (cite it); a kernel passes only when its pins equal its losses, and every pin must match. pairs: "
+                       "refused with exit 2 (" + PAIRS_NO_PINS + ")")
         x.add_argument("--jobs", type=int, default=2)
     c.add_argument("--allow-missing", action="append", default=[])
     a = ap.parse_args()
@@ -369,7 +376,10 @@ def main():
         bad = [s for s in a.switches if not re.match(r"[A-Za-z_]\w*=\S*$", s)]
         if bad or len(a.switches) < 2:
             ap.error(f"pairs: two or more SWITCH=V (got {a.switches})")
-        sys.exit(pairs(a.kit, a.base, a.prefix, a.switches, a.allow, a.jobs, a.accept))
+        if a.accept or os.environ.get("LINT_ACCEPT"):
+            print(f"cand_lint pairs: --accept / LINT_ACCEPT refused: {PAIRS_NO_PINS}", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(pairs(a.kit, a.base, a.prefix, a.switches, a.allow, a.jobs))
     lines, fails = check(a.base, a.cand, a.out, a.allow, a.allow_missing, a.jobs, pins=pins)
     print("\n".join(lines))
     for x in fails:
