@@ -49,8 +49,6 @@ if os.environ.get("FLASH2_B2_FM") == "1" and (D, G) == (256, 6):
 WG3 = B_MODE == "2" and B2_OPTS.get("wg") == 3 and (D, G) == (256, 6)
 B_HEADS = 3 if os.environ.get("FLASH2_B") == "3" and (D, G) == (256, 6) else 2   # query heads per wave of the key-split loop (3: two head triples per KV head)
 HALF = D // 4 if B_MODE == "2" else 128   # dims per wave (key-split loop: four waves share a head pair, each owns a quarter of the dims)
-if D == 256 and B_MODE != "2" and os.environ.get("FLASH2_HALF256"):   # experiment (L18, E55): 64 dims per wave = 4 waves per head (24 per workgroup),
-    HALF = int(os.environ["FLASH2_HALF256"])                          # half the Q^T / O^T registers (room for FLASH2_PF11); needs 16-key tiles
 NFH = HALF // 16                  # 16-dim fragments per wave (8)
 WPH = D // HALF                   # waves per query head (2, or 4 at head_dim 512)
 KT = 32 if D == 256 and B_MODE != "2" else 16   # keys per tile (head_dim 512: K and V^T of 32 keys exceed 64 KiB; the key-split loop reads K/V from the arena)
@@ -67,9 +65,6 @@ NG = (1 if WG3 else G // B_HEADS) if B_MODE == "2" else next(n for n in (1, 2, 4
 if D == 512 and os.environ.get("FLASH2_NG512"):   # experiment: query-head groups per KV head at head_dim 512 (more groups: fewer waves per workgroup, cheaper barriers)
     NG = int(os.environ["FLASH2_NG512"])
     assert G % NG == 0
-if D == 256 and B_MODE != "2" and os.environ.get("FLASH2_NG256"):   # experiment (L18, E55): query-head groups at head_dim 256: smaller workgroups,
-    NG = int(os.environ["FLASH2_NG256"])                            # several per WGP, so one's K/V load wait overlaps another's math (E52: latency-bound)
-    assert G % NG == 0
 GW = G // NG                      # query heads per workgroup
 WAVES = WPH * GW
 # FLASH2_HEADPACK=1 (vsplit only: FLASH2_ROLE=partial FLASH2_SPLITK=1; HRX-like DESIGN-vsplit-headpack.md): a wave's 16 WMMA columns
@@ -83,13 +78,11 @@ if HEADPACK:
                        (B_MODE != "0", "B_MODE 0 only (FLASH2_B)"),
                        ((D, G) != (256, 6), f"head_dim 256 with 6 query heads per KV head only (have {D}, {G})"),
                        ((WPH, KT, KB, NG, GW) != (2, 32, 2, 1, 6), f"2 waves x 128 dims per head, 32-key tiles, one head group (have WPH {WPH}, KT {KT}, NG {NG})"),
-                       (any(os.environ.get(k) for k in ("FLASH2_HALF256", "FLASH2_KT256", "FLASH2_NG256")), "no FLASH2_HALF256 / KT256 / NG256"),
+                       (bool(os.environ.get("FLASH2_KT256")), "no FLASH2_KT256"),
                        (bool(_c.get("sliding_window")), "no sliding window (the window edge's cut invariance is not argued for packing)"),
                        (os.environ.get("FLASH2_SPLITK_SELF", "1") != "1" or os.environ.get("FLASH2_SPLITK_ANY", "0") != "1",
                         "needs FLASH2_SPLITK_ANY=1 (self-listing, off = 0: its leader grid is what limits a tile to 8 tokens)"),
-                       (os.environ.get("FLASH2_EDGE_ZERO", "0") == "1", "no FLASH2_EDGE_ZERO"),
-                       (os.environ.get("FLASH2_VS_PF", "0") == "1", "no FLASH2_VS_PF (its prefetch assumes the 32-dim staging)"),
-                       (os.environ.get("FLASH2_VS_KV8LATE", "0") == "1", "no FLASH2_VS_KV8LATE (kv8_late assumes the 32-dim staging)")):
+                       (os.environ.get("FLASH2_EDGE_ZERO", "0") == "1", "no FLASH2_EDGE_ZERO")):
         if _bad:
             sys.exit(f"FLASH2_HEADPACK: {_why}")
     WAVES = WPH * GW // 2
@@ -750,8 +743,8 @@ R4 =os.environ.get("FLASH2_ARCH") == "rdna4"   # the gfx12 twin (flash2_rdna4.py
 # FLASH2_PF11=1 (gfx11 kernel, experiment, L18): the next K/V tile's loads behind the first barrier (flash2_prefetch.py, the gfx12
 # twin's FLASH2_PF pass on the gfx11 text). E52: the kernel is bound by exposed K/V load latency (no-load ablation 0.57x). Needs the
 # register room of FLASH2_KT256=16 (198 vs 241 VGPRs, E53). Not in the split-K kernel (its loop runs a key split, no prologue tile 0).
-# The split-K kernel (L17 vsplit) had neither pass (its loop runs a key split [sk_lo, sk_hi), no prologue tile 0): opt-in
-# FLASH2_VS_KVH=1 (kvhoist) and FLASH2_VS_PF=1 (prefetch_split with the split's bounds; needs FLASH2_PF11_SPLIT's helpers).
+# The split-K kernel (L17 vsplit) has no prefetch (its loop runs a key split [sk_lo, sk_hi), no prologue tile 0): opt-in
+# FLASH2_VS_KVH=1 (kvhoist).
 if not R4 and os.environ.get("FLASH2_SXH", "0") == "1" and os.environ.get("FLASH2_SX11", "0") != "1":   # gfx11 only, like SX11
     raise SystemExit("FLASH2_SXH: rewrites FLASH2_SX11's exchange; set FLASH2_SX11=1")
 if SPLITK and not R4 and B_MODE != "2":
@@ -761,9 +754,6 @@ if SPLITK and not R4 and B_MODE != "2":
     if os.environ.get("FLASH2_VS_KVH", "0") == "1":
         from flash2_trim import kvhoist
         text = kvhoist(text)
-    if os.environ.get("FLASH2_VS_PF", "0") == "1":
-        from flash2_prefetch import prefetch_split
-        text = prefetch_split(text)
     if os.environ.get("FLASH2_SX11", "0") == "1":   # vsplit: the same S-partial exchange as lane vectors (flash2_trim.sx11; no peel: 2 + 2)
         from flash2_trim import sx11
         text = sx11(text)
@@ -776,14 +766,14 @@ if SPLITK and not R4 and B_MODE != "2":
 if SPLITK and os.environ.get("FLASH2_VSPLIT_PH", "0") == "1" and (R4 or B_MODE == "2"):
     raise SystemExit("FLASH2_VSPLIT_PH: the gfx11 split-K kernel without FLASH2_B=2 only")
 if not R4 and os.environ.get("FLASH2_PF11", "0") == "1" and B_MODE != "2" and not SPLITK:
-    from flash2_prefetch import prefetch, prefetch_uncond, prefetch_split
+    from flash2_prefetch import prefetch_uncond, prefetch_split
     if os.environ.get("FLASH2_KVH11", "0") == "1":   # the row's page-map pointer loaded once before the loop (flash2_trim.kvhoist): one dependent load fewer per tile
         from flash2_trim import kvhoist
         text = kvhoist(text)
     if os.environ.get("FLASH2_PF11_SPLIT", "0") == "1":   # K and V loaded at different times (E55)
         text = prefetch_split(text)
     else:
-        text = prefetch_uncond(text) if os.environ.get("FLASH2_PF11_COND", "0") != "1" else prefetch(text)   # COND=1: the gfx12 pass as is (E54: no overlap)
+        text = prefetch_uncond(text)
 if R4:
     from flash2_rdna4 import to_rdna4, twin_names
     text = to_rdna4(text)
@@ -822,11 +812,6 @@ if os.environ.get("FLASH2_PEEL", "1") == "1" and not EDGE_ZERO and B_MODE != "2"
     if R4 and os.environ.get("FLASH2_HOT", os.environ.get("FLASH2_TRIM", "0")) == "1":   # gfx12 twin: the hot copy skips the validity / mask selects (flash2_trim.py)
         from flash2_trim import hot as _trim_hot
         _hot = lambda ls: _trim_hot(ls, D == 512)
-    _h11 = os.environ.get("FLASH2_HOT11", "0")
-    if not R4 and not PARTIAL and _h11 not in ("", "0"):   # gfx11 g_attention_flash2 only (the kernel q123 measured exact; not the split-K partial): the hot copy without the key-validity compare (kv) and the masks (kvmask; flash2_trim.hot11)
-        assert _h11 in ("kv", "kvmask"), f"FLASH2_HOT11={_h11}: kv or kvmask"
-        from flash2_trim import hot11 as _trim_hot11
-        _hot = lambda ls: _trim_hot11(ls, _h11 == "kvmask")
     text = peel_last_tile(text, _hot)
     if not R4 and not PARTIAL and os.environ.get("FLASH2_SX11", "0") == "1":   # gfx11 g_attention_flash2: S partials exchanged as lane vectors (flash2_trim.sx11)
         from flash2_trim import sx11

@@ -1,4 +1,4 @@
-"""Instruction trims of flash2s (gen_flash2s.py; knobs FLASH2_SX / FLASH2_HOT for the gfx12 twin, FLASH2_HOT11 for the gfx11 kernel).
+"""Instruction trims of flash2s (gen_flash2s.py; knobs FLASH2_SX / FLASH2_HOT for the gfx12 twin).
 
 The d512 tile loop issues ~650 instructions per wave and tile for 16 WMMAs, and WMMA does not overlap with VALU on RDNA4, so the
 kernel is issue bound (3200 cycles per tile and workgroup measured, 4 waves per SIMD).
@@ -105,30 +105,6 @@ def hot(lines, global_only):
             ln = re.sub(r"^(\s*%masked\d+) = vector\.select %valid\d+, (%sc\d+), %neg_v : vector<8xf32>$", r"\1 = vector.addf \2, %zero8 : vector<8xf32>", ln)
             ln = re.sub(r"^(\s*%p\d+) = vector\.select %valid\d+, (%pe\d+), %zero8 : vector<8xf32>$", r"\1 = vector.addf \2, %zero8 : vector<8xf32>", ln)
         out.append(ln)
-    return out
-
-
-
-def hot11(lines, masks):
-    """FLASH2_HOT11 (gfx11 kernel, HRX-like E308 / E310): the hot copy's lines (every key tile but the last) without the key-validity
-    compare (all keys of a non-last tile are written positions: exact for any layer) and, with MASKS, without the causal / window
-    masks (exact only when no layer slides: a non-last tile then lies fully below the query tile's first position; gen_llm refuses
-    MASKS for a model with sliding layers). Fails closed when the expected lines are not there exactly once / twice, so a generator
-    change cannot silently turn the trim into a no-op or a partial edit. Measured (q123, 81,920 keys, 8192-token chunk): masks + key
-    validity 0.949 / 0.955 of the served kernel, exact."""
-    out, nk, nv = [], 0, 0
-    for ln in lines:
-        new = re.sub(r"^(\s*%key_valid) = index\.cmp ule, %key_pos, %pos_last : index$", r"\1 = index.cmp ule, %c0, %c0 : index", ln)
-        nk += new != ln
-        if masks:
-            n2 = re.sub(r"^(\s*%valid\d+) = vector\.andi %causal\d+, %winok\d+ : vector<8xi1>$",
-                        r"\1 = vector.cmpi sle, %qp_v, %qp_v : vector<8xi32> -> vector<8xi1>", new)
-            nv += n2 != new
-            new = n2
-        out.append(new)
-    assert nk == 1, (f"FLASH2_HOT11: {nk} key-validity compares in the hot copy (want 1); key_valid lines found: "
-                     f"{[l.strip()[:90] for l in lines if '%key_valid' in l and '=' in l][:4]}")
-    assert not masks or nv == 2, f"FLASH2_HOT11=kvmask: {nv} causal / window masks in the hot copy (want 2)"
     return out
 
 

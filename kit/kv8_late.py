@@ -24,10 +24,8 @@ import re
 import sys
 
 # kernel -> (loop result suffix of the carried K/O, the variants of the V staging / K select: "" = the loop body, "_pt" = the
-# peeled last tile). g_attention_vsplit (decode/verify split-K, FLASH2_VS_PF's prefetch loop, no peel) only with
-# FLASH2_VS_KV8LATE=1 (HRX-like E158: under KV8 its prefetch lost K to the in-iteration dequant and V to the early wait)
+# peeled last tile)
 KERNELS = {"g_attention_flash2": ("_hot", ("", "_pt")), "g_attention_flash2_partial": ("_hot", ("", "_pt"))}
-VS_KERNEL = ("g_attention_vsplit", ("", ("",)))
 
 
 def _one(lines, pred, what, name):
@@ -110,15 +108,9 @@ def apply(text):
     if not (kc or vl):
         return text
     done = []
-    kernels = dict(KERNELS)
-    vs = os.environ.get("FLASH2_VS_KV8LATE", "0") == "1"
-    if vs:
-        kernels[VS_KERNEL[0]] = VS_KERNEL[1]
-    for name, (res, variants) in kernels.items():
+    for name, (res, variants) in KERNELS.items():
         m = re.search(r'^kernel\.def (?:target\(@rdna3\) )?export\("' + name + r'"\).*?\n\} launch\(.*?\n\}\n', text, re.S | re.M)
         if not m:
-            if name == VS_KERNEL[0]:
-                sys.exit("kv8_late: FLASH2_VS_KV8LATE=1 but no g_attention_vsplit kernel")
             continue
         L = m.group(0).split("\n")
         if vl:

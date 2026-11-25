@@ -179,8 +179,6 @@ THETA = CFG["rope_theta"]
 RD_SWA, THETA_SWA = CFG.get("rope_dims_swa") or RD, CFG.get("rope_theta_swa") or THETA
 # cfg rope_scaling_swa "none": the global layers' YaRN does not apply to the sliding ones (mellum), which then take
 # g_qk_rope_store_swa even at the same base and dims.
-if os.environ.get("FLASH2_HOT11") == "kvmask" and CFG.get("sliding_layers"):   # the hot copy's causal / window masks are droppable only when no layer slides
-    sys.exit(f"FLASH2_HOT11=kvmask: this model has sliding layers {CFG.get('sliding_layers')[:4]}...: use FLASH2_HOT11=kv")
 SWA_ROPE = bool(CFG.get("sliding_layers")) and (CFG.get("head_dim_swa") or D) == D and (
     (RD_SWA, THETA_SWA) != (RD, THETA) or bool(CFG.get("rope_scaling")) and CFG.get("rope_scaling_swa") == "none")
 assert not SWA_ROPE or (RD_SWA % 64 == 0 and RD_SWA <= D), "rope_dims_swa must be a multiple of 64"
