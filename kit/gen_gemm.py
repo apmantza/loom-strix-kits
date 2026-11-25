@@ -51,10 +51,6 @@ if PF16:
 # (gen_llm's default): its kernel-wide scf.if plus the prefetch's own scf.if made these drain (vmcnt(0) + 32 moves before the
 # WMMAs). Without the padding skip the if-form is the better one for q6_k (436 vs 475 loop instructions), and the clamp lengthens
 # the q4_k / q5_k / q8_0 kernels' back-edge copies (runs of 24-56 moves): measured per format with common/kernel_lint.py --baseline.
-# GEMM256_LDS_PF=1 (HRX-like E280): in the 256-row GEMMs, keep one weight fragment in flight from LDS: column c + 1's fragment is
-# loaded before column c's WMMAs, the order pinned by scf.schedule.fence (unset: unchanged program; the compiler otherwise sinks
-# each load to just before its WMMAs and waits lgkmcnt(0) on it, E254 / E256 'ldsser').
-LDS_PF = os.environ.get("GEMM256_LDS_PF", "0") not in ("", "0", "false", "no", "off")
 X_CLAMP = ("q6_k", "iq4_xs", "iq4_nl")
 NOTE = ("    // The next tile's activations at a clamped step, not under scf.if (HRX-like E242; X_CLAMP formats): with the load inside an if whose else\n    // yields the carried value, Loom 0.2.0 waits on it at the join (vmcnt(0)) and shifts it with 32 moves before the WMMAs in\n    // the high-pressure kernels (q6_k, iq4_xs m256). The last step reloads an in-bounds tile it never uses: outputs are unchanged.\n")
 
@@ -1038,21 +1034,10 @@ def gemm_big256(fmt, mode):
                 a = f"{wi}r{r}c{c}"
                 L.append(f"    %m{a}_{kk} = vector.mma %l{r}_{kk}, %rf{wi}{c}_{kk}, {cur[a]} : vector<16xf16>, vector<16xf16>, vector<8xf32>")
                 cur[a] = f"%m{a}_{kk}"
-        if LDS_PF:   # GEMM256_LDS_PF: the next column's weight fragment is issued before this column's WMMAs, fenced (HRX-like E280)
-            L.append(rhs(units[0]))
-            if len(units) > 1:
-                L.append(rhs(units[1]))
-            L.append("    scf.schedule.fence")
-            for i, u in enumerate(units):
-                mmas(u)
-                if i + 2 < len(units):
-                    L.append(rhs(units[i + 2]))
-                L.append("    scf.schedule.fence")
-        else:
-            for u in units:
-                L.append(rhs(u))
-            for u in units:
-                mmas(u)
+        for u in units:
+            L.append(rhs(u))
+        for u in units:
+            mmas(u)
     L.append("    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)")
     L.append("    scf.yield " + ", ".join(cur[a] for a in accs) + ", " + ", ".join(c[2] for c in carried) + " : " + ", ".join("vector<8xf32>" for _ in accs) + ", " + ", ".join(c[3] for c in carried) + "\n  }")
     L.append(f'''  %inv_view = buffer.view %x_stage[%origin] : buffer -> view<256x16xf32>

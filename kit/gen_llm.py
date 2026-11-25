@@ -107,7 +107,7 @@ if KV8:
 if KV8:   # the flash kernels (gen_flash2.py / gen_flash2s.py subprocesses) address KV slots with FLASH2_POS_BYTES
     os.environ["FLASH2_POS_BYTES"] = str(POS_BYTES)
 # Split V zero (HRX-like E441 / E444): the split decode / fallback attention bodies (attention_text's paged branch,
-# gqa_split, multi_token_split, gqa_span) select only the SCORE of a key outside the token's range [lo, hi); its V was
+# gqa_split, multi_token_split) select only the SCORE of a key outside the token's range [lo, hi); its V was
 # still loaded and multiplied by p = +0, so NaN / Inf bytes in the unwritten slots of a ragged last page reached the
 # output (0 x NaN = NaN). The guard keeps such a V finite:
 #   KV8 (always on with KV8; the switch census 11-25 folded KV8_SPLIT_VZERO=1 into it): the key's V scale is selected
@@ -2590,7 +2590,6 @@ class _SplitVZero:
         "v": ("%ok{i}", "%ok{i} = scalar.andi %okl{i}, %okh{i} : i1"),      # attention_text paged branch
         "vh": ("%ok{i}", "%ok{i} = scalar.andi %okl{i}, %okh{i} : i1"),     # gqa_split (load and extf apart: pass 3)
         "mv": ("%mvok{i}", "%mvok{i} = index.cmp ult, %mkey{i}, "),         # multi_token_split (union bound)
-        "sp_vh": ("%sp_vok{i}", "%sp_vok{i} = index.cmp ult, %sp_key{i}, "),  # gqa_span (union bound)
     }
     CLAMPED = "%key{i}_c = scf.select %ok{i}, %key{i}_raw, %j : index"   # attention_text non-paged: V of key j, written
 
@@ -2610,7 +2609,7 @@ class _SplitVZero:
         return (nm.group(1) if nm else "?"), blk, s[self.starts[k]:pos]
 
     def guard(self, m, name):
-        """The guard bit for the V load `name` (e.g. v3, vh3, sp_vh3) matched by m, or None (clamped kernel)."""
+        """The guard bit for the V load `name` (e.g. v3, vh3) matched by m, or None (clamped kernel)."""
         pi = re.fullmatch(r"(\D*?)(\d+)", name)
         kn, blk, before = self.kernel(m.string, m.start())
         if pi and pi.group(1) in self.GUARD:
@@ -3003,163 +3002,6 @@ L17_FROM = min(int(os.environ.get("ATTN_L17_FROM", "2048")), attn_rules.ATTN_GQA
 # the WMMA split-K kernel's launch in the decode branch (its %tiles slot is unused when self-listing: %info fills it)
 VSPLIT_LAUNCH = """
     kernel.launch @g_attention_vsplit[%t](%t, %layer_{i}, %sliding_{i}, %context, %pool, %q, %pml, %info, %info, %origins, %arena, %pacc) : [index](index, index, i32, index, index, buffer, buffer, buffer, buffer, buffer, buffer, buffer)"""
-L17_T = int(os.environ.get("ATTN_L17", "0") or 0)   # L17 span-shared verify attention: tokens per aligned span group (8 = depth 7 + 1); 0 = off
-
-
-def gqa_span(U, S, scale):
-    """L17 (DESIGN-L17-span-verify-attention.md): the K/V-once body for an aligned group of L17_T epoch tokens that is one
-    row at consecutive positions (a verify span). The group's first token's workgroups do the whole group and the others
-    exit. Wave w runs query head kv * G + w for every token of the group over split j = the workgroup's z, loading each key's
-    K and V once per wave (the six waves of a workgroup read the same lines: one DRAM read per KV head). Every token keeps
-    its own split range, 16-key-aligned U-key blocks, masks and operation order of gqa_split, and its state changes only on
-    the blocks of its own loop range [lo_al, hi) (a select passes the old state elsewhere): each token's partials are
-    bit-identical to gqa_split's, so drafted == undrafted and the combine kernel is unchanged.
-    Returns (detect, body): detect defines %sp_ok (the group is a span) and %sp_lead (this token leads it)."""
-    T = L17_T
-    # the span body drops the per-token range select (see the loop below): that is exact only while every active split range
-    # holds a real key, i.e. from 4033 visible keys with 64 splits. Fail closed on a lower ATTN_GQA_FROM.
-    assert attn_rules.ATTN_GQA_FROM > 4032 and S == 64, f"ATTN_L17 needs ATTN_GQA_FROM > 4032 and 64 splits (got {attn_rules.ATTN_GQA_FROM}, {S})"
-    d = [f"""    %sp_cT = index.constant {T} : index
-    %sp_cTl = index.constant {T - 1} : index
-    %sp_rem = index.rem %token, %sp_cT : index
-    %sp_g0v = index.sub %token, %sp_rem : index
-    %sp_g0 = index.assume %sp_g0v [range(%sp_g0v, 0, 8191), lt(%sp_g0v, %tokens)] : index
-    %sp_lead = index.cmp eq, %sp_rem, %c0 : index
-    %sp_last = index.add %sp_g0, %sp_cTl : index
-    %sp_fits = index.cmp ult, %sp_last, %tokens : index
-    %sp_tmax = index.sub %tokens, %c1 : index
-    %sp_flat = scalar.xori %is_sliding, %sp_true : i1"""]
-    d.insert(0, "    %sp_true = scalar.constant true : i1")
-    for i in range(T):
-        d.append(f"""    %sp_ci{i} = index.constant {i} : index
-    %sp_tv{i} = index.add %sp_g0, %sp_ci{i} : index
-    %sp_tm{i} = index.min %sp_tv{i}, %sp_tmax : index
-    %sp_t{i} = index.assume %sp_tm{i} [range(%sp_tm{i}, 0, 8191), lt(%sp_tm{i}, %tokens)] : index
-    %sp_row{i} = view.load %info_view[%sp_t{i}, 0] : view<[%tokens]x4xi32> -> i32
-    %sp_pos{i} = view.load %info_view[%sp_t{i}, 1] : view<[%tokens]x4xi32> -> i32
-    %sp_live{i} = view.load %info_view[%sp_t{i}, 2] : view<[%tokens]x4xi32> -> i32""")
-    d.append("    %sp_ok0a = scalar.andi %sp_fits, %sp_flat : i1")
-    d.append("    %sp_lv0 = scalar.cmpi ne, %sp_live0, %c0_i32 : i32\n    %sp_ok0 = scalar.andi %sp_ok0a, %sp_lv0 : i1")
-    for i in range(1, T):
-        d.append(f"""    %sp_ci32_{i} = scalar.constant {i} : i32
-    %sp_want{i} = scalar.addi %sp_pos0, %sp_ci32_{i} : i32
-    %sp_pe{i} = scalar.cmpi eq, %sp_pos{i}, %sp_want{i} : i32
-    %sp_re{i} = scalar.cmpi eq, %sp_row{i}, %sp_row0 : i32
-    %sp_lv{i} = scalar.cmpi ne, %sp_live{i}, %c0_i32 : i32
-    %sp_a{i} = scalar.andi %sp_pe{i}, %sp_re{i} : i1
-    %sp_b{i} = scalar.andi %sp_a{i}, %sp_lv{i} : i1
-    %sp_ok{i} = scalar.andi %sp_ok{i - 1}, %sp_b{i} : i1""")
-    # the group's first token must itself take the K/V-once body (visible >= ATTN_GQA_FROM)
-    d.append(f"""    %sp_p0b = scalar.assume %sp_pos0 [range(%sp_pos0, 0, 262143)] : i32
-    %sp_p0 = index.cast %sp_p0b : i32 to index
-    %sp_v0 = index.add %sp_p0, %c1 : index
-    %sp_big = index.cmp uge, %sp_v0, %cgqa : index
-    %sp_ok = scalar.andi %sp_ok{T - 1}, %sp_big : i1""")
-    # body (leader workgroups only): wave = head
-    b = [f"""    %sp_hv = index.madd %kv_head, %cg, %wave : index
-    %sp_head = index.assume %sp_hv [range(%sp_hv, 0, {QH - 1})] : index
-    %sp_q_view = buffer.view %q[%zero] : buffer -> view<[%tokens]x{QH}x32x4xf32>
-    %sp_scale = scalar.constant {scale} : f32
-    %sp_scale_v = vector.splat %sp_scale : vector<4xf32>
-    %sp_zero4 = vector.splat %zero_f : vector<4xf32>
-    %sp_cU = index.constant {U} : index
-    %sp_huge = index.constant 1073741824 : index"""]
-    for t in range(T):
-        b.append(f"""    %sp_ct{t} = index.constant {t} : index
-    %sp_pt{t} = index.add %sp_p0, %sp_ct{t} : index
-    %sp_vis{t}_v = index.add %sp_pt{t}, %c1 : index
-    %sp_vis{t} = index.assume %sp_vis{t}_v [range(%sp_vis{t}_v, 1, 262144)] : index
-    %sp_se{t} = func.call @g_split_count(%sp_vis{t}) : (index) -> (index)
-    %sp_act{t} = index.cmp ult, %split_id, %sp_se{t} : index
-    %sp_sl{t} = index.sub %sp_se{t}, %c1 : index
-    %sp_pp{t} = index.add %sp_vis{t}, %sp_sl{t} : index
-    %sp_per{t} = index.div %sp_pp{t}, %sp_se{t} : index
-    %sp_sr{t} = index.mul %split_id, %sp_per{t} : index
-    %sp_lo{t} = index.min %sp_sr{t}, %sp_vis{t} : index
-    %sp_hr{t} = index.add %sp_sr{t}, %sp_per{t} : index
-    %sp_hi{t} = index.min %sp_hr{t}, %sp_vis{t} : index
-    %sp_lq{t} = index.div %sp_lo{t}, %sp_cU : index
-    %sp_la{t} = index.mul %sp_lq{t}, %sp_cU : index
-    %sp_lu{t} = scf.select %sp_act{t}, %sp_la{t}, %sp_huge : index
-    %sp_hu{t} = scf.select %sp_act{t}, %sp_hi{t}, %c0 : index
-""")
-    lo, hi = "%sp_lu0", "%sp_hu0"
-    for t in range(1, T):
-        b.append(f"    %sp_lm{t} = index.min {lo}, %sp_lu{t} : index\n    %sp_hm{t} = index.max {hi}, %sp_hu{t} : index")
-        lo, hi = f"%sp_lm{t}", f"%sp_hm{t}"
-    b.append(f"    %sp_from = index.min {lo}, {hi} : index")   # no active token: an empty loop
-    fin = ", ".join(f"%sp_mf{t}, %sp_lf{t}, %sp_af{t}" for t in range(T))
-    args = ", ".join(f"%sp_m{t} = %neg_big : f32, %sp_l{t} = %zero_f : f32, %sp_acc{t} = %sp_zero4 : vector<4xf32>" for t in range(T))
-    types = ", ".join(["f32, f32, vector<4xf32>"] * T)
-    b.append(f"    {fin} = scf.for %sp_j = [%sp_from to {hi} step %sp_cU]({args}) -> ({types}) {{")
-    b.append("      %sp_kb = func.call @g_kv_offset(%origins, %row, %sp_j, %blocks, %k_plane, %pool) : (buffer, index, index, index, index, index) -> (offset)")
-    for i in range(U):
-        b.append(f"""      %sp_key{i} = index.add %sp_j, %c{i}u : index
-      %sp_kd{i} = index.constant {i * POS_BYTES} : offset
-      %sp_ko{i} = index.add %sp_kb, %sp_kd{i} : offset
-      %sp_kc{i} = buffer.view %arena[%sp_ko{i}] : buffer -> view<{KVH}x32x4xf16>
-      %sp_kh{i} = vector.load %sp_kc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>""" + (f"""
-      %sp_vok{i} = index.cmp ult, %sp_key{i}, {hi} : index""" if SPLIT_VZERO else "") + (f"""
-      %sp_vb{i} = scf.select %sp_vok{i}, %sp_ko{i}, %sp_kb : offset""" if SPLIT_VCLAMP else "") + f"""
-      %sp_vo{i} = index.add {"%sp_vb" if SPLIT_VCLAMP else "%sp_ko"}{i}, %plane_stride : offset
-      %sp_vc{i} = buffer.view %arena[%sp_vo{i}] : buffer -> view<{KVH}x32x4xf16>
-      %sp_vh{i} = vector.load %sp_vc{i}[%kv_head, %lane, %c0] : view<{KVH}x32x4xf16> -> vector<4xf16>""")
-    ys = []
-    for t in range(T):
-        # gqa_split's per-head sequence for this token (head = this wave's), names suffixed _t. Register budget (E40: 8 tokens
-        # with q and K/V held in f32 spilled, 6x slower): the token's query is reloaded per block (the same load and scale
-        # multiply, so the same bits) and K/V stay f16 until use (extf is exact).
-        b.append(f"""      %sp_q_raw{t} = vector.load %sp_q_view[%sp_t{t}, %sp_head, %lane, %c0] : view<[%tokens]x{QH}x32x4xf32> -> vector<4xf32>
-      %sp_q{t} = vector.mulf %sp_q_raw{t}, %sp_scale_v : vector<4xf32>""")
-        for i in range(U):
-            b.append(f"""      %sp_k{i}_{t} = vector.extf %sp_kh{i} : vector<4xf16> to vector<4xf32>
-      %sp_v{i}_{t} = vector.extf %sp_vh{i} : vector<4xf16> to vector<4xf32>""")
-        for i in range(U):
-            b.append(f"""      %sp_okl{i}_{t} = index.cmp uge, %sp_key{i}, %sp_lo{t} : index
-      %sp_okh{i}_{t} = index.cmp ult, %sp_key{i}, %sp_hi{t} : index
-      %sp_ok{i}_{t} = scalar.andi %sp_okl{i}_{t}, %sp_okh{i}_{t} : i1
-      %sp_prod{i}_{t} = vector.mulf %sp_q{t}, %sp_k{i}_{t} : vector<4xf32>
-      %sp_part{i}_{t} = vector.reduce<addf> %sp_prod{i}_{t}, %zero_f : vector<4xf32>, f32""")
-        b.append(allreduce([f"%sp_part{i}_{t}" for i in range(U)], f"spar{t}_", [f"%sp_sr{i}_{t}" for i in range(U)]))
-        for i in range(U):
-            b.append(f"      %sp_s{i}_{t} = scf.select %sp_ok{i}_{t}, %sp_sr{i}_{t}, %neg_big : f32")
-        prev = f"%sp_m{t}"
-        for i in range(U):
-            b.append(f"      %sp_mx{i}_{t} = scalar.maxnumf {prev}, %sp_s{i}_{t} : f32"); prev = f"%sp_mx{i}_{t}"
-        b.append(f"""      %sp_msh_{t} = scalar.subf %sp_m{t}, {prev} : f32
-      %sp_alpha_{t} = scalar.expf<afn> %sp_msh_{t} : f32
-      %sp_ls_{t} = scalar.mulf %sp_l{t}, %sp_alpha_{t} : f32
-      %sp_av_{t} = vector.splat %sp_alpha_{t} : vector<4xf32>
-      %sp_as_{t} = vector.mulf %sp_acc{t}, %sp_av_{t} : vector<4xf32>""")
-        pl, pa = f"%sp_ls_{t}", f"%sp_as_{t}"
-        for i in range(U):
-            b.append(f"""      %sp_d{i}_{t} = scalar.subf %sp_s{i}_{t}, {prev} : f32
-      %sp_p{i}_{t} = scalar.expf<afn> %sp_d{i}_{t} : f32
-      %sp_la{i}_{t} = scalar.addf {pl}, %sp_p{i}_{t} : f32
-      %sp_pv{i}_{t} = vector.splat %sp_p{i}_{t} : vector<4xf32>
-      %sp_aa{i}_{t} = vector.fmaf %sp_pv{i}_{t}, %sp_v{i}_{t}, {pa} : vector<4xf32>"""); pl, pa = f"%sp_la{i}_{t}", f"%sp_aa{i}_{t}"
-        # No per-token range select (E40, mutation-checked): a union block outside the token's own [lo_al, hi) is all masked
-        # for it. After its range (state live) it is an exact no-op (p = exp(-big - m) = 0, alpha = 1). Before its range
-        # (state still m = -big) it leaves junk (p = 1), which the token's first real block wipes exactly (alpha =
-        # exp(-big - real) = 0, l * 0 = acc * 0 = 0). That needs at least one real key per active split range, which holds
-        # here: the span body runs from ATTN_GQA_FROM (4096) visible keys, where 64 splits of ceil(v / 64) never leave one
-        # empty (63 * ceil(v / 64) < v for v > 4032). Masked keys are positions below the span's last token: written K/V.
-        ys += [prev, pl, pa]
-    b.append(f"      scf.yield {', '.join(ys)} : {types}")
-    b.append("    }")
-    b.append(f"""    %sp_acc_view = buffer.view %part_acc[%zero] : buffer -> view<[%tokens]x{QH}x{S}x32x4xf32>
-    %sp_first = index.cmp eq, %lane, %c0 : index
-    %sp_ml_view = buffer.view %part_ml[%zero] : buffer -> view<[%tokens]x{QH}x{S}x2xf32>
-    %sp_split = index.assume %split_id [range(%split_id, 0, {S - 1})] : index""")
-    for t in range(T):
-        b.append(f"""    scf.if %sp_act{t} {{
-    vector.store %sp_af{t}, %sp_acc_view[%sp_t{t}, %sp_head, %sp_split, %lane, %c0] : vector<4xf32>, view<[%tokens]x{QH}x{S}x32x4xf32>
-    scf.if %sp_first {{
-      view.store %sp_mf{t}, %sp_ml_view[%sp_t{t}, %sp_head, %sp_split, 0] : f32, view<[%tokens]x{QH}x{S}x2xf32>
-      view.store %sp_lf{t}, %sp_ml_view[%sp_t{t}, %sp_head, %sp_split, 1] : f32, view<[%tokens]x{QH}x{S}x2xf32>
-    }}
-    }}""")
-    return "\n".join(d), "\n".join(b)
 
 
 def gqa_split(text, P, S, span=False):
@@ -3183,9 +3025,6 @@ def gqa_split(text, P, S, span=False):
     %use_gqa = index.cmp uge, %visible, %cgqa : index
     %gq = index.constant {G} : index
     scf.if %use_gqa {{"""
-    if L17_T and span:
-        _det, _body = gqa_span(U, S, scale)
-        head += "\n" + _det + "\n    scf.if %sp_ok {\n    scf.if %sp_lead {\n" + _body + "\n    }\n    } else {"
     t = [head + f"""
     %gslot = index.madd %split_id, %gq, %wave : index
     %active_g = index.cmp ult, %gslot, %s_eff : index
@@ -3268,10 +3107,9 @@ def gqa_split(text, P, S, span=False):
       view.store %mf_{h}, %ml_view[%token, %head{h}, %gs, 0] : f32, view<[%tokens]x{QH}x{S}x2xf32>
       view.store %lf_{h}, %ml_view[%token, %head{h}, %gs, 1] : f32, view<[%tokens]x{QH}x{S}x2xf32>
     }}""")
-    t.append("    }\n" + ("    }\n" if L17_T and span else "") + "    } else {\n" + old + "    }\n")
+    t.append("    }\n    } else {\n" + old + "    }\n")
     if L17_VS and span:   # tokens from L17_FROM visible keys are g_attention_vsplit's (it writes all 64 partial slots): nothing to do here
-        hd = head.split("\n    %sp_true")[0] if L17_T else head
-        t = [hd, f"""    }} else {{
+        t = [head, f"""    }} else {{
     %l17_from = index.constant {L17_FROM} : index
     %l17_below = index.cmp ult, %visible, %l17_from : index
     scf.if %l17_below {{
@@ -3592,7 +3430,7 @@ kernel.def export("{P}_attention_combine") @{P}_attention_combine(%tokens: index
 """
     gqa_on = P == "g" and attn_rules.gqa(gen_draft.enabled(), seg_tokens(), D, twin) and attn_rules.paged(U) and attn_rules.butterfly(U)
     if gqa_on:
-        text = gqa_split(text, P, S, span=not twin)   # L17 span body on the gfx11 kernel only (ATTN_L17)
+        text = gqa_split(text, P, S, span=not twin)   # ATTN_L17_VS's vsplit branch on the gfx11 kernel only
     if P == "g" and attn_rules.multi_token(U, KVH) and (not gqa_on or gen_draft.enabled()):   # nodraft + K/V-once body: no spans
         text = multi_token_split(text, P, U, ATTN_MT, attn_rules.ATTN_GQA_FROM - 1 if gqa_on else None)   # gqa body from visible = ATTN_GQA_FROM, i.e. position FROM - 1
     if D != 128:
@@ -4456,7 +4294,6 @@ kernel.def export("g_head_select_p") @g_head_select_p(%spans: index) {{
 from gen_gemm import HELPER as GEMM_HELPER   # noqa: E402  formats without a 128/256-row kernel of their own
 GEMM_M256 = os.environ.get("GEMM_M256", "1") not in ("", "0", "false", "no")
 GEMM_M256_MIN_N = int(os.environ.get("GEMM_M256_MIN_N", "8192") or 0)
-GEMM_M256_MIN_N_ALL = os.environ.get("GEMM_M256_MIN_N_ALL", "0") not in ("", "0", "false", "no")
 # PREFILL_F16_SCRATCH (L4b option B): a prefill GEMM over a quantized weight first converts the weight to f16 in a scratch
 # buffer (g_deq16_<fmt>, gen_gemm.deq16) and then runs the f16 GEMM: no dequant VALU in the GEMM's inner loop (a no-dequant
 # ablation ran prefill +22%, E15). PF16_FORMATS: the formats converted (default: every format gen_gemm dequantizes).
@@ -4498,9 +4335,9 @@ def linear(fmt, x, s, w, wsize, y, k, n, kval, mode="store", gemm_only=False, wi
     nv = width if width is not None else int(n) if str(n).isdigit() else NVAL.get(n)
     # GEMM_M256_MIN_N (default 8192; 0 = off): outputs narrower than this keep the 128-row kernel. A 256 x 128 tile over a narrow,
     # long-K projection (ffn_down: n 5120, k 17408) leaves ~160 workgroups per 1024-row chunk on a 40-CU GPU: IQ4_XS store
-    # went 6.3 -> 11.7 ms per launch with the 256-row tiles (profile-p0/p1). GEMM_M256_MIN_N_ALL=1 applies it to every format,
-    # else only to the IQ formats that gen_gemm.py dequantizes directly (IQ4_NL / IQ4_XS).
-    narrow = bool(GEMM_M256_MIN_N and nv and nv < GEMM_M256_MIN_N and (GEMM_M256_MIN_N_ALL or fmt in ("iq4_nl", "iq4_xs")))
+    # went 6.3 -> 11.7 ms per launch with the 256-row tiles (profile-p0/p1). Only for the IQ formats that gen_gemm.py dequantizes
+    # directly (IQ4_NL / IQ4_XS): extended to every format it lost (HRX-like E12; that switch was deleted by the census 11-25).
+    narrow = bool(GEMM_M256_MIN_N and nv and nv < GEMM_M256_MIN_N and fmt in ("iq4_nl", "iq4_xs"))
     if GEMM_M256 and fmt not in GEMM_HELPER and not narrow:   # 256-row tiles: half the weight dequant per MMA (gen_gemm.gemm_big256)
         m128 = f"""scf.if %huge {{
           kernel.launch @g_gemm_{fmt}_{mode}_m256[%t, {n}]({args}) : [index, index]({types})

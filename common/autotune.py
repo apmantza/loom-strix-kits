@@ -34,7 +34,7 @@ Search space (JSON; unknown keys refused):
    "kit": "qwen38-27b", "base_cmd": "/abs/WORK/pkg-x.cmd"          # a package's recipe (common/build.sh's PKG.cmd), or:
    "generator": {"argv": ["{python}", "{lsk}/kit/fixtures/x.py", "{out}/program/x.loom"], "sources": ["kit/fixtures/x.py"]},
    "base_env": {"K": "V"},                                         # generator mode only
-   "knobs": {"GEMM256_KT": {"values": ["32", "64"], "trades_occupancy": "...", "note": "..."}, "GEMM256_LDS_PF": ["0", "1"]},
+   "knobs": {"GEMM256_KT": {"values": ["32", "64"], "trades_occupancy": "...", "note": "..."}, "GEMM256_FLATADDR": ["0", "1"]},
    "strategy": "grid" | "coordinate", "budget": 8,
    "timed": {"top": 3, "rounds": 3, "reps": 20, "chain": "bash .../candidate_check.sh {pkg}", "telemetry": "...",
              "kernels": {"KERNEL": {"workload": ["n=4096"], "buf": ["y=16384"], "scalar": [], "compare": ["y:f32"], "weight": 1}}}}
