@@ -49,6 +49,7 @@ import ast
 import concurrent.futures
 import glob
 import itertools
+import hashlib
 import json
 import math
 import os
@@ -69,6 +70,15 @@ TIMED_KEYS = {"top", "rounds", "reps", "chain", "telemetry", "kernels"}
 TKERNEL_KEYS = {"workload", "buf", "scalar", "compare", "weight"}
 NAME = re.compile(r"[A-Z][A-Z0-9_]*$")
 
+
+
+def lint_version():
+    """the cache key's lint part: kernel_lint.py and loop_census.py (its disassembly) hashed, so a cached row.json never carries
+    figures an older kernel_lint computed (r2 changed 'waves' from a fraction to Loom's integer tier)"""
+    h = hashlib.sha256()
+    for f in ("kernel_lint.py", "loop_census.py"):
+        h.update(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), f), "rb").read())
+    return h.hexdigest()[:12]
 
 class Refuse(Exception):
     """a usage or premise error: exit 2"""
@@ -331,7 +341,7 @@ class Search:
     def compile_one(self, prog, k, fp):
         """the kernel's metrics, compiled once per source closure (the same closure: the same code, binary_gate's premise)"""
         import kernel_lint
-        d = os.path.join(self.out, "cache", f"{k}.{fp[:16]}")
+        d = os.path.join(self.out, "cache", f"{k}.{fp[:16]}.{lint_version()}")   # a kernel_lint change re-lints (review r1 F6)
         meta = os.path.join(d, "row.json")
         if os.path.exists(meta):
             return json.load(open(meta))

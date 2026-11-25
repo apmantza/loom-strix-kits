@@ -65,7 +65,7 @@ common/serve.sh qwen38-27b pkg                        # OpenAI-compatible API, t
 | `common/agent_run_summary.py` | summarizes server-side numbers of an agent run from /metrics snapshots |
 | `common/events_ab.sh KIT OUT LEN PKG...` | served per-dispatch profiles (ABBA order) at one prompt size, then every lane against its hardware floor (`kits/<kit>/lanes.json`) |
 | `common/events_summary.py`, `lane_breakdown.py`, `ceiling.py` | the lane table, one lane kernel by kernel (with GB/s for matvecs), the floors themselves |
-| `common/fresh.py KIT` | is the kit still current: installed and measured hrx-loom against PyPI, each pinned file's sha256 against its repository's main (exit 1 stale, 2 check failed) |
+| `common/fresh.py KIT` | is the kit still current: installed and measured hrx-loom against PyPI, each pinned file's sha256 against its repository's main (exit 1 stale, 2 check failed); also the Loom tool surface: new / removed binaries, subcommands, flags, changed help lines and docs workflows per Loom version and between `VENV` and `VENV_NEXT` (`HRX_SYSTEM` for workflows; reported, never the exit code) |
 | `common/new_kit.sh NAME MODEL_ID` | scaffolds `kits/NAME/` (manifest, pins, lanes, notes, fetch wrapper) |
 | `common/make_lanes.py WEIGHTS` | the floors' model constants from a GGUF or safetensors header (local or remote): bytes per decode step (MoE: the experts a verify step's tokens touch; looped layers; MTP and vision excluded), multiply-adds, KV slots for hybrid attention |
 | `common/kit_check.sh KIT` | the weights gate: files match the pins, upstream freshness, lanes.json reproduces from the weights |

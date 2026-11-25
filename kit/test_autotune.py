@@ -108,6 +108,8 @@ def main():
                                   timed={"top": 2, "rounds": 2, "kernels": {"at_scale": {"workload": ["n=4096"], "buf": ["w=16384", "y=16384"], "compare": ["y:f32"]}}})
         d3 = os.path.basename(os.path.dirname(by["AT_SCALE=3.0"]["rows"]["at_scale"]["hsaco"]))
         d4 = os.path.basename(os.path.dirname(by["AT_SCALE=4.0"]["rows"]["at_scale"]["hsaco"]))
+        ok(d3.endswith("." + at.lint_version()) and len(at.lint_version()) == 12, f"the compile cache is keyed by kernel_lint's version: "
+           f"a lint change never reuses an older lint's row.json (review r1 F6) ({d3})")
         def timed(ms):
             r = subprocess.run([sys.executable, TOOL, "time", res, "--hsaco-run", stub], capture_output=True, text=True,
                                env=dict(os.environ, AT_STUB=json.dumps(ms)))

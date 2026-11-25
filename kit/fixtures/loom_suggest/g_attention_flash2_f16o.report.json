@@ -59,6 +59,7 @@
    }
   ]
  },
+ "target_key": "gfx1151",
  "target_resources": {
   "limiting_resource": "amdgpu.vgpr",
   "max_subgroups_per_simd": 16,
