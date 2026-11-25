@@ -58,20 +58,28 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   [barrier] a NOTE (with --package / --program / --source: the kernel's Loom text, checked against the binary's s_barrier count;
             user 11-25, after cuda-oxide's no_data_race / uniform_barriers; E504: one extra barrier per flash2 tile cost +1.4 %):
             a kernel.barrier<workgroup> that orders no workgroup-memory hazard (RAW / WAR / WAW between overlapping accesses of one
-            buffer.alloca<workgroup>, one writing) that no other barrier on the same path also orders: removable on its own (two such
-            barriers removed together are not covered). --barriers prints every barrier with the pairs it orders. Fire 11-25 on
-            pkg-e480 (259 kernels, 83 MB, 3.4 s): 8 barriers, all flash2 (main-loop end-of-tile barrier and the tail's last
-            barrier, in flash2 / _f16o / _partial / _partial_f16o); author-judged sample 2 of 2 real (static-1125/barrier-lint).
+            workgroup alloca, one writing) that no other barrier on the same path also orders: removable on its own (two such
+            barriers removed together are not covered). The model fails closed: views and accesses are allowlists (BAR_VIEW,
+            BAR_ACCESS), any other op touching a region reads and writes all of it, and two accesses overlap unless their views sit
+            at disjoint constant byte extents (indices assumed in bounds, as Loom requires); review 11-25 (static-1125/barrier-lint).
+            --barriers prints every barrier with the pairs it orders. Fire 11-25 on pkg-e480 (259 kernels, 85 MB, 3.4 s): 8
+            barriers, all flash2 (main-loop end-of-tile barrier and the tail's last barrier, in flash2 / _f16o / _partial /
+            _partial_f16o); author-judged sample 2 of 2 real.
   [divbar]  a NOTE: a barrier or workgroup collective under an scf.if / scf.for whose condition or bound may differ between a
-            workgroup's invocations (derived from ids, lanes, shuffles, scans, atomics; an unlisted kernel.* result counts as
-            non-uniform; a workgroup reduce / vote is uniform): some waves may never arrive. Fire 11-25 on pkg-e480: none.
-  (potential races, two overlapping accesses with no barrier between, are listed by --barriers only, never as a note: lane- or
-  wave-indexed staging stores are not proved disjoint (no per-invocation index model), and an author-judged sample of 10 of the
-  60 on pkg-e480 found 0 real; all were `row = tid / 2, col = (tid % 2) * 32 + c` staging or per-wave rows.)
-  Not analysed (printed, never clean): unknown region ops, a return before the end, workgroup scan / vote, a workgroup view
-  through a loop or yield, a callee that synchronises or allocates workgroup memory, barrier forms other than <workgroup>
-  scope(workgroup), and a text whose implied s_barrier count (two per workgroup reduce, times constant unrolls) is not the
-  binary's. Another engine's code objects carry no Loom text: the check does not apply to them.
+            workgroup's invocations: some waves may never arrive. Uniform is an allowlist: workgroup id / size / count, subgroup
+            count / size, a workgroup reduce, constants and kernel arguments, and arithmetic, views and plain loads of those;
+            everything else (ids, lanes, shuffles, scans, fragments, mma, atomics, volatile loads, unlisted ops, a loop's values
+            under a non-uniform trip count) may differ. Fire 11-25 on pkg-e480: none.
+  (potential races, two overlapping accesses with no barrier between, are computed and listed by --barriers only, never a note:
+  lane- or wave-indexed staging stores are not proved disjoint (no per-invocation index model), and an author-judged sample of 10
+  of the 60 on pkg-e480 (132 without r1's index lattice) found 0 real; all were `row = tid / 2, col = (tid % 2) * 32 + c` staging or per-wave rows.)
+  Not analysed (printed, never clean): unknown region ops (scf.while ...), op lines it cannot parse, a return before the end,
+  kernel.exit, kernel.async.* / kernel.tensor.* (data lands after issue), an alloca in a space other than workgroup / private /
+  global or a buffer.alloca.init<workgroup>, workgroup scan / vote, a workgroup view through a loop or yield, a callee that
+  synchronises, allocates workgroup memory or copies asynchronously, barrier forms other than <workgroup> scope(workgroup), and
+  a text whose implied s_barrier count (two per workgroup reduce, times constant unrolls) is not the binary's. Two exports of one
+  name in the texts: the last wins (kernel_texts); the s_barrier cross-check refuses it only when the counts differ. Another
+  engine's code objects carry no Loom text: the check does not apply to them.
   regress:  (with --baseline) worse than the same kernel in another build: a new spill, the prefetch now drained, fewer
             waves per SIMD, or the hot loop / its longest move run >= 10 % longer (E226: Loom 0.3.0's vmcnt(0) + 32-move shift;
             E230: a rewrite's spill; E236: a variant's residency drop).
@@ -1035,9 +1043,10 @@ def barrier_check(text, funcs=None, races=False):
 def barriers(rows, texts, funcs, roots=None, races=False):
     """attach barrier_check to each row whose kernel text is known, cross-checked against the binary: when the text's barriers
     (plus two per workgroup collective, times constant unroll counts) are not the binary's s_barrier count, the text is not
-    what runs and no verdict is given (fail closed). Notes: 'barrier' (a barrier orders nothing; races are listed, not noted),
-    'divbar' (a barrier or collective under control flow that may differ between invocations). With texts, a binary with
-    s_barriers whose text is missing is 'not analysed'; without any text (another engine's objects) the rule does not apply"""
+    what runs and no verdict is given (fail closed). Notes: 'barrier' (a barrier orders nothing), 'divbar' (a barrier or collective
+    under control flow that may differ between invocations); races are computed only when RACES (--barriers) and listed, not
+    noted. With texts, a binary with s_barriers whose text is missing is 'not analysed'; without any text (another engine's
+    objects) the rule does not apply"""
     for r in rows:
         if roots and not re.search(roots, r["kernel"]):
             continue
@@ -1187,7 +1196,8 @@ def main():
     ap.add_argument("--source", action="append", default=[], help="a package directory or program file whose texts feed the "
                     "text-level rules (maskedv, barrier) for code objects compiled earlier (repeatable)")
     ap.add_argument("--barriers", action="store_true", help="print every barrier of every analysed kernel with the hazard pairs it "
-                    "orders, not only the kernels with a barrier that orders nothing or a potential race")
+                    "orders and the potential races (computed only then), not only the kernels with a barrier that orders nothing or "
+                    "that the check could not model")
     ap.add_argument("--flagged", action="store_true", help="print flagged kernels only")
     ap.add_argument("--strict", action="store_true", help="exit 1 when any kernel is flagged")
     a = ap.parse_args()
