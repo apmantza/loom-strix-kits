@@ -127,7 +127,13 @@ back-edge (E109), the extra LDS bank-service rounds of Loom's gfx1151 bank model
 bank_service_groups before acting; E249: the f16 GEMMs' 48 extra rounds were the epilogue's once-per-tile store), and with --profile
 each kernel's served ms.
 A code object holding many kernels (another engine's build: *.co / *.hsaco) is linted kernel by kernel (lint_object).
-usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--profile RUN] [--source PKG_OR_LOOM] [--barriers] [--flagged] [--strict]
+--loom-candidates (C19): Loom upstream CANDIDATES, never flags, notes or an exit code; each is a prompt for a compiler packet that a
+human still makes airtight (minimal .loom repro, upstream main, existing issues, the user's approval to post). Per Loom kernel object:
+'tier' (the report's next tier vs whole-workgroup arithmetic, E533) and 'vopd-edge' (back-edge copy groups VOPD could pair, E592);
+with --baseline, 'sdk' (two compiles of identical programs by two compilers, from each directory's loom-provenance: shapes that
+appear or disappear with only the compiler changed; E177 / E227 by hand). Fire 11-25 on pkg-e480: 0.2.0 24 tier / 17 vopd-edge,
+0.3.0 20 / 17, 0.2.0 -> 0.3.0 4 sdk lines (f16 m256 GEMMs +addr64; split attention better waves 6 -> 8).
+usage: kernel_lint.py DIR_OR_HSACO ... [--baseline DIR] [--profile RUN] [--source PKG_OR_LOOM] [--barriers] [--loom-candidates] [--flagged] [--strict]
        kernel_lint.py --package PKG | --program FILE.loom ... --out DIR [--loom-compile PATH] [--roots REGEX] [--jobs N] [...]
          (compiles every gfx11 kernel root into DIR first; two compilers: run twice with --loom-compile and pass the first
           run's DIR as --baseline of the second; --strict: exit 1 when anything is flagged)"""

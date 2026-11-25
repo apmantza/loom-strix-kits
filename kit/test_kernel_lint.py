@@ -59,6 +59,10 @@
     build (E520: STAGE_LIVE x FLATADDR), VOPD pairs left unformed not counted (E551: flash2's back-edge 65 moves -> 31 pairs);
     each with near misses (two rounds, a runtime grid, an unmodelled op; loads kept in flight or issued early; loads issued after
     the join, read inside the block or issued inside it, an exit test; one-parity destinations, dependent moves, modifiers).
+  - C19 Loom candidates (loom_cands(), HANDOFF failure list): a report's phantom next tier (E533), allocation-emitted back-edge
+    copies VOPD could pair (E592) and a shape moved by the compiler alone (E177 / E227) found only by hand; each with near misses
+    (agreeing tier, wave cap, unverified tier; short, distant, ordered or paired copies; programs, roots, target or compiler not
+    attributable), and candidates never reaching flags, notes or --strict.
 usage: python3 kit/test_kernel_lint.py   (needs loom-compile: VENV from the environment or the machine env file)"""
 import json
 import os
