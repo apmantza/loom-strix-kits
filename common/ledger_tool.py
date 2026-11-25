@@ -298,7 +298,7 @@ def card_tagged(step):
     ls = [l for l in hd if re.match(r"^#\s*bound:", l)]
     if len(ls) != 1:
         probs.append(f"{len(ls)} '# bound:' lines (need exactly one: '# bound: PART now X (limit Y; best engine Z | none measured), "
-                     "best case B of the request (amdahl.py), resolved by M (floor F)' or '# bound: n/a (diagnosis)')")
+                     "best case B % of the request (amdahl.py ...), resolved by M (floor F %)' or '# bound: n/a (diagnosis)')")
     elif BOUND_NA.match(ls[0]):
         f["bound"] = None
     elif BOUND.match(ls[0]):
