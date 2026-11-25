@@ -37,7 +37,7 @@ The weights are never redistributed; each kit downloads them from their original
 - Strix Halo (gfx1151). Other RDNA 3 parts may build, but they are untested and the tuning assumes this chip.
 - Linux with ROCm-capable amdgpu, and **unlimited memlock** for loom-serve (io_uring pinning).
 - Python 3.12, `pip install hrx-loom==0.2.0 gguf numpy tokenizers huggingface_hub`.
-- A loom-skills checkout for its knowledge base (`LOOM_KB_ROOT=<checkout>/skills/loom-kb`), tested at 7952d7f.
+- A loom-skills checkout for its knowledge base (`LOOM_KB_ROOT=<checkout>/skills/loom-kb`), tested at d630a7c (11-25).
 - Note that the BIOS power mode matters: on some boards the 85 W default caps prefill noticeably below the 120 W mode.
 
 ## Usage
