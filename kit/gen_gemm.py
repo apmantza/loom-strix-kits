@@ -10,6 +10,8 @@ Variants:
   swiglu        two weights (gate, up), Y = silu(X Wg^T) * (X Wu^T)
 """
 import os, re as _re, sys
+import retired
+retired.check()   # switch census 11-25
 PREFIX = os.environ.get("GEMM_PREFIX", "g")
 META = os.environ.get("GEMM_KMETA", "@g_k_metadata")
 

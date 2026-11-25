@@ -15,6 +15,8 @@
 import json, math, os, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import retired  # noqa: E402
+retired.check()   # a retired switch (switch census 11-25) set to anything the kit no longer builds stops here, before the config is read
 from gen_gdn import gdn_geometry, gdn_kernels, recurrence_pf, split_qgate, chunk_mode, fused_mode  # noqa: E402
 from formats import SPLIT, SCALE_DIV  # noqa: E402
 

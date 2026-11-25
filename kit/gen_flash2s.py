@@ -24,6 +24,10 @@ import os
 import subprocess
 import sys
 
+import retired
+
+retired.check()   # switch census 11-25
+
 _c = json.load(open(os.environ["LLM_CONFIG"]))
 P = "g"
 KVH, G, D = _c["kv_heads"], _c["heads"] // _c["kv_heads"], _c["head_dim"]

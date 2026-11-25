@@ -22,7 +22,10 @@ GEOMS = [{"kv_heads": 4, "heads": 24, "head_dim": 256, "layers": 64}, {"kv_heads
 def recipe(kit):
     for ln in open(os.path.join(HERE, "..", "kits", kit, "kit.env")):
         if ln.startswith("KIT_RECIPE="):
-            return dict(kv.split("=", 1) for kv in shlex.split(ln.split("=", 1)[1].split("#")[0]))
+            words = [w for t in shlex.split(ln.split("=", 1)[1], comments=True) for w in t.split()]   # the quoted value's words
+            sw = dict(kv.split("=", 1) for kv in words)
+            assert sw and all(re.fullmatch(r"[A-Z][A-Z0-9_]*", k) and re.fullmatch(r"[^\s=]+", v) for k, v in sw.items()), sw
+            return sw
     raise SystemExit(f"no KIT_RECIPE in kits/{kit}/kit.env")
 
 
@@ -67,6 +70,8 @@ def main():
         for gi, geom in enumerate(GEOMS):
             cfg = os.path.join(tmp, f"cfg{gi}.json"); json.dump(geom, open(cfg, "w"))
             tag = f"kv{geom['kv_heads']}/h{geom['heads']}"
+            if geom["heads"] // geom["kv_heads"] != 6:   # FLASH2_HEADPACK serves 6 query heads per KV head only (gen_flash2s refuses others)
+                base = {k: v for k, v in base.items() if k != "FLASH2_HEADPACK"}
             for vs in (False, True):
                 what = f"{tag} {'vsplit' if vs else 'flash2'}"
                 r0, t0 = gen(tmp, cfg, base, vs)
