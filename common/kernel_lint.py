@@ -1230,14 +1230,14 @@ def sdk_diff(cur, base, pc, pb):
     compilers (provenance pc / pb). Per kernel in both, the shapes (flags, the per-kernel notes SHAPE_NOTES, candidate kinds) that
     appear or disappear and regressions() each way; a kernel compiled by one side only. Fails closed: without both provenances, with
     an object in either directory that its provenance does not list with the same sha256 (read_provenance's "unverified": review
-    F1), different programs or roots, one compiler (same path or same version) or an unknown version, one 'not attributable' line
+    F1), different programs or roots, one compiler version (a path holds one) or an unknown version, one 'not attributable' line
     and nothing else."""
     unv = [f"{x.get('path', '?')}: {x['unverified']}" for x in (pc, pb) if x and x.get("unverified")]
     known = lambda x: x.get("version") and x.get("version") != "version unknown"
     why = ("provenance missing" if not (pc and pb) else f"objects not as recorded: {'; '.join(unv)}" if unv
            else "programs differ" if pc.get("programs") != pb.get("programs") or not pc.get("programs")
            else "roots differ" if pc.get("roots") != pb.get("roots")
-           else "one compiler" if pc.get("compiler") == pb.get("compiler") or pc.get("version") == pb.get("version")
+           else "one compiler" if pc.get("version") == pb.get("version")      # one path is one venv, so one version: the version decides
            else "compiler version unknown" if not (known(pc) and known(pb)) else None)
     if why:
         return [f"loomcand sdk: not attributable ({why}): an SDK differential needs both directories compiled by kernel_lint "
@@ -1979,6 +1979,9 @@ def compile_programs(progs, out, jobs, lc=None, roots=None):
     def one(pk):
         prog, k = pk
         r = None
+        for x in OBJ_EXT:                             # a root's old outputs never outlive its compile (review F1: a kernel that fails
+            if os.path.exists(f"{out}/{k}{x}"):       # under the new compiler must not keep the old compiler's object)
+                os.remove(f"{out}/{k}{x}")
         for rep in ("summary", "details"):            # details (per-packet rows, ~10x larger) only where the bank model conflicts: ldsbank
             r = subprocess.run([lc, prog, "--target=amdgpu:gfx1151", f"--root={k}", f"--output={out}/{k}.hsaco",
                                 f"--compile-report={rep}", f"--compile-report-output={out}/{k}.json"], capture_output=True, text=True)
@@ -1991,8 +1994,8 @@ def compile_programs(progs, out, jobs, lc=None, roots=None):
         for k, rc, err in results:
             if rc:
                 failed.append((k, (err.strip().split("\n") or [""])[0][:160]))
-    done = [k for k, rc, _ in results if not rc]
-    objs = [f"{out}/{k}{x}" for k in done for x in OBJ_EXT if os.path.exists(f"{out}/{k}{x}")]
+    objs = [f"{out}/{k}{x}" for _, k in work for x in OBJ_EXT if os.path.exists(f"{out}/{k}{x}")]   # every output of this compile's
+    # roots, a failed root's report included (g_silu_mul fails standalone under both versions and leaves a report)
     json.dump(provenance(lc, progs, roots, objs), open(pv, "w"), indent=1)
     return texts, failed
 

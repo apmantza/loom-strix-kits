@@ -785,9 +785,14 @@ def main():
             base = dict(pr, compiler="/other/loom-compile", version="hrx-loom 0.0.0", unverified=None)
             row1 = kl.lint(os.path.join(dd, "g_deq16_iq4_nl.hsaco"))
             got = kl.sdk_diff({"g_deq16_iq4_nl": row1}, {"g_deq16_iq4_nl": dict(row1)}, pr, base)
-            ok("g_deq16_iq4_nl2.hsaco" in (pr.get("unverified") or "") and len(got) == 1
-               and got[0].startswith("loomcand sdk: not attributable (objects not as recorded"),
-               f"provenance: {name}: g_deq16_iq4_nl2's object left from the first compile is not the second compiler's (F1) ({pr.get('unverified')}; {got})")
+            if name == "stale":              # a root this compile did not attempt keeps its object: the directory is not attributable
+                ok("g_deq16_iq4_nl2.hsaco" in (pr.get("unverified") or "") and len(got) == 1
+                   and got[0].startswith("loomcand sdk: not attributable (objects not as recorded"),
+                   f"provenance: stale: g_deq16_iq4_nl2's object from the first compile is not the second compiler's (F1) ({pr.get('unverified')}; {got})")
+            else:                            # a root that failed under this compiler: its old object is removed before the compile
+                ok(not os.path.exists(os.path.join(dd, "g_deq16_iq4_nl2.hsaco")) and pr.get("unverified") is None,
+                   f"provenance: failed: g_deq16_iq4_nl2's old object does not survive its failed compile, so it cannot be attributed to "
+                   f"the new compiler (F1) ({os.listdir(dd)}; {pr.get('unverified')})")
         import shutil as sh_
         for what, act in (("changed", lambda d_: open(os.path.join(d_, "g_deq16_iq4_nl.hsaco"), "ab").write(b"\0")),
                           ("missing", lambda d_: os.remove(os.path.join(d_, "g_deq16_iq4_nl.json")))):
@@ -796,6 +801,16 @@ def main():
             act(dd)
             got = (kl.read_provenance(dd) or {}).get("unverified") or ""
             ok(got.startswith(what + ":"), f"provenance: an object {what} after the compile is not as recorded (F1) ({got})")
+        dd = os.path.join(t, "f1-failrep")
+        open(os.path.join(t, "lc-fails-rep"), "w").write('#!/bin/sh\nfor a in "$@"; do case "$a" in --compile-report-output=*) echo {} > "${a#*=}";; esac; done\n'
+                                                          'echo "error [SUBRANGE/010]" >&2\nexit 1\n')
+        os.chmod(os.path.join(t, "lc-fails-rep"), 0o755)
+        subprocess.run([sys.executable, klp, "--program", two_loom, "--out", dd, "--loom-compile", os.path.join(t, "lc-fails-rep")],
+                       capture_output=True, text=True, timeout=600)
+        pr = kl.read_provenance(dd) or {}
+        ok(os.path.exists(os.path.join(dd, "g_deq16_iq4_nl.json")) and pr.get("unverified") is None and "g_deq16_iq4_nl.json" in (pr.get("objects") or {}),
+           f"provenance: a root that fails but writes its report (live g_silu_mul, both versions) lists the report, so the package stays "
+           f"attributable ({pr.get('unverified')}, {sorted(pr.get('objects') or {})})")
         pr = kl.read_provenance(pv1) or {}
         ok(pr.get("unverified") is None and "g_deq16_iq4_nl.hsaco" in (pr.get("objects") or {}),
            f"provenance: a clean compile lists its objects and verifies ({pr.get('unverified')}, {sorted(pr.get('objects') or {})})")
