@@ -251,7 +251,7 @@ def main():
         sg = os.path.join(t, "sg"); os.makedirs(sg)
         shutil.copy(os.path.join(t, "iq4_new.hsaco"), os.path.join(sg, "g_deq16_iq4_nl.hsaco"))
         shutil.copy(os.path.join(HERE, "fixtures", "loom_suggest", "g_gemm_f16_acc_m256.report.json"), os.path.join(sg, "g_deq16_iq4_nl.json"))
-        tools = {"missing": os.path.join(t, "no-such-tool"), "garbage": "echo hello", "list": "echo '[1]'", "crash": "echo boom >&2; exit 2",
+        tools = {"missing": os.path.join(t, "no-such-tool"), "garbage": "echo hello", "list": "echo '[1]'", "crash": "echo boom >&2; exit 2", "nonutf8": r'printf "\377\376 not utf8"',
                  "good": "cat " + os.path.join(HERE, "fixtures", "loom_suggest", "g_gemm_f16_acc_m256.suggest.json")}
         klp = os.path.join(HERE, "..", "common", "kernel_lint.py")
         for name, body in tools.items():
@@ -264,11 +264,11 @@ def main():
             row = [x for x in p.stdout.splitlines() if x.startswith("g_deq16_iq4_nl ")]
             if name == "good":
                 ok(p.returncode == 0 and row and "loom:lds_bank_service" in row[0] and "loom g_deq16_iq4_nl: residency cliff: Loom next tier 5: phantom (E533)" in p.stdout
-                   and "kernel_lint: 1 kernels, 0 flagged" in p.stdout,
+                   and "kernel_lint: 1 kernels, 0 flagged" in p.stdout and ": 0 of 1 runs unknown" in p.stdout,
                    f"--suggest: findings are notes, the cliff judged in whole workgroups, no flag (rc {p.returncode}, {row}, {p.stderr[-200:]})")
             else:
                 ok(p.returncode == 0 and row and "loom:unknown" in row[0] and "loom g_deq16_iq4_nl: unknown (" in p.stdout
-                   and "kernel_lint: 1 kernels" in p.stdout,
+                   and "kernel_lint: 1 kernels" in p.stdout and ": every run failed (unknown (" in p.stdout,
                    f"--suggest with a {name} tool: 'unknown', table complete (rc {p.returncode}, {row}, {p.stderr[-300:]})")
         r = compile_lint(lc, t, "q6_old", q6_old + kernel("g_q6_k_icodes", False), "t_g_q6_k_icodes")
         ok("repack" in r["flags"], f"pre-E233 q6_k codes flag repack (pk {r['pk']}, bfe {r['bfe']})")

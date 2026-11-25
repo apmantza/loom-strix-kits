@@ -46,6 +46,85 @@ def fake(t, name, body):
     return p
 
 
+def edited(k, **ev):
+    """fixture K's suggest document with its residency_cliff evidence fields (by suffix) replaced"""
+    d = json.load(open(os.path.join(FIX, k + ".suggest.json")))
+    for x in d["findings"]:
+        if x["id"] == ls.CLIFF:
+            for key in list(x["evidence"]):
+                for suf, v in ev.items():
+                    if key.endswith("." + suf):   # dotted: 'next_better_tier' must not match 'reduction_units_to_next_better_tier'
+                        x["evidence"][key] = v
+    return d
+
+
+def r2():
+    """review r1 of suggest-1125 (7e9caf2): F1 fail closed past the process boundary, F2 'agrees' = Loom's tier IS the tier the cuts
+    land on, F3 Loom 0.3.0's per-investigation grouping, F4 a summary of failed runs, F5 the two-cliff and empty-needs guards"""
+    # F2: kernel_lint's occupancy() names the tier the cuts land on (q4_k k4096: VGPR <= 96 lands on 16); Loom's 14, 15 or 40 with the
+    # same cut, or flash2's 9-cuts called 12, is not that tier: 'disagrees' (7e9caf2 said 'agrees' for every tier >= occupancy's next)
+    for k, nt, cuts in (("g_mv_q4_k_k4096_t8_q8", 14, None), ("g_mv_q4_k_k4096_t8_q8", 15, None), ("g_mv_q4_k_k4096_t8_q8", 40, None),
+                        ("g_attention_flash2_f16o", 12, None)):
+        res = ls.parse(json.dumps(edited(k, next_better_tier=nt)))
+        occ = lc.occupancy(lc.report_limit(os.path.join(FIX, k + ".report.json"))[4], 4)
+        if k == "g_attention_flash2_f16o":   # give Loom exactly occupancy()'s cuts (VGPR <= 168, LDS <= 43008: they land on 9)
+            res = ls.parse(json.dumps(edited(k, next_better_tier=nt, **{"rows[1].reduction_units_to_next_better_tier": 72})))
+        cell, lines = ls.describe(res, occ, True)
+        ok(f"->{nt} disagrees" in cell, f"F2: {k} with Loom's tier edited to {nt} (same cuts as occupancy()): disagrees", (cell, occ and occ.get("next")))
+    occ = lc.occupancy(lc.report_limit(os.path.join(FIX, "g_mv_q4_k_k4096_t8_q8.report.json"))[4], 4)
+    ok(occ.get("next") == 16, "F2: occupancy()'s next is the tier the cuts land on (kernel_lint tier_state)", occ)
+    # F5: two cliffs in one report, a cliff without a constraint row: unrecognised, never judged
+    d = json.load(open(os.path.join(FIX, "g_attention_flash2_f16o.suggest.json")))
+    d["findings"] += [x for x in d["findings"] if x["id"] == ls.CLIFF]
+    ok("residency_cliff (evidence shape)" in ls.describe(ls.parse(json.dumps(d)), None, True)[0], "F5 (R4): two cliffs in one report are unrecognised")
+    d = json.load(open(os.path.join(FIX, "g_attention_flash2_f16o.suggest.json")))
+    for x in d["findings"]:
+        if x["id"] == ls.CLIFF:
+            x["evidence"] = {k: v for k, v in x["evidence"].items() if not k.startswith("residency_constraints")}
+    ok("residency_cliff (evidence shape)" in ls.describe(ls.parse(json.dumps(d)), None, True)[0],
+       "F5 (R7): a cliff naming no resource to cut is unrecognised, not 'phantom' or 'agrees' on empty cuts")
+    # F3: Loom 0.3.0 keeps one example per investigation with match_count, under the same kind and schema 0
+    for k, want in (("g_attention_flash2_f16o", "expand x21"), ("g_gemm_f16_acc_m256", "expand x101")):
+        res = ls.parse(open(os.path.join(FIX, k + ".v030.suggest.json")).read())
+        cell, lines = ls.describe(res, None, False)
+        ok(want in cell, f"F3: 0.3.0 {k}: counts weighted by match_count ({want}, as 0.2.0 lists them)", cell)
+        ok(any("examples" in x for x in lines if x.startswith("reduce expansion")),
+           f"F3: 0.3.0 {k}: a figure summed over examples says it covers examples, not every match", lines)
+    with tempfile.TemporaryDirectory() as t:
+        # F1: past the process boundary (review probes): non-UTF-8 output, lds_bank_service evidence as a list, an unknown id whose
+        # action is a dict. Each was an exception that ended kernel_lint (7e9caf2); now 'unknown (...)' for that kernel only.
+        rep = os.path.join(FIX, "g_gemm_f16_acc_m256.report.json")
+        g = json.load(open(os.path.join(FIX, "g_gemm_f16_acc_m256.suggest.json")))
+        ev = json.loads(json.dumps(g)); [x.update(evidence=list(x["evidence"].items())) for x in ev["findings"] if x["id"] == "amdgpu.lds_bank_service"]
+        ad = json.loads(json.dumps(g)); ad["findings"].append({"id": "amdgpu.new", "action": {"text": "x"}, "evidence": {}})
+        json.dump(ev, open(os.path.join(t, "ev.json"), "w")); json.dump(ad, open(os.path.join(t, "ad.json"), "w"))
+        tools = {"nonutf8": fake(t, "nonutf8", r'printf "\377\376 not utf8"'), "evlist": fake(t, "evlist", f"cat {t}/ev.json"),
+                 "actiondict": fake(t, "actiondict", f"cat {t}/ad.json"), "good": fake(t, "good", f"cat {os.path.join(FIX, 'g_gemm_f16_acc_m256.suggest.json')}")}
+        for name in ("nonutf8", "evlist", "actiondict"):
+            try:
+                s = ls.survey({"a": rep, "b": rep}, tools[name], None, jobs=1)
+            except Exception as e:   # noqa: BLE001
+                s = {"raised": f"{type(e).__name__}: {e}"}
+            want = "unrecognised suggest finding: amdgpu.new" if name == "actiondict" else "unknown ("
+            ok("raised" not in s and s["a"]["cell"].startswith(want) if name != "actiondict" else "raised" not in s and want in s["a"]["cell"],
+               f"F1: a {name} document gives '{want}' for that kernel and the survey completes", s.get("raised") or s["a"]["cell"])
+        ok(ls.run(rep, tools["nonutf8"]).get("error") == "unknown (loom-compile-report suggest: output not UTF-8)", "F1: non-UTF-8 named as such",
+           ls.run(rep, tools["nonutf8"]))
+        # F4: one summary line; the tool and its version on it
+        s = ls.survey({"a": rep, "b": rep, "c": os.path.join(t, "none.json")}, tools["good"], None)
+        ok(ls.summary(s, tools["good"]).startswith("loom suggest (") and ls.summary(s, tools["good"]).endswith("0 of 2 runs unknown"),
+           "F4: summary counts runs (a kernel without a report is not a run)", ls.summary(s, tools["good"]))
+        s = ls.survey({"a": rep, "b": rep}, tools["nonutf8"], None)
+        ok(ls.summary(s, tools["nonutf8"]).endswith("every run failed (unknown (loom-compile-report suggest: output not UTF-8))"),
+           "F4: every run failed: said, with the first reason", ls.summary(s, tools["nonutf8"]))
+        s["b"] = ls.survey({"b": rep}, tools["good"], None)["b"]
+        ok(ls.summary(s, tools["good"]).endswith("1 of 2 runs unknown"), "F4: N of M runs unknown", ls.summary(s, tools["good"]))
+        os.makedirs(os.path.join(t, "bin")); os.makedirs(os.path.join(t, "lib", "python3.12", "site-packages", "hrx_loom-0.3.0.dist-info"))
+        tp = fake(os.path.join(t, "bin"), "loom-compile-report", "exit 0")
+        ok(ls.version(tp) == "hrx-loom 0.3.0", "F3: the tool's hrx-loom version from its venv", ls.version(tp))
+        ok(ls.version(fake(t, "other", "exit 0")) == "version unknown", "F3: a tool outside a venv: version unknown", ls.version(fake(t, "other", "exit 0")))
+
+
 def main():
     # ---------------------------------------------------------------- real live findings against whole-workgroup tiers
     res, occ = fixture("g_attention_flash2_f16o")
@@ -61,8 +140,9 @@ def main():
     for k, t in (("g_mv_q5_k_k5120_t8_q8", "12->15"), ("g_attention_vsplit", "3->5")):
         res, occ = fixture(k)
         cell, lines = ls.describe(res, occ, True)
-        ok(f"cliff {t} unverified" in cell and any("not whole waves per SIMD" in x for x in lines),
-           f"{k}: occupancy() cannot verify the tier, so Loom's cliff is 'unverified'", (cell, lines))
+        ok(f"cliff {t} unverified" in cell and any("a bound, not a measured tier" in x for x in lines),
+           f"{k}: a workgroup whose waves are not a multiple of the SIMDs has a bound tier (kernel_lint's ceil rule): Loom's cliff "
+           "against it is 'unverified', never 'agrees'", (cell, lines))
     res, occ = fixture("g_mv_q4_k_k4096_t8_q8")
     cell, lines = ls.describe(res, occ, True)
     ok("cliff 12->16 agrees" in cell, "q4_k k4096: the same cuts (VGPR <= 96) land on Loom's 16, above occupancy()'s 13: agrees", (cell, occ))
@@ -152,6 +232,7 @@ def main():
         ok(s["a"]["cell"].startswith("unknown (loom-compile-report suggest rc 2)") and s["a"]["notes"] == ["loom:unknown"],
            "a crash in the survey: unknown cell and note", s["a"])
 
+    r2()
     print(f"{'FAILED ' + str(fails) if fails else 'all ok'}")
     sys.exit(1 if fails else 0)
 
