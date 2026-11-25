@@ -254,6 +254,99 @@ def main():
                              "  %neg_v = vector.splat %neg_big : vector<8xf32>\n  %s0 = vector.select %ok0, %sr0, %neg_v : vector<8xf32>\n")
     ok(kl.masked_v(vec) == ["%ok0"], "maskedv: a vector.select against a splat of the fill fires too (vsplit's form)")
     ok(kl.masked_v(att(plain).replace("-3.0e38", "-1.0")) is None, "maskedv: a select against -1.0 is not a score mask")
+    # barrier check (user 11-25, cuda-oxide's no_data_race / uniform_barriers; HRX-like E504: one extra barrier per flash2 tile
+    # cost +1.4 %). Recurrences: an LDS write read by another wave with no barrier between not reported; a barrier that orders
+    # nothing kept silently; a barrier under a lane-dependent branch (some waves never arrive) passed; a construct the model cannot
+    # read reported clean instead of 'not analysed'; a predecessor list doubled per scf.if (11-25: 2^k entries, the draft fire run
+    # took 47.9 GB and was OOM-killed); report lines one off the program file's (11-25 draft: L4298 for the barrier at 4299)
+    def bk(body, wg="%c64"):
+        return ('kernel.def export("g_b") @g_b(%n: index) {\n  %c1 = index.constant 1 : index\n  %c64 = index.constant 64 : index\n'
+                "  %c32 = index.constant 32 : index\n"
+                f"  kernel.launch.config workgroups(%n, %c1, %c1) workgroup_size({wg}, %c1, %c1) : index\n"
+                "} launch(%x: buffer, %y: buffer) {\n  %c0 = index.constant 0 : index\n  %c1 = index.constant 1 : index\n"
+                "  %c32 = index.constant 32 : index\n  %tid = kernel.workitem.id x : index\n"
+                "  %t = buffer.alloca<workgroup> align(16) %bytes : buffer\n  %tv = buffer.view %t[%c0] : buffer -> view<64xf32>\n"
+                "  %xv = buffer.view %x[%c0] : buffer -> view<64xf32>\n  %v = view.load %xv[%tid] : view<64xf32> -> f32\n"
+                + body + "  kernel.return\n}\n")
+    st = "  view.store %v, %tv[%tid] : f32, view<64xf32>\n"
+    nb = "  %nb = index.sub %c32, %tid : index\n  %r = view.load %tv[%nb] : view<64xf32> -> f32\n"
+    bar = "  kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)\n"
+    b = kl.barrier_check(bk(st + nb))
+    ok(b["status"] == "no barriers", f"barrier: a kernel without barriers is 'no barriers', not analysed further ({b['status']})")
+    b = kl.barrier_check(bk(st + bar + bar + nb))
+    ok(b["status"] == "analysed" and [x["verdict"] for x in b["barriers"]] == ["orders nothing"] * 2 and not b["races"],
+       f"barrier: write, barrier, barrier, neighbour read: either barrier alone is redundant ({b['barriers']})")
+    b = kl.barrier_check(bk(st + bar + nb))
+    ok([x["verdict"] for x in b["barriers"]] == ["orders"] and not b["races"] and b["barriers"][0]["pairs"][0][2] == "RAW",
+       f"barrier: write, barrier, neighbour read: the barrier orders the RAW ({b['barriers']})")
+    b = kl.barrier_check(bk(st + nb))
+    ok(b["status"] == "no barriers", "barrier: (the same race without any barrier is out of scope: 'no barriers')")
+    b = kl.barrier_check(bk(st + bar + nb + "  view.store %v, %tv[%c1] : f32, view<64xf32>\n"))
+    ok(len(b["races"]) == 1 and b["races"][0][2] == "WAR", f"barrier: a store after the read with no barrier is a WAR race ({b['races']})")
+    b = kl.barrier_check(bk("  scf.for %i = [%c0 to %n step %c1] {\n" + st + bar + nb + "  }\n"))
+    ok(any(r[2] == "WAR" for r in b["races"]), f"barrier: a tile loop without its end barrier races the next store with this "
+       f"read across the back-edge (WAR) ({b['races']})")
+    b = kl.barrier_check(bk("  scf.for %i = [%c0 to %n step %c1] {\n" + st + bar + nb + bar + "  }\n"))
+    ok(not b["races"] and [x["verdict"] for x in b["barriers"]] == ["orders", "orders"],
+       f"barrier: with the end barrier the loop is clean and both barriers order a pair ({b['barriers']}, {b['races']})")
+    dis = ("  view.store %v, %tv[%c0] : f32, view<64xf32>\n  %r = view.load %tv[%c1] : view<64xf32> -> f32\n" + bar)
+    b = kl.barrier_check(bk(dis))
+    ok(not b["races"] and b["barriers"][0]["verdict"] == "orders nothing",
+       f"barrier: disjoint constant elements [0] and [1] neither race nor need the barrier ({b})")
+    two = ("  %c128 = index.constant 128 : index\n  %lo = buffer.view %t[%c0] : buffer -> view<32xf32>\n"
+           "  %hi = buffer.view %t[%c128] : buffer -> view<32xf32>\n  view.store %v, %lo[%tid] : f32, view<32xf32>\n"
+           "  %r = view.load %hi[%tid] : view<32xf32> -> f32\n" + bar)
+    b = kl.barrier_check(bk(two))
+    ok(not b["races"], f"barrier: views at disjoint constant byte extents of one buffer do not race ({b['races']})")
+    b = kl.barrier_check(bk(two.replace("%t[%c128]", "%t[%c64]")))
+    ok(len(b["races"]) == 1, f"barrier: the same views overlapping (offset 64 < 128 bytes) race ({b['races']})")
+    div = "  %lt = index.cmp ult, %tid, %c32 : index\n  scf.if %lt {\n" + st + bar + "  }\n" + nb
+    b = kl.barrier_check(bk(div))
+    ok(b["status"].startswith("divergent"), f"barrier: a barrier under a lane-dependent scf.if is reported divergent ({b['status']})")
+    uni = div.replace("index.cmp ult, %tid, %c32", "index.cmp ult, %n, %c32")
+    b = kl.barrier_check(bk(uni))
+    ok(b["status"] == "analysed", f"barrier: the same under a uniform condition is analysed ({b['status']})")
+    b = kl.barrier_check(bk(div.replace("index.cmp ult, %tid, %c32", "index.cmp ult, %w, %c32")
+                            .replace("  %lt", "  %one = scalar.constant 1.0 : f32\n"
+                                     "  %ct = view.atomic.rmw<add> %tv[%c0], %one : view<64xf32>, f32 -> f32\n"
+                                     "  %w = scalar.fptosi %ct : f32 to index\n  %lt")))
+    ok(b["status"].startswith("divergent"), f"barrier: a condition from an atomic's result (uniform operands) is non-uniform "
+       f"({b['status']})")
+    b = kl.barrier_check(bk(st + "  %pre = kernel.subgroup.scan<add> %n : index\n  scf.if %pre {\n" + bar + "  }\n"))
+    ok(b["status"].startswith("divergent"), f"barrier: a subgroup scan of a uniform value (a per-lane prefix) is non-uniform "
+       f"({b['status']})")
+    b = kl.barrier_check(bk(st + bar + "  scf.while %a {\n" + nb + "  }\n"))
+    ok(b["status"].startswith("not analysed"), f"barrier: an unknown region op is 'not analysed', never clean ({b['status']})")
+    b = kl.barrier_check(bk(st + "  scf.if %n {\n  kernel.return\n  }\n" + bar + nb))
+    ok(b["status"].startswith("not analysed"), f"barrier: a return before the end of the launch body is 'not analysed' ({b['status']})")
+    b = kl.barrier_check(bk(st + bar + "  %s = kernel.workgroup.scan<add> %v : f32\n" + nb))
+    ok(b["status"].startswith("not analysed"), f"barrier: an unmodelled workgroup collective is 'not analysed' ({b['status']})")
+    b = kl.barrier_check(bk(st + bar + nb, wg="%c32"))
+    ok(b["status"] == "single wave", f"barrier: a one-wave workgroup has nothing to order ({b['status']})")
+    chain = "".join(f"  %q{i} = index.cmp ult, %n, %c32 : index\n  scf.if %q{i} {{\n  }}\n" for i in range(28))
+    probe = ("import resource, sys\nresource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))\n"
+             f"sys.path.insert(0, {os.path.dirname(kl.__file__)!r})\nimport kernel_lint as kl\n"
+             "print(kl.barrier_check(sys.stdin.read())['status'])\n")
+    pr = subprocess.run([sys.executable, "-c", probe], input=bk(st + chain + bar + nb), capture_output=True, text=True, timeout=120)
+    ok(pr.returncode == 0 and pr.stdout.strip() == "analysed", f"barrier: 28 empty ifs in a row analyse within 1 GiB of address "
+       f"space (the 11-25 draft doubled a list per if: 2^28 entries; its fire run took 47.9 GB): rc {pr.returncode} "
+       f"{(pr.stdout + pr.stderr).strip()[-80:]}")
+    row = {"kernel": "g_b", "s_barrier": 1}
+    kl.barriers([row], {"g_b": bk(st + bar + bar + nb)}, {})
+    ok("barrier" not in row.get("notes", []) and row["barrier"]["status"].startswith("not analysed: the binary has 1"),
+       f"barrier: a binary whose s_barrier count differs from the text's is not analysed ({row['barrier']['status']})")
+    row = {"kernel": "g_b", "s_barrier": 2}
+    kl.barriers([row], {"g_b": bk(st + bar + bar + nb)}, {})
+    ok("barrier" in row.get("notes", []), f"barrier: matching counts give the note ({row.get('notes')})")
+    row = {"kernel": "g_b", "s_barrier": 1}
+    kl.barriers([row], {"g_b": bk(st + bar + nb)}, {})
+    rep = kl.barrier_report(row, ("p.loom", 100), full=True)
+    want = 100 + bk(st + bar + nb).split("\n").index(bar.rstrip("\n"))
+    ok(any(x.startswith(f"  L{want}: orders") for x in rep), f"barrier: report lines are the program file's (kernel.def at 100, "
+       f"barrier at {want}): {rep[1:3]}")
+    row = {"kernel": "g_other", "s_barrier": 3}
+    kl.barriers([row], {"g_b": bk(st)}, {})
+    ok(row.get("barrier", {}).get("status", "").startswith("not analysed"), "barrier: a binary with barriers and no text is 'not analysed'")
     import json, tempfile as tf
     with tf.TemporaryDirectory() as t:
         js = os.path.join(t, "k.json")
