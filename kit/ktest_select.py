@@ -5,7 +5,13 @@ usage: ktest_select.py LIB.loom CASES.loom-test OUT.loom-test [ARCH]     (ARCH: 
 A case launches kernels of the generated library. On a gfx12 device (RDNA4) every launch of a kernel K that has a
 `K_rdna4` twin (dual_target.py's convention) goes to the twin; a case launching a gfx11-only kernel there (target(@rdna3)
 without a twin: it cannot be compiled for gfx12) is skipped, so one test file covers both architectures. On gfx11
-(or LOOM_RDNA4=0) the cases are launched as written. A case whose kernel is not in this build is skipped in both."""
+(or LOOM_RDNA4=0) the cases are launched as written. A case whose kernel is not in this build is skipped in both.
+
+       ktest_select.py changed BGATE.json      (common/ktest.sh KTEST_CHANGED)
+prints the kernels common/binary_gate.py's rows (--json; common/cand_lint.py writes PKG.lint/bgate.json) report CHANGED or NEW,
+comma-separated (empty: nothing changed), for a selected generation (make_kernel_tests.py KTEST_KERNELS: by_kernels). Exit 1 with
+the reason when the changed set is unknown (an unreadable file, a row the gate could not judge: ERROR, an unknown verdict): the
+caller then runs the full suite, never zero cases."""
 import os
 import re
 import sys
@@ -57,6 +63,55 @@ def _base(k, defined):
     return k[:-len(dual_target.SUFFIX)] if k.endswith(dual_target.SUFFIX) and k[:-len(dual_target.SUFFIX)] in defined else k
 
 
+LAUNCH = re.compile(r'kernel\.launch @([\w.]+)')
+CASE = re.compile(r'check\.case public @(\w+)')
+# The smoke set of a selected generation: whichever of these the generator emits for the model (embed and head_argmax always;
+# attention_chain for an attention model, gdn_chain for a hybrid). They are the generator's end-to-end chains through the model's
+# entry, a layer of each kind and its exit, each launching several kernels in the served order: a change outside the kernels
+# binary_gate reports (a shared case helper, the generator's own plumbing) still meets a case.
+SMOKE = ("embed", "attention_chain", "gdn_chain", "head_argmax")
+GATE_VERDICTS = {"same", "text-only", "CHANGED", "NEW", "MISSING"}     # binary_gate.judge's verdicts but ERROR
+
+
+def launches(case):
+    """the kernels a case launches; a kt_K copy counts as K (the kernel it tests)"""
+    return {k[3:] if k.startswith("kt_") else k for k in LAUNCH.findall(case)}
+
+
+def by_kernels(cases, kernels, smoke=SMOKE):
+    """(text, kept case names, kept smoke names): the cases of CASES (a cases.loom-test text) that launch one of KERNELS, or are named
+    in SMOKE; non-case blocks (helper kernel definitions) are kept. Selection is by the launched kernel, never by the case name: the
+    names do not say which kernel they test (11-25: flash2's cases are 'flash_*', 'stale_kv_*', 'nob3_*', 'flataddr_*')."""
+    kernels = set(kernels)
+    keep, names, sm = [], [], []
+    for b in re.split(r'(?m)^(?=check\.case )', cases):
+        m = CASE.match(b)
+        if not m:
+            keep.append(b)
+            continue
+        if launches(b) & kernels or m.group(1) in smoke:
+            keep.append(b)
+            names.append(m.group(1))
+            if m.group(1) in smoke:
+                sm.append(m.group(1))
+    return "".join(keep), names, sm
+
+
+def changed_kernels(path):
+    """the kernels binary_gate's rows (a --json file) report CHANGED or NEW; ValueError when the changed set is unknown"""
+    import json
+    try:
+        rows = json.load(open(path))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"cannot read {path}: {e}")
+    if not isinstance(rows, list) or not rows or not all(isinstance(r, dict) and "kernel" in r and "verdict" in r for r in rows):
+        raise ValueError(f"{path}: not binary_gate rows")
+    bad = [f"{r['kernel']} {r['verdict']}" for r in rows if r["verdict"] not in GATE_VERDICTS]
+    if bad:
+        raise ValueError(f"{path}: rows the gate could not judge: {', '.join(bad[:5])}")
+    return sorted(r["kernel"] for r in rows if r["verdict"] in ("CHANGED", "NEW"))
+
+
 # Launched kernels hrx-loom 0.2.0's loom-test cannot run as a case root (loom-kb topic sdk, "kernel tests"): reported apart.
 UNTESTABLE = {
     r"_listed$": "indirect dispatch (the launch config reads its count from a buffer)",
@@ -76,11 +131,17 @@ def coverage(lib, selected):
     for d in re.split(r'(?m)^(?=\S+\.(?:def|decl) )', lib):
         if d.startswith(("command.def", "template.def", "func.def")):
             launched |= {_base(k, defined) for k in re.findall(r'kernel\.launch @([\w.]+)', d)}
-    tested = {_base(k[3:] if k.startswith("kt_") else k, defined) for k in re.findall(r'kernel\.launch @([\w.]+)', selected)}   # kt_K: a copy of K
+    tested = {_base(k, defined) for k in launches(selected)}   # kt_K: a copy of K
     return sorted(launched), sorted(launched - tested)
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["changed"] and len(sys.argv) == 3:
+        try:
+            print(",".join(changed_kernels(sys.argv[2])))
+        except ValueError as e:
+            sys.exit(f"ktest_select: changed set unknown: {e}")
+        sys.exit(0)
     if len(sys.argv) < 4:
         sys.exit(__doc__)
     arch = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("DEVICE_ARCH", "")
