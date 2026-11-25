@@ -25,9 +25,11 @@ Header contract (lines of the leading comment block, after a shebang):
   # predict: <metric> <lo>-<hi>          e.g. 'decode ratio 0.97-0.99' (also lo..hi, lo to hi); lo <= hi
   # kill: <condition>                    what result stops the lever (free text)
   # budget: <minutes>                    the step's time budget, > 0 (an optional 'min' after the number)
-  # bound: PART [now] X (limit Y; best engine Z | none measured), best case B of the request (amdahl.py), resolved by M (floor F)
+  # bound: PART [now] X (limit Y; best engine Z | none measured), best case B % of the request (amdahl.py ...), resolved by M (floor F %)
                                        exactly one: the lever's price (rules section 2, 'Price the lever'; HRX-like E536 / E538);
-                                       a diagnosis or tool step: '# bound: n/a (diagnosis)'. Anything else is refused.
+                                       a diagnosis or tool step: '# bound: n/a (diagnosis)'. Anything else is refused. B may be a
+                                       range lo-hi (judged by hi); B and F in %; the source starts with an amdahl.py command or
+                                       its saved output path; B below F is refused (name the finer measurement that decides).
   # compiler: KERNEL_REGEX METRIC FROM -> TO [(note)]   optional, one per predicted static delta in the built package: the regex
                                        compiles, METRIC is a kernel_lint table column (COMPILER_METRICS), FROM / TO numbers
   # result: <regex>                      optional: one capture group, the result figure (the last match in the result file wins)
@@ -47,9 +49,11 @@ Subcommands and verdict lines (exit 0 ok, 1 refused / outside / owed, 2 usage or
                                                                       compiler lines (if any) well formed
   compiler-check STEP BUILT BASE   COMPILER: OK | ABSENT            each '# compiler:' line against kernel_lint's table (its stdout,
                             saved; or a directory holding exactly one such file) of the built package and of the base: every kernel
-                            the regex fully matches, present in both tables, must read FROM in BASE and TO in BUILT within the
-                            metric's tolerance (exact for vgpr, waves, scratch, in_flight, selects; 2 % otherwise) and have moved
-                            from BASE by at least half the predicted delta, in its direction (FROM == TO: unchanged within it). A regex matching no kernel, a kernel in one table only, a '-' value, a table with
+                            the regex fully matches, present in both tables, must read FROM in BASE and TO in BUILT: exact for
+                            vgpr, waves, scratch, in_flight, selects; otherwise BASE within the band of FROM, BUILT within half the
+                            predicted delta of TO, having moved at least half of it in its direction (built == FROM is ABSENT); FROM == TO: both within an
+                            absolute band (counts 2, per-MMA ratios 0.05). Every alternative of every '|' and every capturing
+                            group must match a kernel present in both tables (a claimed branch nothing checks: ABSENT). A regex matching no kernel, a kernel in one table only, a '-' value, a table with
                             a kernel twice (two builds mixed) or without kernel_lint's header: ABSENT / error. Recurrence: E520's
                             three-lever flash2 build lost the V-tile prefetch (cover 58 -> 23) while its loop count moved as
                             predicted; the delta a hypothesis predicts is checked before any GPU minute (E110, E230, E318).
@@ -75,10 +79,15 @@ PREDICT = re.compile(r"^#\s*predict:\s*(?P<metric>.*?\S)\s+(?P<lo>" + NUM + r")\
 KILL = re.compile(r"^#\s*kill:\s*\S")
 BUDGET = re.compile(r"^#\s*budget:\s*(" + NUM + r")\s*(?:min|minutes)?(?:\s*\(.*\))?\s*$")
 TARGET = re.compile(r"^[\w.:+/-]+$")
+UNUM = r"\d+(?:\.\d+)?"
 BOUND = re.compile(r"^#\s*bound:\s*(?P<part>\S.*?)\s+(?:now\s+)?(?P<now>" + NUM + r")\s*[^\s(),;]*\s*"
                    r"\(limit\s+(?P<limit>" + NUM + r")[^;()]*;\s*best engine\s+(?P<engine>[^()]*?\S)\s*\)\s*,\s*"
-                   r"best case\s+(?P<best>" + NUM + r")\s*%?[^()]*?\s+of the request\s*\((?P<tool>[^()]*amdahl\.py[^()]*)\)\s*,\s*"
-                   r"resolved by\s+(?P<by>[^()]*?\S)\s*\(floor\s+(?P<floor>" + NUM + r")[^()]*\)\s*$")
+                   r"best case\s+(?P<best>" + UNUM + r")(?:\s*-\s*(?P<best_hi>" + UNUM + r"))?\s*%\s+of the request\s*"
+                   r"\((?P<tool>[^()]*)\)\s*,\s*"
+                   r"resolved by\s+(?P<by>[^()]*?\S)\s*\(floor\s+(?P<floor>" + UNUM + r")\s*%(?:[\s,;][^()]*)?\)\s*$")
+# the source of the best case: amdahl.py run (its command, e.g. 'amdahl.py', 'common/amdahl.py --device cap85w') or its saved
+# output (a path whose file name starts with 'amdahl'); text that merely names it ('not amdahl.py') is refused (review C16 F5)
+BOUND_TOOL = re.compile(r"^(?:\S*/)?amdahl\.py(?:\s.*)?$|^\S*/amdahl[\w.-]*\.(?:txt|json|md|log)(?:\s.*)?$")
 BOUND_NA = re.compile(r"^#\s*bound:\s*n/a \(diagnosis\)\s*$")
 COMPILER = re.compile(r"^#\s*compiler:\s*(?P<rx>\S+)\s+(?P<metric>\S+)\s+(?P<frm>" + NUM + r")\s*->\s*(?P<to>" + NUM +
                       r")\s*(?:\([^()]*\))?\s*$")
@@ -86,10 +95,13 @@ COMPILER = re.compile(r"^#\s*compiler:\s*(?P<rx>\S+)\s+(?P<metric>\S+)\s+(?P<frm
 COMPILER_METRICS = {"loop_instructions": "loop", "common_path": "comm", "non_mma_per_mma": "other/op", "selects": "sel",
                     "scratch": "scr", "moves": "mov", "move_run": "run", "vgpr": "vgpr", "waves": "w/S", "load_cover": "cov",
                     "in_flight": "fly", "lds_waits_per_mma": "ldsW"}
-# tolerance (share of the predicted value): exact for counts where one unit is the effect (registers, waves, spills, loads in
-# flight, selects); 2 % for counts a scheduler moves by a few instructions between builds
-COMPILER_TOL = {m: 0.0 for m in ("vgpr", "waves", "scratch", "in_flight", "selects")}
-COMPILER_TOL.update({m: 0.02 for m in COMPILER_METRICS if m not in COMPILER_TOL})
+# exact metrics: one unit is the effect (registers, waves, spills, loads in flight, selects): base == FROM and built == TO.
+# Other metrics (review C16 F6): a predicted change FROM -> TO passes when base reads FROM within the absolute band, built within
+# |TO - FROM| / 2 of TO, and built - base moved at least half the delta in its direction; a predicted 'unchanged' (FROM == TO)
+# passes when both read within the band of FROM. Band: instruction counts 2, per-MMA ratios 0.05 (FROM is a base-table reading).
+COMPILER_EXACT = {"vgpr", "waves", "scratch", "in_flight", "selects"}
+COMPILER_BAND = {m: (0.0 if m in COMPILER_EXACT else 0.05 if m in ("non_mma_per_mma", "lds_waits_per_mma") else 2.0)
+                 for m in COMPILER_METRICS}
 END = r"(?=[;|()`]|\.(?:\s|$)|$)"
 ARCHIVE = re.compile(r"^Archive:\s*(\S+)\s*$")
 
@@ -244,10 +256,26 @@ def preflight(step, log, exclude=frozenset(), exclude_note=None, grandfather=Non
 
 
 def card(step):
-    """(fields, problems) of the probe-card lines: predict (metric, lo, hi), kill, budget minutes, result regex, result file"""
+    """(fields, problems) of the probe-card lines: predict (metric, lo, hi), kill, budget minutes, bound, compiler, result regex,
+    result file"""
+    f, tagged = card_tagged(step)
+    return f, [m for _, m in tagged]
+
+
+class _Tagged(list):
+    """problems tagged with the header key they belong to (review C16 F7: callers filter by key, never by message text)"""
+    key = None
+
+    def append(self, msg):
+        super().append((self.key, msg))
+
+
+def card_tagged(step):
+    """(fields, [(key, problem)]): card() with each problem tagged by its header key"""
     hd = header(open(step).read())
-    f, probs = {}, []
+    f, probs = {}, _Tagged()
     for key, rx in (("predict", PREDICT), ("kill", KILL), ("budget", BUDGET)):
+        probs.key = key
         ls = [l for l in hd if re.match(r"^#\s*" + key + r":", l)]
         if len(ls) != 1:
             probs.append(f"{len(ls)} '# {key}:' lines (need exactly one)")
@@ -266,6 +294,7 @@ def card(step):
             f["budget"] = float(m.group(1))
         else:
             f["kill"] = ls[0].split(":", 1)[1].strip()
+    probs.key = "bound"
     ls = [l for l in hd if re.match(r"^#\s*bound:", l)]
     if len(ls) != 1:
         probs.append(f"{len(ls)} '# bound:' lines (need exactly one: '# bound: PART now X (limit Y; best engine Z | none measured), "
@@ -273,9 +302,20 @@ def card(step):
     elif BOUND_NA.match(ls[0]):
         f["bound"] = None
     elif BOUND.match(ls[0]):
-        f["bound"] = BOUND.match(ls[0]).groupdict()
+        b = f["bound"] = BOUND.match(ls[0]).groupdict()
+        lo, hi = float(b["best"]), float(b["best_hi"] or b["best"])
+        if not BOUND_TOOL.match(b["tool"].strip()):
+            probs.append(f"'# bound:' best case source {b['tool']!r} is not an amdahl.py run or its saved output "
+                         "('amdahl.py ...', 'common/amdahl.py ...', '<dir>/amdahl-....txt')")
+        elif lo > hi:
+            probs.append(f"'# bound:' best case range {lo:g}-{hi:g} % runs backwards")
+        elif hi < float(b["floor"]):
+            probs.append(f"'# bound:' best case {hi:g} % is below the floor {float(b['floor']):g} % of '{b['by']}': a lever below "
+                         "every measurement's floor is not built; name the finer measurement that decides (floor at or below the "
+                         "best case) in 'resolved by' (rules section 2, 'Price the lever'; HRX-like E536)")
     else:
         probs.append(f"'# bound:' line not in a known form: {ls[0]!r}")
+    probs.key = "compiler"
     f["compiler"] = []
     for l in (l for l in hd if re.match(r"^#\s*compiler:", l)):
         m = COMPILER.match(l)
@@ -293,18 +333,20 @@ def card(step):
             continue
         f["compiler"].append((l, rx, m.group("metric"), float(m.group("frm")), float(m.group("to"))))
     for key in ("result", "result-file"):
+        probs.key = key
         ls = [l.split(":", 1)[1].strip() for l in hd if re.match(r"^#\s*" + key + r":", l)]
         if len(ls) > 1:
             probs.append(f"{len(ls)} '# {key}:' lines (at most one)")
         elif ls:
             f[key] = ls[0]
+    probs.key = "result"
     if "result" in f:
         try:
             if re.compile(f["result"]).groups != 1:
                 probs.append(f"result regex needs exactly one capture group: {f['result']!r}")
         except re.error as e:
             probs.append(f"result regex does not compile ({e}): {f['result']!r}")
-    return f, probs
+    return f, list(probs)
 
 
 # a timed or judged GPU measurement (HRX-like E508: q201's `events_ab.sh ... && events_summary.py ...; sed` skipped its judgement when
@@ -327,8 +369,9 @@ def chains(text):
 
 def verdict(step, result=None):
     """(line, exit code, detail lines)"""
-    f, probs = card(step)
-    probs = [p for p in probs if "'# bound:'" not in p and "'# compiler:'" not in p]   # admission lines: probe-card check's job
+    f, tagged = card_tagged(step)
+    # bound and compiler are admission lines (probe-card check's job, before the run): the verdict judges the rest, by key
+    probs = [m for k, m in tagged if k in ("predict", "kill", "budget", "result", "result-file")]
     if "predict" not in f or probs:
         return "VERDICT: ERROR", 2, ["probe card not valid: " + "; ".join(probs or ["no predict line"])]
     metric, lo, hi = f["predict"]
@@ -419,21 +462,72 @@ def lint_table(path):
     return rows
 
 
+def alternatives(pat):
+    """[(label, variant)]: for each alternation (top level or inside any group), one variant of PAT per alternative, keeping that
+    alternative alone; a variant that fully matches no kernel is a branch the line claims and nothing checks (review C16 F6 h3)"""
+    groups, stack, bars, i = [], [(0, [])], [], 0
+    while i < len(pat):
+        c = pat[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[":
+            j = i + 1
+            if j < len(pat) and pat[j] == "^":
+                j += 1
+            if j < len(pat) and pat[j] == "]":
+                j += 1
+            while j < len(pat) and pat[j] != "]":
+                j += 2 if pat[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == "(":
+            m = re.match(r"\((?:\?(?::|P<\w+>|<\w+>|[=!]|<[=!]|[aiLmsux-]+:))?", pat[i:])
+            stack.append((i + m.end(), []))
+            i += m.end()
+            continue
+        if c == ")" and len(stack) > 1:
+            start, bs = stack.pop()
+            groups.append((start, i, bs))
+        elif c == "|":
+            stack[-1][1].append(i)
+        i += 1
+    groups.append((0, len(pat), stack[0][1]))
+    out = []
+    for start, end, bs in groups:
+        if not bs:
+            continue
+        cuts = [start - 1] + bs + [end]
+        for a, b in zip(cuts, cuts[1:]):
+            alt = pat[a + 1:b]
+            out.append((alt or "(empty)", pat[:start] + alt + pat[end:]))
+    return out
+
+
 def compiler_check(step, built, base):
-    """(lines, problems): each '# compiler:' line against the built and base kernel_lint tables"""
-    f, probs = card(step)
-    probs = [p for p in probs if "compiler:" in p]
+    """(lines, problems): each '# compiler:' line against the built and base kernel_lint tables (state table: the C16 hand-off,
+    r3 D)"""
+    f, tagged = card_tagged(step)
+    probs = [m for k, m in tagged if k == "compiler"]
     if not f["compiler"] and not probs:
         return ["no '# compiler:' lines: nothing predicted"], []
     tb, ta = lint_table(built), lint_table(base)
     out = []
     for line, rx, metric, frm, to in f["compiler"]:
-        col, tol = COMPILER_METRICS[metric], COMPILER_TOL[metric]
-        near = lambda v, x: abs(v - x) <= tol * abs(x)
+        col, band = COMPILER_METRICS[metric], COMPILER_BAND[metric]
+        if re.search(r"\\[1-9]|\(\?P=", rx.pattern):
+            probs.append(f"{line!r}: a back-reference in the regex (one line per kernel instead)")
+            continue
         names = sorted(k for k in set(tb) | set(ta) if rx.fullmatch(k))
         if not names:
             probs.append(f"{line!r}: the regex matches no kernel in either table")
             continue
+        for alt, variant in alternatives(rx.pattern):
+            if not any(re.fullmatch(variant, k) for k in names):
+                probs.append(f"{line!r}: the alternative {alt!r} matches no kernel")
+        for g in range(1, rx.groups + 1):
+            if all(rx.fullmatch(k).group(g) is None for k in names):
+                probs.append(f"{line!r}: group {g} of the regex takes part in no matched kernel (an optional part nothing checks)")
         for k in names:
             if k not in tb or k not in ta:
                 probs.append(f"{line!r}: {k} is in the {'base' if k in ta else 'built'} table only")
@@ -442,12 +536,19 @@ def compiler_check(step, built, base):
             if not isinstance(a, float) or not isinstance(b, float):
                 probs.append(f"{line!r}: {k} {col} has no value (base {a!r}, built {b!r})")
                 continue
-            moved = near(a, frm) and near(b, to) and (abs(b - a) <= tol * abs(frm) if frm == to else
-                                                       (b - a) * (to - frm) > 0 and abs(b - a) >= abs(to - frm) / 2)
+            d = to - frm
+            if frm == to:
+                moved, rule = abs(a - frm) <= band and abs(b - frm) <= band, f"both within {band:g} of {frm:g}"
+            elif metric in COMPILER_EXACT:
+                moved, rule = a == frm and b == to, "exact"
+            else:
+                h = abs(d) / 2
+                moved = abs(a - frm) <= band and abs(b - to) <= h and b != frm and (b - a) * d > 0 and abs(b - a) >= h
+                rule = f"base within {band:g} of FROM, built within {h:g} of TO, moved >= {h:g} in its direction"
             out.append(f"  {k} {metric}: base {a:g} built {b:g} (predicted {frm:g} -> {to:g}): {'ok' if moved else 'ABSENT'}")
             if not moved:
-                probs.append(f"{line!r}: {k} {metric} read {a:g} -> {b:g}, predicted {frm:g} -> {to:g} (within {100 * tol:g} %, at "
-                             "least half the delta in its direction): go back to source, not to a timing")
+                probs.append(f"{line!r}: {k} {metric} read {a:g} -> {b:g}, predicted {frm:g} -> {to:g} ({rule}): go back to "
+                             "source, not to a timing")
     return out, probs
 
 

@@ -150,7 +150,28 @@ def main():
                                (bl.replace("(amdahl.py)", "(estimate)"), False, "a source other than amdahl.py"),
                                (bl.replace(" (floor 0.5 %)", ""), False, "no floor"),
                                (bl.replace("limit 29.7 s; ", ""), False, "no limit"),
-                               (bl + "\n" + bl, False, "two bound lines")):
+                               (bl + "\n" + bl, False, "two bound lines"),
+                               # review C16 F5 (r3): the rule the line records, not only its form. Recurrence: HRX-like E536 (q205's
+                               # flash2 lever, 0.3-1.8 % of prefill, was queued against a 7 % bench floor; rules: 'not built')
+                               (bl.replace("1.2 %", "0.3-1.8 %"), True, "f3: a range, judged by its upper end 1.8 >= 0.5"),
+                               (bl.replace("1.2 %", "0.3-1.8 %").replace("floor 0.5 %", "floor 1.8 %"), True, "a range whose upper end is the floor"),
+                               (bl.replace("1.2 %", "0.3-1.8 %").replace("floor 0.5 %", "floor 2 %"), False, "a range wholly below the floor"),
+                               (bl.replace("1.2 %", "1.8-0.6 %"), False, "a range written backwards (both ends above the floor)"),
+                               (bl.replace("served lane ABBA (floor 0.5 %)", "agent bench (floor 7 %)").replace("1.2 %", "0.3 %"), False,
+                                "f4: E536's shape, best 0.3 % below the deciding bench's 7 % floor"),
+                               (bl.replace("1.2 %", "0.5 %"), True, "best case equal to the floor"),
+                               (bl.replace("1.2 %", "0.4 %"), False, "best case just below the floor"),
+                               (bl.replace("(amdahl.py)", "(not amdahl.py)"), False, "f6: '(not amdahl.py)' names the tool, never ran it"),
+                               (bl.replace("(amdahl.py)", "(estimated, cf. amdahl.py)"), False, "amdahl.py named after other text"),
+                               (bl.replace("(amdahl.py)", "(common/amdahl.py --device cap85w W/x/events.json)"), True, "an amdahl.py command line"),
+                               (bl.replace("(amdahl.py)", "(W/static-1125/q205/amdahl-flash2.txt)"), True, "a saved amdahl output path"),
+                               (bl.replace("(amdahl.py)", "(W/static-1125/q205/guess.txt)"), False, "an output path not amdahl's"),
+                               (bl.replace(" of the request", ""), False, "V17: no 'of the request'"),
+                               (bl.replace("1.2 % of the request", "1.2 % of flash2"), False, "V17: a share of the part, not of the request"),
+                               (bl.replace("1.2 %", "1.2"), False, "a best case without %"),
+                               (bl.replace("floor 0.5 %", "floor 0.5"), False, "a floor without % (cannot be compared)"),
+                               (bl.replace("floor 0.5 %", "floor 0.5 % decode"), True, "a floor with a note after the %"),
+                               (bl + " and more", False, "text after the floor's paren")):
             p = w("q217.sh", CARD.replace(bl, alt))
             rc, out = cli("probe-card", "check", p)
             case(f"bound {what}: {'OK' if ok_ else 'MISSING'} ({out.strip()[:70]})", (rc == 0) == ok_)
@@ -163,7 +184,9 @@ def main():
                                (cl.replace("loop_instructions", "s_barrier"), False, "s_barrier (not in kernel_lint's table)"),
                                (cl.replace("g_attention_flash2_f16o", "g_attention_flash2_(f16o"), False, "a regex that does not compile"),
                                (cl.replace(" -> 903", " 903"), False, "no arrow"),
-                               (cl.replace("952 -> 903", "952 -> fewer"), False, "a word for a number")):
+                               (cl.replace("952 -> 903", "952 -> fewer"), False, "a word for a number"),
+                               (cl + " junk", False, "V18: trailing text after TO"),
+                               (cl + " (note) junk", False, "V18: trailing text after the note")):
             p = w("q218.sh", CARD.replace("# result:", alt + "\n# result:"))
             rc, out = cli("probe-card", "check", p)
             case(f"compiler {what}: {'OK' if ok_ else 'MISSING'} ({out.strip()[:70]})", (rc == 0) == ok_)
@@ -208,8 +231,55 @@ def main():
         case("compiler-check, 952 -> 945 predicted, 952 -> 958 read (both inside their bands, moved the other way): refused", rc == 1)
         rc, out = pair(940, 960, "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 952", 2)
         case("compiler-check, unchanged predicted, 960 -> 940 read (each inside 952's band, moved 20 > 19): refused", rc == 1)
-        rc, out = pair(950, 955, "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 952", 3)
-        case("compiler-check, unchanged predicted, 955 -> 950 read: OK", rc == 0)
+        rc, out = pair(950, 954, "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 952", 3)
+        case("compiler-check, unchanged predicted, 954 -> 950 read (both within 2 of 952): OK", rc == 0)
+        # review C16 F6 (r3): h1-h4 and the band edges. Recurrence: the 2 % band was relative to the value, so any delta under ~4 %
+        # of the count passed at half its size, and 'unchanged' passed a 1.9 % move (E520's whole lever was 49 instructions, 5 %)
+        for b_, a_, line, ok_, what in (
+                (936, 952, "952 -> 920", True, "h1: half the predicted delta moved (936 = 920 + 16, the band edge): ok by the >= half rule"),
+                (937, 952, "952 -> 920", False, "15 of 32 moved (under half)"),
+                (1677, 1700, "1677 -> 1660", False, "h2: built reads FROM, base 1700 not FROM: ABSENT"),
+                (952, 952, "952 -> 920", False, "built == FROM == base: ABSENT"),
+                (934, 952, "952 -> 952", False, "h4: 'unchanged' predicted, 952 -> 934 read (1.9 %)"),
+                (955, 952, "952 -> 952", False, "'unchanged', built 3 off (band 2)"),
+                (921, 954, "952 -> 920", True, "base 2 off FROM (the band edge), built 1 off TO"),
+                (920, 955, "952 -> 920", False, "base 3 off FROM (band 2)"),
+                (900, 952, "952 -> 920", False, "an overshoot: 52 moved for 32 predicted (built 20 past TO, half-delta band 16)"),
+                (936, 950, "952 -> 920", False, "base 2 toward TO, built at TO's band edge: 14 moved, under half of 32"),
+                (953, 954, "952 -> 954", False, "a small delta (+2) read backwards: base 954, built 953 (each inside its band)")):
+            rc, out = pair(b_, a_, "# compiler: g_attention_flash2_f16o loop_instructions " + line, 4)
+            case(f"compiler-check, {what}: {'OK' if ok_ else 'refused'} ({out.strip().splitlines()[-1]})", (rc == 0) == ok_)
+        # V13: the regex must fully match a kernel name ('flash2_f16' is a prefix of a real kernel: search would match it)
+        rc, out = cli("compiler-check", w("q240.sh", CARD.replace("# result:", "# compiler: g_attention_flash2_f16 loop_instructions 952 -> 903\n# result:")), cmb2, base)
+        case(f"compiler-check V13: a prefix of a kernel name matches nothing (full match): refused ({out.strip()[-50:]})", rc == 1 and "matches no kernel" in out)
+        # review C16 F6 h3: an alternation branch matching no kernel (claimed, never checked); an optional group likewise
+        for line, ok_, what in (
+                ("g_attention_flash2(_f16o|_nope_f16o) loop_instructions 952 -> 903", False, "h3: alternative '_nope_f16o' matches no kernel"),
+                ("g_attention_flash2_(?:f16o|nope) loop_instructions 952 -> 903", False, "a non-capturing alternation with a dead branch"),
+                ("g_attention_flash2_f16o|g_attention_flash2_nope loop_instructions 952 -> 903", False, "a top-level dead alternative"),
+                ("g_attention_flash2(_nope)?_f16o loop_instructions 952 -> 903", False, "an optional group no kernel takes"),
+                ("g_attention_flash2(_partial)?_f16o vgpr 240 -> 237", False, "both branches checked: partial's vgpr 252 is not FROM"),
+                ("g_attention_flash2_(f16o)\\1? loop_instructions 952 -> 903", False, "a back-reference"),
+                ("g_attention_flash2_[f|x]16o loop_instructions 952 -> 903", True, "a '|' inside a character class is not an alternation"),
+                ("g_attention_flash2_f16o|g_attention_flash2_partial_f16o selects 113 -> 113", True, "two live alternatives, both checked")):
+            rc, out = cli("compiler-check", w("q241.sh", CARD.replace("# result:", "# compiler: " + line + "\n# result:")), cmb2, base)
+            case(f"compiler-check, {what}: {'OK' if ok_ else 'refused'} ({out.strip().splitlines()[-2][-70:] if not ok_ else out.strip()[-12:]})", (rc == 0) == ok_)
+        # V14: kernel-level rows (no loop) are read like loop rows
+        krow = "g_rmsnorm_f16                                kernel   120   120    0      0.0    4   0    0    0   10    4   48  16    -     -     0     0    0   0     0        -\n"
+        rc, out = cli("compiler-check", w("q242.sh", CARD.replace("# result:", "# compiler: g_rmsnorm_f16 vgpr 48 -> 40\n# result:")),
+                      w("lint-kb.txt", LINT_CMB2 + krow.replace("   48  16", "   40  16")), w("lint-ka.txt", LINT_BASE + krow))
+        case(f"compiler-check V14: a kernel-level row (where = kernel) is read: OK ({out.strip()[-14:]})", rc == 0)
+        # V16: compiler-check judges the compiler lines whatever the bound line says (a malformed bound is probe-card's refusal)
+        nb = CARD.replace(bl, "# bound: flash2 is slow").replace("# result:", cl + "\n# result:")
+        rc, out = cli("compiler-check", w("q243.sh", nb), cmb2, base)
+        case(f"compiler-check V16: a malformed bound line does not stop the check: OK ({out.strip()[-14:]})", rc == 0 and "base 952 built 903" in out)
+        # F7 / V15: verdict filters problems by field, not by message text
+        rc, out = cli("verdict", w("q244.sh", CARD.replace("# budget: 45 min", "# budget: soon '# bound:'")), "0.98")
+        case(f"verdict F7 g2: a malformed budget line quoting '# bound:' still errors ({out.strip()[:40]})", rc == 2 and "VERDICT: ERROR" in out)
+        rc, out = cli("verdict", w("q245.sh", CARD.replace("# result:", "# compiler: g_x valu_per_tile 1 -> 2\n# result:")), "0.98")
+        case(f"verdict V15: a malformed compiler line (an admission line) does not stop the verdict: INSIDE ({out.strip()[:30]})", rc == 0)
+        rc, out = cli("verdict", w("q246.sh", CARD.replace(bl, bl.replace("1.2 %", "0.1 %"))), "0.98")
+        case(f"verdict: a bound below its floor (an admission problem) does not stop the verdict: INSIDE ({out.strip()[:30]})", rc == 0)
         rc, out = cli("verdict", w("q227.sh", "".join(l + "\n" for l in CARD.split("\n") if not l.startswith("# bound:"))), "0.98")
         case(f"verdict does not need the bound line (an admission line, checked before the run): INSIDE ({out.strip()[:40]})", rc == 0)
         only = w("lint-only.txt", LINT_CMB2.split("g_attention_flash2_partial")[0])
