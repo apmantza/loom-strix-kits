@@ -557,7 +557,7 @@ def loom_cands():
     ok(c and (c["report"], c["whole"]) == ((4, 5), (4, 6)) and "bound" not in c["line"],
        f"tier: live m256 GEMM report 4 -> 5, whole workgroups 4 -> 6 (T1b) ({c and c['line']})")
     c = one(kl.loom_candidates("g_mv_q4_k_k17408_t16_q8_r32", [], [], rep("mv_q4_k_k17408_t16_r32_e480_residency.json"))[0], "tier")
-    ok(c and (c["report"], c["whole"]) == ((7, 8), (5, 9)) and "bound" in c["line"],
+    ok(c and (c["report"], c["whole"]) == ((7, 8), (5, 9)) and "bound: placement undocumented" in c["line"],
        f"tier: a 544-lane matvec (17 waves) report 7 -> 8, whole workgroups 5 -> 9, marked bound (T1c) ({c and c['line']})")
     cs, skip = kl.loom_candidates("g_gemm_f16_swiglu_m256", [], [], rep("gemm_f16_swiglu_m256_e480_residency.json"))
     ok(cs == [] and skip == [], f"tier: the swiglu m256 GEMM's report 4 -> 6 agrees: no candidate (N1) ({kinds(cs)}, {skip})")
@@ -609,10 +609,10 @@ def loom_cands():
     chain = [mv(0)] + [f"v_mov_b32_e32 v{100 + k}, v{99 + k}" for k in range(1, 20)]
     c = edge(chain)
     ok(c is None, f"vopd-edge: a sequentialized copy chain (each move reads the previous one's destination): no pair (N5c) ({c})")
-    war = sum(([f"v_mov_b32_e32 v{100 + 2 * k}, v{1 + 2 * k}", f"v_mov_b32_e32 v{1 + 2 * k}, v{51 + 2 * k}"] for k in range(10)), [])
-    c = edge(war)
-    ok(c is None, f"vopd-edge: the second move overwrites the first's source (the first reads the other's destination): no pair, "
-       f"order constraint (N5c) ({c})")
+    rot = ["v_mov_b32_e32 v99, v100"] + [f"v_mov_b32_e32 v{100 + k}, v{101 + k}" for k in range(20)]
+    c = edge(rot)
+    ok(c is None, f"vopd-edge: a rotation sequentialized through a temporary (each move overwrites the previous one's source, so the "
+       f"first half reads the other's destination; parities would pair): no pair, order constraint (N5c) ({c})")
     dual = [f"v_dual_mov_b32 v{100 + 2 * k}, v{1 + 2 * k} :: v_dual_mov_b32 v{101 + 2 * k}, v{2 + 2 * k}" for k in range(10)]
     c = edge(dual)
     ok(c is None, f"vopd-edge: copies already paired: none (N5d) ({c})")
@@ -631,12 +631,29 @@ def loom_cands():
     same = kl.sdk_diff({"k": g2}, {"k": dict(g2)}, pb, pa)
     ok(not [x for x in same if x.startswith("loomcand sdk k:")], f"sdk: equal shapes: no candidate (N6) ({same})")
     for what, a_, b_ in (("programs differ", prov("0.3.0", "/v030/bin/loom-compile", "b" * 64), pa),
-                         ("provenance missing", pb, None), ("one compiler", pa, dict(pa))):
+                         ("provenance missing", pb, None), ("one compiler", pa, dict(pa)), ("roots differ", dict(pb, roots="^g_gemm"), pa),
+                         ("target differs", dict(pb, target="amdgpu:gfx1201"), pa)):
         got = kl.sdk_diff({"g_gemm_f16_store_m256": g3}, {"g_gemm_f16_store_m256": g2}, a_, b_)
         ok(len(got) == 1 and got[0].startswith("loomcand sdk: not attributable"), f"sdk: {what}: not attributable, no per-kernel line (N6) ({got})")
     got = kl.sdk_diff({"a": g3, "new": g3}, {"a": g3, "old": g2}, pb, pa)
     ok(sorted(x.split(":")[0] for x in got if x.startswith("loomcand sdk ")) == ["loomcand sdk new", "loomcand sdk old"],
        f"sdk: a kernel compiled by one side only is a line ({got})")
+    tagged = dict(g3, flags=g3["flags"] + ["regress:loop209->249"], notes=g3.get("notes", []) + ["loom:residency_cliff", "outlier"])
+    got = kl.sdk_diff({"g": tagged}, {"g": g3}, pb, pa)
+    ok(not [x for x in got if x.startswith("loomcand sdk g:")], f"sdk: --baseline's regress flags, Loom's suggest notes and peer notes "
+       f"(outlier) are not shapes of the code ({got})")
+    w6, w8 = dict(g3, waves=6), dict(g3, waves=8)
+    got = kl.sdk_diff({"g": w8}, {"g": w6}, pb, pa)
+    ok(any("better waves6->8" in x for x in got) and not any(" worse " in x for x in got),
+       f"sdk: a kernel that gained waves reads 'better waves6->8' in the base -> candidate direction ({got})")
+    d = tempfile.mkdtemp(prefix="kl_prov.")
+    open(os.path.join(d, "loom-provenance"), "w").write("{}")
+    try:
+        kl.compile_programs([os.path.join(d, "missing.loom")], d, 1, lc="/bin/false")
+    except OSError:
+        pass
+    ok(not os.path.exists(os.path.join(d, "loom-provenance")), "provenance: a compile that dies half-way leaves none (no differential "
+       "on mixed objects)")
     # ---- N7: candidates never reach flags or notes (cand_lint calls lint_listing / lint)
     ok("loomcand" not in g2 and "loomcand" not in g3, "isolation: lint_listing rows carry no candidates (N7)")
 

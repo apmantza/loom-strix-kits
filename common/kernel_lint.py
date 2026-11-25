@@ -1137,13 +1137,12 @@ def loom_candidates(name, ins, addr, rep):
                                     + (f" ({red})" if red else "") + f"; whole workgroups ({occ['wg']} lanes = {w} waves, "
                                     f"{st['q']} per SIMD{', bound: placement undocumented' if st['bound'] else ''}): {ours}; "
                                     f"contradicts {LOOM_TIER_DOC}"})
-    groups, seen = [], set()
-    for t, e in loops(ins, addr):
+    groups = []
+    for t, e in loops(ins, addr):                  # each backward branch has its own edge group (one per branch, never shared)
         body = ins[t:e + 1]
         bb = backedge_block(body)
-        if not bb or (t + bb[0], t + bb[1]) in seen:
+        if not bb:
             continue
-        seen.add((t + bb[0], t + bb[1]))
         pairs = vopd_pairs(body, *bb)[0]
         if pairs >= EDGE_PAIRS_MIN:
             groups.append((sum(copy_moves(x) for x in body[bb[0]:bb[1] + 1]), pairs, t + bb[0]))
@@ -2051,7 +2050,9 @@ def main():
     if not files:
         sys.exit("kernel_lint: no code objects")
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
-        rows = [r for rs in ex.map(lambda f: lint_file(f, rga), files) for r in rs]
+        per_file = list(ex.map(lambda f: lint_file(f, rga), files))
+    rows = [r for rs in per_file for r in rs]
+    single = {id(rs[0]): f for f, rs in zip(files, per_file) if len(rs) == 1}    # a one-kernel object: its report is f's .json
     outl = outliers(rows)
     tiny(rows, stats)
     rounds(rows, texts)
@@ -2069,15 +2070,15 @@ def main():
                 r["flags"] += ["regress:" + x for x in regressions(r, base_rows[r["kernel"]])]
     cand_lines, cand_skip = [], collections.Counter()
     if a.loom_candidates:
-        def cands(f):
+        def cands(f, name=None):
             js = f[:-6] + ".json"
-            rep = json.load(open(js)) if os.path.exists(js) else None
-            return loom_candidates(os.path.basename(f)[:-6], *disasm(f), rep)
-        loom_files = [f for f in files if f.endswith(".hsaco")]          # one Loom kernel per object, named by the file (lint())
+            rep = json.load(open(js)) if f.endswith(".hsaco") and os.path.exists(js) else None
+            return loom_candidates(name or os.path.basename(f)[:-6], *disasm(f), rep)
         with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
-            got = dict(zip([os.path.basename(f)[:-6] for f in loom_files], ex.map(cands, loom_files)))
+            got = dict(ex.map(lambda r: (id(r), cands(single[id(r)], r["kernel"]) if id(r) in single
+                                         else ([], ["a kernel of a multi-kernel object (no report)"])), rows))
         for r in rows:
-            cs, sk = got.get(r["kernel"], ([], ["not a Loom kernel object"]))
+            cs, sk = got[id(r)]
             r["loomcand"] = cs
             cand_lines += [c["line"] for c in cs]
             cand_skip.update(sk)
