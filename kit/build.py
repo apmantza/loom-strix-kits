@@ -990,6 +990,13 @@ json.dump(card, open(os.path.join(pkg, "model.json"), "w"), indent=1)
 bench = {k: v for k, v in cfg.items() if k != "tensors"}
 bench["model_id"] = card["model"]["id"]
 bench["draft"] = DRAFT
+# A drafter given by DRAFTER / --drafter that is not cfg.json's drafter: the cfg record (repo, file, tuned table) describes
+# another file, and readers of llm_config.json (make_kernel_tests.py) would look for it (HRX-like q199: RedHat's DFlash2 drafter
+# served while the record named z-lab's). Record the file served and drop the other drafter's tuning.
+_cd = (cfg.get("drafter") or {}).get("gguf")
+if DRAFT and DRAFT.get("gguf") and _cd and os.path.basename(_cd) != os.path.basename(DRAFT["gguf"]):
+    bench["drafter"] = {"gguf": DRAFT["gguf"], "kind": DRAFT["kind"], "depth": DRAFT["depth"],
+                        "override": f"DRAFTER / --drafter replaced cfg.json's {os.path.basename(_cd)}: depth from its tuning, the table not carried"}
 # What generated the programs (kit_source.py): the loom-skills commit of this kit and the Loom SDK. The model card
 # shows them; a kit made by apply_example.sh carries the commit in KIT_SOURCE.
 from kit_source import SDK_PIN, generator_stamp  # noqa: E402
