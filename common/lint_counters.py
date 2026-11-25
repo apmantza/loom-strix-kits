@@ -15,7 +15,7 @@ Inputs (all arguments; no model constants):
   --device FILE   common/devices/<gfx>.json: the DRAM read ceiling of its default profile (serial's bandwidth guard), and the
                   hardware the lane floors of (d) are computed at (--profile, default its default_profile)
   --noise-floor F the kit's noise_floor.json ({lane substring: pct}, events_summary's format): (d)'s screen per lane
-  --top N         (d): levers printed and sent to amdahl.py (default 15); --amdahl-out PATH keeps amdahl's input JSON
+  --top N         (d): levers ranked and sent to amdahl.py per phase (default 15); --amdahl-out PATH keeps amdahl's input JSON
 
 Counters attach to a served kernel only when the workload's code object is byte-identical to the served compile (sha256 of
 --codes/KERNEL.hsaco). The code object is the one hsaco path in the workload's log.txt `Command:` line, or hsaco= in the spec;
@@ -58,10 +58,13 @@ A price is served share x matching share: the share of served device time the fl
 fixing it returns; a ranking, not a prediction).
 (d) levers (user 11-25: 'make the linter rank, not just flag'): per served kernel and lane, a lever for each priced lint rule, or
 an 'unnamed' one for a kernel without one, bounded by min(headroom attribution, pattern price). Headroom = the lane's served time
-minus its floor (ceiling.lane_floor at --device's profile, the floor amdahl's to_floor uses; a lane without a floor against 0);
-the kernel's attribution is its share of the lane's served time x that headroom: an attribution, not a measurement. The top N
-go to common/amdahl.py as one phase per lane (wall = the lane's served ms, screen = its noise floor, one overlap_group per
-kernel), and a lever below its lane's screen is 'not worth building' (rules 2: price the lever before building it). (d2) lists
+minus its floor (ceiling.lane_floor at --device's profile, the floor amdahl's to_floor uses); the kernel's attribution is its
+share of the lane's served time x that headroom: an attribution, not a measurement. Two ranked lists, decode then prefill, each
+by the bound as % of that phase's served time (user 11-25: 'two separate ranks'), top N each. Only floor-backed levers are ranked;
+a lane without a floor (judged against 0, so its bound is the whole kernel time) is listed after each list, never screened. The
+ranked levers go to common/amdahl.py as one phase per lane (wall = the lane's served ms, screen = its noise floor, one
+overlap_group per kernel), and a lever below its lane's screen is 'not worth building' (rules 2: price before building). The
+noise floors' false-pass sweep is still owed (kit NOTES.md): 'clears the screen' is provisional and the report says so. (d2) lists
 occupancy levers unpriced (rules 1: occupancy is latency hiding, not a throughput model): every resource the compile report's
 residency_constraints mark limiting with its reduction to the next tier (flash2 is held by VGPR and LDS at once: both must
 move), beside the kernel's load-counter wait share at the served level.
@@ -492,23 +495,28 @@ def lane_headroom(srv, steps, prompt, d, hw):
                 h["why"] = (f"floor {f['floor']:.3f} {'ms/step' if dec else 's/prompt'} ({f['binds']} binds)" +
                             (f" x {steps} verify steps" if dec else ""))
         h["headroom_ms"] = None if h["floor_ms"] is None else max(0.0, ms - h["floor_ms"])
+        h["floored"] = bool(h["floor_ms"])   # a computed floor above 0: no-floor (judged against 0) and unknown lanes are not
         out[ln["lane"]] = h
     return out
 
 
 def levers(lint, srv, workloads, bw_ceiling, heads):
     """one lever per (served kernel, lane, priced lint rule), or one 'unnamed' lever for a kernel without a priced rule:
-    {"kernel", "lane", "lever", "evidence", "target_ms", "attr_ms", "price_ms", "upper_ms"}, ranked by upper_ms (None last).
+    {"kernel", "phase", "lane", "lever", "evidence", "target_ms", "attr_ms", "price_ms", "upper_ms", "pct", "floored"}, ranked by
+    pct (None last): upper_ms as % of the phase's served ms (r2, user 11-25: decode and prefill are ranked separately; on live
+    decode is 10.8 s of a 207 s request and no decode lever reached a request-wide top 15). floored: the lane has a floor above 0.
     attr_ms = the kernel's share of its lane's served ms x the lane's headroom (an attribution: no kernel was timed at a floor);
     price_ms = the kernel's ms in the lane x the rule's matching share (section c); upper_ms = the smaller of the known two"""
-    out = []
-    for (k, _), r in srv.items():
+    out, phase_ms = [], collections.Counter()
+    for (_, ph), r in srv.items():
+        phase_ms[ph] += r["ms"]
+    for (k, ph), r in srv.items():
         pats = [h for h in hits(lint.get(k) or {}) if h in RULES]
         res = {rule: back(rule, workloads, k, bw_ceiling) for rule in pats}
         for lane, ms in r["lanes"].items():
             hd = heads[lane]
             attr = hd["headroom_ms"] * ms / hd["ms"] if hd["headroom_ms"] is not None and hd["ms"] > 0 else None
-            base = {"kernel": k, "lane": lane, "target_ms": ms, "attr_ms": attr}
+            base = {"kernel": k, "phase": ph, "lane": lane, "target_ms": ms, "attr_ms": attr, "floored": hd["floored"]}
             if not pats:
                 out.append(dict(base, lever=UNNAMED, evidence="no evidence", price_ms=None))
             for rule in pats:
@@ -518,35 +526,36 @@ def levers(lint, srv, workloads, bw_ceiling, heads):
     for x in out:
         known = [v for v in (x["attr_ms"], x["price_ms"]) if v is not None]
         x["upper_ms"] = min(known) if known else None
-    out.sort(key=lambda x: (x["upper_ms"] is None, -(x["upper_ms"] or 0.0), x["kernel"], x["lever"]))
+        x["pct"] = 100 * x["upper_ms"] / phase_ms[x["phase"]] if known and phase_ms[x["phase"]] > 0 else None
+    out.sort(key=lambda x: (x["pct"] is None, -(x["pct"] or 0.0), x["kernel"], x["lever"]))
     return out
 
 
+def ranked(lv, phase, top):
+    """the TOP floor-backed levers of PHASE in rank order (LV is sorted by pct): what (d) ranks and amdahl screens. A floor-backed
+    lever is always bounded: its lane's headroom is known, so its attribution is"""
+    return [x for x in lv if x["phase"] == phase and x["floored"]][:top]
+
+
 def amdahl_input(lv, heads, noise, top):
-    """(amdahl.py input doc, the levers sent, [(lane, why) left out]): the TOP bounded levers, one phase per lane (wall = the
-    lane's served ms, screen_pct = its noise floor; without one amdahl's default screen applies), one overlap_group per kernel so
-    two levers on one kernel never add. A lane whose kernels' best levers claim its whole time (floor 0) is left out: amdahl
-    refuses groups that save the whole wall"""
-    picked = [x for x in lv if x["upper_ms"] is not None][:top]
+    """(amdahl.py input doc, the levers sent): each phase's TOP floor-backed levers (ranked: a no-floor lane's bound is the whole
+    kernel time, not a floor, so it is never screened), one amdahl phase per lane (wall = the lane's served ms, screen_pct = its
+    noise floor; without one amdahl's default screen applies), one overlap_group per kernel so two levers on one kernel never add.
+    A floor above 0 keeps every lane's savings below its wall (each lever <= its attribution; they sum to the headroom)"""
+    picked = [x for ph in sorted({x["phase"] for x in lv}) for x in ranked(lv, ph, top)]
     by = {}
     for x in picked:
         by.setdefault(x["lane"], []).append(x)
-    doc, omitted = {"phases": []}, []
+    doc = {"phases": []}
     for lane, xs in by.items():
         wall = heads[lane]["ms"]
-        best = {}
-        for x in xs:
-            best[x["kernel"]] = max(best.get(x["kernel"], 0.0), x["upper_ms"])
-        if sum(best.values()) >= wall:
-            omitted.append((lane, f"its levers claim {sum(best.values()):.1f} of {wall:.1f} ms ({heads[lane]['why']})"))
-            continue
         ph = {"phase": lane, "unit": "ms/request", "wall": wall,
               "candidates": [{"name": f"{x['kernel']}:{x['lever']}", "target": x["target_ms"], "reduction": x["upper_ms"],
                               "overlap_group": x["kernel"], "src": f"lint_counters (d): {x['evidence']}"} for x in xs]}
         if lane in noise:
             ph["screen_pct"] = noise[lane]
         doc["phases"].append(ph)
-    return doc, picked, omitted
+    return doc, picked
 
 
 def run_amdahl(doc, path):
@@ -578,31 +587,46 @@ def latency_wait(workloads, kernel):
     return "unknown (no usable counters at the served level)"
 
 
-def section_d(lv, heads, verdicts, omitted, noise, lint, srv, workloads, top, hwname):
-    """(d) as lines: the lanes against their floors, the ranked levers with amdahl's verdict, the occupancy levers (unpriced)"""
-    out = [f"(d) levers ranked by upper bound = min(headroom attribution, pattern price), ms of served device time in this request",
-           f"    lane floors: ceiling.lane_floor at {hwname}; headroom = lane served - floor (a lane without a floor: against 0).",
+def section_d(lv, heads, verdicts, noise, lint, srv, workloads, top, hwname):
+    """(d) as lines: the lanes against their floors, then one ranked list per phase (decode first, ranks from 1 in each) with
+    amdahl's verdict and a 'no floor' block after it, then the occupancy levers (unpriced)"""
+    out = [f"(d) levers per phase, ranked by upper bound = min(headroom attribution, pattern price) as % of the phase's served time",
+           f"    lane floors: ceiling.lane_floor at {hwname}; headroom = lane served - floor.",
            "    attr = the kernel's share of its lane's served time x the lane's headroom: an attribution, not a measurement (no kernel",
            "    was timed at its floor). price = the kernel's ms in the lane x the rule's matching share (section c). evidence:",
            "    counter-backed / counters: not backed or mixed (section b) / static only (a lint flag, no usable counters) / no evidence",
            "    (no lint flag: only the lane's headroom). screen: amdahl.py, one phase per lane, the lane's noise floor % of its served",
            "    time; a lever below it is not worth building (an A/B could not tell it from noise). Not additive: amdahl's combined",
-           "    line counts the best lever per kernel.",
+           "    line counts the best lever per kernel. Only floor-backed levers are ranked and screened; levers in lanes without a",
+           "    floor (judged against 0, ceiling.py) are listed after each ranked list, unranked and never screened.",
+           "    PROVISIONAL: the screen uses the kit's noise_floor.json, whose false-pass sweep is still owed (kit NOTES.md), so",
+           "    'clears the noise screen' is provisional.",
            f"{'lane':45s} {'phase':7s} {'served ms':>10s} {'floor ms':>10s} {'headroom':>10s} {'noise%':>6s}  why"]
     for lane, h in heads.items():
         out.append(f"{lane:45s} {h['phase']:7s} {h['ms']:10.1f} {fmt(h['floor_ms'], '{:.1f}') if h['floor_ms'] is not None else 'unknown':>10s} "
                    f"{fmt(h['headroom_ms'], '{:.1f}') if h['headroom_ms'] is not None else 'unknown':>10s} "
                    f"{fmt(noise[lane], '{:.2f}') if lane in noise else '-':>6s}  {h['why']}")
-    out += ["", f"{'#':>3s} {'upper ms':>9s} {'attr ms':>9s} {'price ms':>9s}  {'evidence':21s} {'screen':28s} {'kernel':36s} "
-                f"{'lever':22s} lane"]
-    for i, x in enumerate(lv[:top], 1):
-        v = verdicts.get((x["lane"], f"{x['kernel']}:{x['lever']}"))
-        scr = ("clears the noise screen" if v else "not worth building") if v is not None else \
-            ("unbounded: not screened" if x["upper_ms"] is None else "not screened (lane left out)")
-        f = lambda y: f"{y:9.1f}" if y is not None else f"{'-':>9s}"
-        out.append(f"{i:3d} {f(x['upper_ms'])} {f(x['attr_ms'])} {f(x['price_ms'])}  {x['evidence']:21s} {scr:28s} {x['kernel']:36s} "
-                   f"{x['lever']:22s} {x['lane']}")
-    out += [f"    lane left out of the screen: {lane}: {why}" for lane, why in omitted]
+    f = lambda y, w=9, p=1: f"{y:{w}.{p}f}" if y is not None else f"{'-':>{w}s}"
+    hdr = (f"{'#':>3s} {'upper%':>7s} {'upper ms':>9s} {'attr ms':>9s} {'price ms':>9s}  {'evidence':21s} {'screen':28s} "
+           f"{'kernel':36s} {'lever':22s} lane")
+    row = lambda i, x, scr: (f"{i:>3s} {f(x['pct'], 7, 2)} {f(x['upper_ms'])} {f(x['attr_ms'])} {f(x['price_ms'])}  "
+                             f"{x['evidence']:21s} {scr:28s} {x['kernel']:36s} {x['lever']:22s} {x['lane']}")
+    pms = collections.Counter()
+    for (_, ph), r in srv.items():
+        pms[ph] += r["ms"]
+    for ph in sorted(pms, key=lambda p: (p != "decode", p)):
+        out += ["", f"(d) {ph}: levers ranked by upper bound as % of {ph}'s served time ({pms[ph]:.1f} ms), top {top}", hdr]
+        for i, x in enumerate(ranked(lv, ph, top), 1):
+            v = verdicts.get((x["lane"], f"{x['kernel']}:{x['lever']}"))
+            out.append(row(str(i), x, ("clears the noise screen" if v else "not worth building") if v is not None else "amdahl gave no verdict"))
+        rest = [x for x in lv if x["phase"] == ph and not x["floored"]]
+        nofl = [x for x in rest if heads[x["lane"]]["floor_ms"] is not None]
+        out += [f"    {ph}: no floor: upper bound = whole kernel time (or the pattern price when smaller); unranked, not screened; "
+                f"top {top} of {len(nofl)}"] + [row("-", x, "no floor: not screened") for x in nofl[:top]]
+        unk = [x for x in rest if heads[x["lane"]]["floor_ms"] is None]
+        if unk:
+            out += [f"    {ph}: floor unknown (see the lane table): not ranked, not screened; top {top} of {len(unk)}"] + \
+                [row("-", x, "floor unknown: not screened") for x in unk[:top]]
     ms = collections.Counter()
     for (k, _), r in srv.items():
         ms[k] += r["ms"]
@@ -649,7 +673,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--profile", help="the device file's profile for the lane floors (default: its default_profile)")
     ap.add_argument("--noise-floor", help="(d): {lane substring: pct}, the kit's noise_floor.json: each lane's amdahl screen")
-    ap.add_argument("--top", type=int, default=15, help="(d): levers printed and sent to amdahl")
+    ap.add_argument("--top", type=int, default=15, help="(d): levers ranked and screened per phase")
     ap.add_argument("--amdahl-out", help="(d): write amdahl's input JSON here (default: a temporary file)")
     a = ap.parse_args()
     dev = json.load(open(a.device))
@@ -676,13 +700,13 @@ def main():
     heads = lane_headroom(srv, steps, prompt, d, hw)
     noise = lane_noise(a.noise_floor, d) if a.noise_floor else {}
     lv = levers(lint, srv, wl, bw, heads)
-    doc, _, omitted = amdahl_input(lv, heads, noise, a.top)
+    doc, _ = amdahl_input(lv, heads, noise, a.top)
     import tempfile
     with tempfile.TemporaryDirectory() as t:
         lines, verdicts = run_amdahl(doc, a.amdahl_out or os.path.join(t, "amdahl_in.json"))
     print()
-    print("\n".join(section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, a.top, hw["name"])))
-    print(f"\n(d3) amdahl.py on the top {a.top} bounded levers" + (f" ({a.amdahl_out})" if a.amdahl_out else "") +
+    print("\n".join(section_d(lv, heads, verdicts, noise, lint, srv, wl, a.top, hw["name"])))
+    print(f"\n(d3) amdahl.py on each phase's top {a.top} floor-backed levers (no-floor lanes are not sent)" + (f" ({a.amdahl_out})" if a.amdahl_out else "") +
           (f"; lanes without a noise floor use amdahl's default screen" if set(heads) - set(noise) else "") + ":")
     print("\n".join("    " + x for x in lines))
     print()

@@ -235,6 +235,7 @@ def main():
         lint = {"g_mv_a": {"flags": ["copies", "join"]}, "g_mv_b": {"flags": ["join"], "notes": ["maskedv"]}, "g_x": {},
                 "g_gemm_a": {}, "g_fl": {"flags": ["copies"]}}
         lv = lc.levers(lint, srv, wl, 240, heads)
+        UN = "unnamed (no lint flag)"
         got = {(x["kernel"], x["lever"]): (x["evidence"], x["upper_ms"] if x["upper_ms"] is None else round(x["upper_ms"], 6)) for x in lv}
         ok(got[("g_mv_a", "copies")] == ("counter-backed", 12.0), "backed lever: min(attribution 18, price 12) = 12 ms", got)
         ok(got[("g_mv_b", "join")] == ("static only", 12.0), "static-only lever: bounded by its headroom attribution", got)
@@ -242,13 +243,17 @@ def main():
         ok(got[("g_gemm_a", "unnamed (no lint flag)")] == ("no evidence", 500.0), "the whole lane's headroom on its one kernel", got)
         ok(got[("g_fl", "copies")] == ("static only", None), "headroom unknown and no price: no bound", got)
         ok(not any(x["lever"] == "maskedv" for x in lv), "unpriced rules (maskedv) are not speed levers", "")
-        ok([x["upper_ms"] for x in lv if x["upper_ms"] is not None] == sorted((x["upper_ms"] for x in lv if x["upper_ms"] is not None),
-                                                                              reverse=True) and lv[-1]["upper_ms"] is None,
-           "ranked by upper bound, unbounded last", [(x["kernel"], x["lever"], x["upper_ms"]) for x in lv])
+        # r2 (coordinator 11-25): rank within each phase by the upper bound as % of that phase's served time, so decode levers
+        # (10.8 s of a 207 s request on live) are visible on their own; lanes without a floor are not ranked or screened
+        pc = {(x["kernel"], x["lever"]): (x["phase"], round(x["pct"], 3) if x["pct"] is not None else None, x["floored"]) for x in lv}
+        ok(pc[("g_mv_a", "copies")] == ("decode", 22.222, True) and pc[("g_gemm_a", UN)] == ("prefill", 31.25, True),
+           "pct = upper / the phase's served ms (decode 54 ms, prefill 1600 ms)", pc)
+        ok(pc[("g_x", UN)][2] is False and pc[("g_fl", "copies")][2] is False, "no-floor and unknown-floor lanes are not floor-backed", pc)
 
         # amdahl: one phase per lane, the lane's noise floor as its screen, one overlap group per kernel
         noise = {"dec w": 50.0, "pre gemm": 0.33}
-        doc, picked, omitted = lc.amdahl_input(lv, heads, noise, 10)
+        noise["dec other"] = 1.0
+        doc, picked = lc.amdahl_input(lv, heads, noise, 10)
         ph = {p["phase"]: p for p in doc["phases"]}
         ok(ph["dec w"]["screen_pct"] == 50.0 and ph["dec w"]["wall"] == 50.0 and
            not any("screen_pct" in p for p in lc.amdahl_input(lv, heads, {}, 10)[0]["phases"]),
@@ -256,24 +261,39 @@ def main():
         grp = [c["overlap_group"] for c in ph["dec w"]["candidates"] if c["name"].startswith("g_mv_a")]
         ok(len(grp) == 2 and set(grp) == {"g_mv_a"}, "two levers on one kernel share its overlap group", grp)
         ok(not any(x["upper_ms"] is None for x in picked), "unbounded levers are not sent to amdahl", "")
-        ok(omitted and omitted[0][0] == "dec other", "a lane whose levers claim its whole time (floor 0) is left out, named", omitted)
+        ok(not any(x["kernel"] == "g_x" for x in picked) and "dec other" not in ph,
+           "a no-floor lane's levers never reach amdahl (whole kernel time is not a floor-backed bound)", [x["kernel"] for x in picked])
+        one = lc.amdahl_input(lv, heads, noise, 1)[1]
+        ok(sorted((x["phase"], x["kernel"]) for x in one) == [("decode", "g_mv_a"), ("prefill", "g_gemm_a")],
+           "--top applies per phase: decode's best lever is screened beside prefill's 500 ms", [(x["phase"], x["kernel"]) for x in one])
         out, verdicts = lc.run_amdahl(doc, os.path.join(t, "amdahl_in.json"))
         ok(verdicts.get(("pre gemm", "g_gemm_a:unnamed (no lint flag)")) is True, "500 of 1500 ms clears a 0.33 % screen", verdicts)
         ok(verdicts.get(("dec w", "g_mv_a:copies")) is False, "12 of 50 ms is below a 50 % screen: not worth building", verdicts)
         ok("amdahl:" in out[-1], "amdahl's own output is in the report", out[-1:])
-        lines = lc.section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, 10, "fixture hw")
+        lines = lc.section_d(lv, heads, verdicts, noise, lint, srv, wl, 10, "fixture hw")
         txt = "\n".join(lines)
         ok("not worth building" in txt and "an attribution, not a measurement" in txt, "verdicts and the attribution caveat printed", "")
+        ok("false-pass sweep" in txt and "provisional" in txt, "header says the noise screen is provisional", "")
+        firsts = [ln.split()[:2] for ln in txt.splitlines() if ln[:3].strip() == "1" and len(ln.split()) > 2]
+        ok(txt.index("(d) decode") < txt.index("(d) prefill") and len(firsts) == 2,
+           "two ranked sections, decode first, each with its own rank 1 (user 11-25: 'two separate ranks')", firsts)
+        pre = txt.split("(d) prefill")[1].split("(d2)")[0]
+        ok([ln for ln in pre.splitlines() if ln[:3].strip() == "1" and "g_gemm_a" in ln], "prefill's rank 1 is its own best lever", pre)
+        dec = txt.split("(d) decode")[1].split("(d) prefill")[0]
+        ranked, nofl = dec.split("no floor: upper bound = whole kernel time")
+        gx = [x for x in nofl.splitlines() if "g_x" in x]
+        ok("g_mv_a" in ranked and "g_x" not in ranked and gx and "clears" not in gx[0] and "not screened" in gx[0],
+           "decode ranked block, then the no-floor block; a no-floor lever is never marked as clearing the screen", (ranked, gx))
         lint["g_fl"].update(_limits=lims, waves=6, _next_tier=7)
-        txt = "\n".join(lc.section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, 10, "fixture hw"))
+        txt = "\n".join(lc.section_d(lv, heads, verdicts, noise, lint, srv, wl, 10, "fixture hw"))
         occ = [x for x in txt.splitlines() if x.lstrip().startswith("g_fl")]
         ok(occ and "vgpr 240 registers -24" in occ[-1] and "lds 61952 bytes -18944" in occ[-1] and "all 2" in occ[-1],
            "occupancy lever lists every limiting resource and says it needs all of them", occ)
         lint["g_fl"]["_limits"] = [{"name": "max_waves", "units": None, "unit": "", "reduction": None, "tier": 16}]
-        txt = "\n".join(lc.section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, 10, "fixture hw"))
+        txt = "\n".join(lc.section_d(lv, heads, verdicts, noise, lint, srv, wl, 10, "fixture hw"))
         ok(not [x for x in txt.split("(d2)")[1].splitlines() if x.lstrip().startswith("g_fl")], "a kernel at the best tier has no lever", "")
         lint["g_mv_a"].update(_limits=lims, waves=6, _next_tier=7)
-        txt = "\n".join(lc.section_d(lv, heads, verdicts, omitted, noise, lint, srv, wl, 10, "fixture hw"))
+        txt = "\n".join(lc.section_d(lv, heads, verdicts, noise, lint, srv, wl, 10, "fixture hw"))
         occ = [x for x in txt.split("(d2)")[1].splitlines() if x.lstrip().startswith("g_mv_a")]
         ok(occ and "35.0 %" in occ[0], "occupancy lever shows the latency-wait share (vmem 30 + lgkm 5)", occ)
         wps = lc.load_workloads([workload(os.path.join(t, "wps"), hs, kernel="g_mv_a", level="profile_standard",
