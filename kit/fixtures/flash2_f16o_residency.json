@@ -1,0 +1,108 @@
+{
+ "kind": "loom.compile_report",
+ "schema_version": 0,
+ "target_key": "gfx1151",
+ "residency_constraints": {
+  "count": 4,
+  "rows": [
+   {
+    "index": 0,
+    "function": "g_attention_flash2_f16o",
+    "name": "amdgpu.sgpr",
+    "kind": "unconstrained_resource",
+    "unit": "registers",
+    "allocation_scope": "subgroup",
+    "pool_scope": "SIMD",
+    "pool_units": 2048,
+    "allocation_granularity": 128,
+    "units": 78,
+    "rounded_units": 128,
+    "independent_tier": 16,
+    "limiting": false
+   },
+   {
+    "index": 1,
+    "function": "g_attention_flash2_f16o",
+    "name": "amdgpu.vgpr",
+    "kind": "pooled_resource",
+    "unit": "registers",
+    "allocation_scope": "subgroup",
+    "pool_scope": "SIMD",
+    "pool_units": 1536,
+    "allocation_granularity": 24,
+    "units": 237,
+    "rounded_units": 240,
+    "independent_tier": 6,
+    "limiting": true,
+    "reduction_units_to_next_better_tier": 21
+   },
+   {
+    "index": 2,
+    "function": "g_attention_flash2_f16o",
+    "name": "amdgpu.lds",
+    "kind": "pooled_resource",
+    "unit": "bytes",
+    "allocation_scope": "workgroup",
+    "pool_scope": "occupancy domain",
+    "pool_units": 131072,
+    "allocation_granularity": 1024,
+    "units": 61952,
+    "rounded_units": 62464,
+    "independent_tier": 6,
+    "limiting": true,
+    "reduction_units_to_next_better_tier": 18944
+   },
+   {
+    "index": 3,
+    "function": "g_attention_flash2_f16o",
+    "name": "amdgpu.workgroup_slots",
+    "kind": "fixed_limit",
+    "independent_tier": 15,
+    "limiting": false
+   }
+  ]
+ },
+ "workload": {
+  "workgroup_size": {
+   "x": 384,
+   "y": 1,
+   "z": 1,
+   "flat": 384
+  }
+ },
+ "target_resources": {
+  "scalar": {
+   "register_class": "amdgpu.sgpr",
+   "final": {
+    "register_count": 78,
+    "overhead_units": 0
+   },
+   "scheduled_pressure": {
+    "peak_live_units": 78
+   }
+  },
+  "vector": {
+   "register_class": "amdgpu.vgpr",
+   "final": {
+    "register_count": 237,
+    "overhead_units": 8
+   },
+   "scheduled_pressure": {
+    "peak_live_units": 229
+   }
+  },
+  "subgroup_size": 32,
+  "max_subgroups_per_simd": 16,
+  "resident_subgroups_per_simd": 6,
+  "occupancy_percent": 37,
+  "limiting_resource": "amdgpu.vgpr",
+  "residency": {
+   "required_tier": 3,
+   "best_tier": 16,
+   "current_tier": 6,
+   "launchable": true,
+   "limiting_resource_count": 2,
+   "next_better_tier": 7
+  }
+ }
+}

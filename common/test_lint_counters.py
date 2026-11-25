@@ -204,7 +204,7 @@ def main():
         return {"name": "amdgpu.lds", "kind": "pooled_resource", "unit": "bytes", "allocation_scope": "workgroup",
                 "pool_scope": "occupancy domain", "pool_units": 131072, "allocation_granularity": 1024, "units": units,
                 "independent_tier": tier, "limiting": limiting, "reduction_units_to_next_better_tier": 18944}
-    SG = {"name": "amdgpu.sgpr", "kind": "unconstrained_resource", "independent_tier": 16, "limiting": False}
+    SG = {"name": "amdgpu.sgpr", "kind": "unconstrained_resource", "allocation_scope": "subgroup", "independent_tier": 16, "limiting": False}
 
     def slots(tier):
         return {"name": "amdgpu.workgroup_slots", "kind": "fixed_limit", "independent_tier": tier, "limiting": False}
@@ -224,7 +224,8 @@ def main():
         ok(o.get("tier") == 3 and o.get("report_tier") == 5 and o.get("next") == 6 and o.get("needs") == [("vgpr", 252, "registers", 240, 12)],
            "the report's unrounded tier (flash2_partial: VGPR 5 at 3 waves per workgroup) is really 3; next 6 needs VGPR <= 240", o)
         o = lc.occupancy(lc.report_limit(report(os.path.join(t, "m.json"), 160, 12, [SG, vgpr(114, 12)]))[4], 4)
-        ok("tier unverified" in o.get("why", "") and "not whole waves" in o["why"], "160 lanes (5 waves over 4 SIMDs): tier unverified", o)
+        ok(o.get("tier") == 12 and o.get("bound") is True and o.get("next") == 15, "160 lanes (5 waves over 4 SIMDs): verified at "
+           "ceil(9 x 5 / 4) = 12, a bound (Loom's convention), next 15 at VGPR <= 96 (review r1 F1/F2: was 'unverified')", o)
         o = lc.occupancy(lc.report_limit(report(os.path.join(t, "n.json"), None, 6, [SG, vgpr(240, 6)]))[4], 4)
         ok("tier unverified" in o.get("why", ""), "no workgroup size in the report: tier unverified", o)
         o = lc.occupancy(lc.report_limit(report(os.path.join(t, "x.json"), 384, 6, [SG, vgpr(240, 6), lds(61952, 6)]))[4], None)
@@ -232,10 +233,12 @@ def main():
         o = lc.occupancy(lc.report_limit(report(os.path.join(t, "d.json"), 384, 7, [SG, vgpr(240, 6), lds(61952, 6)]))[4], 4)
         ok("tier unverified" in o.get("why", "") and "report" in o["why"], "computed tier disagrees with the report: unverified", o)
         o = lc.occupancy(lc.report_limit(report(os.path.join(t, "s.json"), 384, 6, [SG, vgpr(240, 6), lds(61952, 6), slots(7)]))[4], 4)
-        ok("workgroup_slots" in o.get("why", ""), "a fixed limit below the next tier blocks it (named)", o)
-        ok(lc.occupancy(lc.report_limit(report(os.path.join(t, "b.json"), 128, 16, [SG, vgpr(24, 16, False)]))[4], 4) is None,
+        ok("workgroup_slots" in o.get("why", "") and o["why"].startswith("next tier") and "blocked" in o["why"] and o.get("tier") == 6,
+           "a fixed limit below the next tier blocks it (named; 'next tier ... blocked' is loom_suggest's phantom test)", o)
+        best = lambda o: o is None                     # the contract loom_suggest (C6) relies on: None at the best tier
+        ok(best(lc.occupancy(lc.report_limit(report(os.path.join(t, "b.json"), 128, 16, [SG, vgpr(24, 16, False)]))[4], 4)),
            "at the wave cap: no occupancy lever", "")
-        ok(lc.occupancy(lc.report_limit(report(os.path.join(t, "z.json"), 256, 16, [SG, vgpr(24, 16, False), lds(0, 16, False)]))[4], 4) is None,
+        ok(best(lc.occupancy(lc.report_limit(report(os.path.join(t, "z.json"), 256, 16, [SG, vgpr(24, 16, False), lds(0, 16, False)]))[4], 4)),
            "a kernel using no LDS (0 B) is at the best tier, not 'unverified' (live: every g_deq16_*)", "")
         ok(lc.occupancy(None, 4) == {"why": "no compile report"}, "no compile report: said, not dropped", "")
         json.dump({"target_resources": {"limiting_resource": "amdgpu.lds", "residency": {"current_tier": 4}}}, open(js, "w"))
@@ -372,6 +375,30 @@ def main():
         ok(not [x for x in txt.splitlines() if x.startswith("g_gemm_a ")], "d2: a kernel at the wave cap has no lever", "")
         nb = [x for x in txt.splitlines() if x.startswith("g_mv_b ")]
         ok(nb and "no compile report" in nb[0], "d2: a served kernel without a compile report is listed as such, not dropped", nb)
+        # (a) and (d2) print one occupancy (review r1 F1: (a) said 11.25 and (d2) 'unverified' for g_mv_q5_k_k5120_t8_q8, 160 lanes)
+        cd = os.path.join(t, "agree"); os.makedirs(cd)
+        report(os.path.join(cd, "g_mv_q5.json"), 160, 12, [SG, vgpr(114, 12), lds(2560, 16, False), slots(15)])
+        la = {"g_mv_q5": {"kernel": "g_mv_q5", "flags": []}}
+        lc.attach_reports(la, cd, 4)
+        sq = {("g_mv_q5", "decode"): {"ms": 10.0, "calls": 1, "shapes": {8}, "lanes": {"dec w": 10.0}}}
+        ra = [x for x in lc.build(la, sq, 10.0, [], 240)[0] if x.startswith("g_mv_q5 ")]
+        rd = [x for x in lc.section_d(lc.levers(la, sq, [], 240, hd), hd, {}, noise, la, sq, [], 10, "fixture hw", 4)
+              if x.startswith("g_mv_q5 ")]
+        ok(ra and rd and " 12 bound " in ra[0] and "tier 12 bound -> 15 bound" in rd[0],
+           "(a) and (d2) agree on a 160-lane matvec: 12 bound, next 15", (ra, rd))
+        # the --device file's SIMD count reaches the tiers (verify r2 V8: attach_reports used 4 whatever the device said): a 64-lane
+        # workgroup with 16 KiB LDS seats 8 workgroups = 16 waves; over 2 SIMDs that is tier 8, over 4 it would be 4
+        dv = os.path.join(t, "fake2.json")
+        json.dump({"simds_per_occupancy_domain": 2}, open(dv, "w"))
+        report(os.path.join(cd, "g_two.json"), 64, 8, [SG, vgpr(48, 16, False), lds(16384, 8), slots(16)])
+        l2 = {"g_two": {"kernel": "g_two", "flags": []}, "g_none": {"kernel": "g_none", "flags": []}}
+        lc.attach_reports(l2, cd, json.load(open(dv)).get("simds_per_occupancy_domain"))
+        ok(l2["g_two"]["occ"].get("tier") == 8 and not l2["g_two"]["occ"].get("bound"),
+           "a device file with 2 SIMDs per occupancy domain: tier 8, not 4 (the --device count is used)", l2["g_two"]["occ"])
+        sn = {("g_none", "decode"): {"ms": 1.0, "calls": 1, "shapes": {8}, "lanes": {"dec w": 1.0}}}
+        rn = [x for x in lc.build(l2, sn, 1.0, [], 240)[0] if x.startswith("g_none ")]
+        ok(rn and rn[0].split()[7] == "-", "(a): a kernel without a compile report prints '-' (no report), not '?' (unverified)", rn)
+        ok("placement caveat" in sec(verdicts, noise).split("(d2)")[1], "(d2)'s header says what 'bound' means there", "")
         ma = [x for x in txt.splitlines() if x.startswith("g_mv_a ")]
         ok(ma and "35.0 %" in ma[0], "occupancy lever shows the latency-wait share (vmem 30 + lgkm 5)", ma)
         wps = lc.load_workloads([workload(os.path.join(t, "wps"), hs, kernel="g_mv_a", level="profile_standard",

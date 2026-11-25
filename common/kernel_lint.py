@@ -83,8 +83,11 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   regress:  (with --baseline) worse than the same kernel in another build: a new spill, the prefetch now drained, fewer
             waves per SIMD, or the hot loop / its longest move run >= 10 % longer (E226: Loom 0.3.0's vmcnt(0) + 32-move shift;
             E230: a rewrite's spill; E236: a variant's residency drop).
-Reported, not flagged: non-MMA instructions per MMA, moves, VGPRs, waves/SIMD, VGPRs to free for the next residency tier
-(Loom's summary report beside the code object, KERNEL.json), pf ('drain' when a vmcnt(0) sits between the loop's last load and
+Reported, not flagged: non-MMA instructions per MMA, moves, VGPRs, w/S (waves per SIMD) and 'next': the tier reached once the
+VGPRs (v) and LDS bytes (l) shown are freed together, 'best' at the wave cap, 'blocked' by the slot limit; both counted in whole
+workgroups from the summary report beside the code object, KERNEL.json (tier_state(); E533: Loom 0.2.0's own tier rounds VGPRs per
+wave and named flash2's next tier 7, unreachable); 'bound' marks a workgroup whose waves are not a multiple of the SIMDs (Loom's
+ceil convention: placement unknown), pf ('drain' when a vmcnt(0) sits between the loop's last load and
 its first WMMA), and with --package the kernel's launch sites in the package. Calibrated on 225 served kernels (E237 / E241):
 v_mul_lo_u32 (address math) and a drain alone are not defects.
 Decoding goes through loop_census.disasm (ROCm 10.2 llvm-objdump; it refuses undecoded words).
@@ -283,15 +286,148 @@ def join_runs(ins):
     return best
 
 
+OCC_ROWS = {("amdgpu.vgpr", "pooled_resource", "subgroup"), ("amdgpu.lds", "pooled_resource", "workgroup"),
+            ("amdgpu.workgroup_slots", "fixed_limit", None), ("amdgpu.sgpr", "unconstrained_resource", "subgroup")}
+# (name, kind, scope): the residency rows occupancy() models (every row of pkg-e480's 259 reports); any other row: unverified
+
+
+def occ_inputs(doc):
+    """occupancy()'s inputs from a Loom compile report: workgroup lanes, wave size, wave cap, the report's current tier, its
+    residency_constraints rows and target"""
+    tr = doc.get("target_resources") or {}
+    return {"wg": ((doc.get("workload") or {}).get("workgroup_size") or {}).get("flat"), "wave": tr.get("subgroup_size"),
+            "cap": tr.get("max_subgroups_per_simd"), "tier": (tr.get("residency") or {}).get("current_tier"),
+            "rows": (doc.get("residency_constraints") or {}).get("rows", []), "target": doc.get("target_key")}
+
+
+def device_simds(target):
+    """SIMDs per occupancy domain from common/devices/<target>.json, or None (occupancy() then says unverified)"""
+    f = os.path.join(os.path.dirname(os.path.abspath(__file__)), "devices", f"{target}.json")
+    return json.load(open(f)).get("simds_per_occupancy_domain") if target and os.path.exists(f) else None
+
+
+def occupancy(occ, simds):
+    """the occupancy LEVER (lint_counters (d2), loom_suggest's cliff verdict): None at the best tier (the wave cap); {"why"} when
+    unverified or when a fixed limit blocks the next tier ('next tier blocked by ...', with "tier" and "bound" kept); else
+    tier_state()'s dict {"tier", "bound", "q", "report_tier", "next", "needs": [(name, units, unit, max, cut)]}"""
+    st = tier_state(occ, simds)
+    if "why" in st:
+        return st
+    if st["blocked"]:
+        return {"why": st["blocked"], "tier": st["tier"], "bound": st["bound"]}
+    return None if st["next"] is None else st
+
+
+def tier_state(occ, simds):
+    """The residency tier in whole workgroups, the next tier a workgroup can reach and what each resource must drop to for it:
+    {"tier", "bound", "q", "report_tier", "next", "needs": [(resource, units, unit, max units, cut)], "blocked"}; {"why": reason}
+    when it cannot be verified. The one model behind kernel_lint's w/S and next columns, lint_counters (a) and (d2) (through
+    occupancy(), the lever view of the same result), and livereg's budget.
+    A workgroup of w waves lives on one occupancy domain of SIMDS SIMDs (Loom runs WGP mode: 4); n resident workgroups put
+    ceil(n w / SIMDS) waves on the busiest SIMD, Loom's own rule (v0.2.0 occupancy.c:377-383, wave_limit_for_workgroups). The tier is
+    that integer; it is exact when w % SIMDS == 0 and otherwise a bound (Loom's balanced placement; how the SPI places a workgroup's
+    waves over the SIMDs is documented nowhere we searched: 'bound', never a fraction, HRX-like review r1 F3). Loom 0.2.0's own tier
+    takes VGPRs per wave, not per whole workgroup (HRX-like E533): flash2 (384 lanes, 12 waves) reported 7, reachable is 9, so the
+    report's next tier and reductions are not used. Each resource's independent tier is recomputed (subgroup scope: pool / rounded
+    units waves; workgroup scope: ceil((pool / rounded units) w / SIMDS)) and must equal the report's, and the whole-workgroup tier
+    must equal its current tier or the unrounded minimum, or the tier is 'unverified'. next is the tier actually reached once every
+    cut is applied (a VGPR granule can skip past n + 1 workgroups: g_dfl_ctx_split's -3 VGPRs lands on 12, not 11; review r1 F2);
+    None at the wave cap, or with "blocked" naming the fixed limit that stops it."""
+    if not occ:
+        return {"why": "no compile report"}
+    wg, wave, cap, cur = occ.get("wg"), occ.get("wave"), occ.get("cap"), occ.get("tier")
+    if not simds or not all(isinstance(v, int) and v > 0 for v in (wg, wave, cap, cur)):
+        return {"why": "tier unverified: workgroup size, wave size, wave cap or current tier missing from the report, or the device "
+                       "file has no simds_per_occupancy_domain"}
+    w = -(-wg // wave)
+    busiest = lambda n: -(-n * w // simds)
+    fit = lambda t: max([0] + [n for n in range(1, cap * simds + 1) if busiest(n) <= t])   # workgroups whose busiest SIMD fits t waves
+    pooled, fixed = [], []
+    for r in occ["rows"]:
+        name, kind = r.get("name", "?").split(".")[-1], r.get("kind")
+        if (r.get("name"), kind, r.get("allocation_scope")) not in OCC_ROWS:     # fail closed: a row nobody modelled is no figure
+            return {"why": f"tier unverified: residency row {r.get('name')} ({kind}, {r.get('allocation_scope')}) not modelled"}
+        if kind == "unconstrained_resource":
+            continue
+        if kind == "fixed_limit":
+            fixed.append((name, r.get("independent_tier")))
+            continue
+        try:
+            pool, gran, units, scope = int(r["pool_units"]), int(r["allocation_granularity"]), int(r["units"]), r["allocation_scope"]
+        except (KeyError, TypeError, ValueError):
+            return {"why": f"tier unverified: {name} ({kind}) lacks pool, granularity, units or scope"}
+        if kind != "pooled_resource" or scope not in ("subgroup", "workgroup") or gran <= 0 or units < 0:
+            return {"why": f"tier unverified: {name}: kind {kind!r}, scope {scope!r}, granularity {gran}, units {units} not modelled"}
+        pooled.append((name, units, r.get("unit") or "", pool, gran, scope, r.get("independent_tier")))
+    if any(not isinstance(t, int) for _, t in fixed):
+        return {"why": "tier unverified: a fixed limit without a tier"}
+    def groups(name, units, pool, gran, scope):           # workgroups this resource admits, and its independent tier as Loom counts it
+        ru = -(-units // gran) * gran
+        if ru == 0:                                        # a resource the kernel does not use (0 B of LDS) never limits
+            return fit(cap), cap
+        if scope == "subgroup":
+            t = min(cap, pool // ru)
+            return fit(t), t
+        return min(pool // ru, fit(cap)), min(cap, busiest(pool // ru))
+    n_of = {}
+    for name, units, unit, pool, gran, scope, rep in pooled:
+        n_of[name], got = groups(name, units, pool, gran, scope)
+        if got != rep:
+            return {"why": f"tier unverified: {name} computes to tier {got}, the report says {rep}"}
+    for name, t in fixed:
+        n_of[name] = fit(t)
+    n = min(list(n_of.values()) + [fit(cap)])
+    tier = busiest(n)
+    raw = min([rep for *_, rep in pooled] + [t for _, t in fixed] + [cap])
+    if cur not in (tier, raw):   # raw: the report's own unrounded minimum (E533: flash2_partial, VGPR tier 5 at 3 waves per SIMD is 3)
+        return {"why": f"tier unverified: computes to {tier} in whole workgroups ({raw} unrounded), the report says {cur}"}
+    out = {"tier": tier, "bound": w % simds != 0, "q": w // simds if w % simds == 0 else round(w / simds, 2), "report_tier": cur,
+           "next": None, "needs": [], "blocked": None}
+    m = n + 1
+    while busiest(m) <= tier:     # 1-3-wave workgroups: n + 1 can leave the busiest SIMD's ceil unchanged (verify r2 V-F1); Loom
+        m += 1                    # inverts from tier + 1 the same way (occupancy.c local_memory_budget)
+    if busiest(m) > cap:
+        return out                                         # the wave cap: the best tier
+    block = [f"{x} (tier {t})" for x, t in fixed if n_of[x] < m]
+    if block:
+        out["blocked"] = "next tier blocked by a fixed limit: " + ", ".join(block)
+        return out
+    cut = {}
+    for name, units, unit, pool, gran, scope, rep in pooled:
+        if n_of[name] < m:
+            mx = (pool // busiest(m) if scope == "subgroup" else pool // m) // gran * gran
+            out["needs"].append((name, units, unit, mx, units - mx))
+            cut[name] = mx
+    reached = min([groups(nm, cut.get(nm, u), pl, gr, sc)[0] for nm, u, _, pl, gr, sc, _ in pooled] +
+                  [n_of[x] for x, _ in fixed] + [fit(cap)])
+    out["next"] = busiest(reached)
+    return out
+
+
 def residency(js):
-    """(VGPRs, waves/SIMD, VGPRs to free for the next better tier) from a Loom summary report, or Nones"""
+    """(VGPRs, tier_state() of the summary report beside the code object) or (None, None); the row keys follow from it (lint())"""
     if not os.path.exists(js):
-        return None, None, None
-    tr = json.load(open(js)).get("target_resources") or {}
-    res = tr.get("residency") or {}
-    lim = res.get("unique_limiting_resource") or {}
-    return (((tr.get("vector") or {}).get("final") or {}).get("register_count"), res.get("current_tier"),
-            lim.get("reduction_units_to_next_better_tier"))
+        return None, None
+    d = json.load(open(js))
+    occ = occ_inputs(d)
+    return (((d.get("target_resources") or {}).get("vector") or {}).get("final") or {}).get("register_count"), \
+        tier_state(occ, device_simds(occ["target"]))
+
+
+def tier_text(o, key="tier"):
+    """a tier for print: the integer, plus ' bound' where the workgroup's waves are not a multiple of the SIMDs (placement unknown)"""
+    return "-" if not o or o.get(key) is None else f"{o[key]}{' bound' if o.get('bound') else ''}"
+
+
+def next_text(r):
+    """the 'next' column: the tier reached after the cuts and what to free for it together (v VGPRs, l LDS bytes); 'best' at the wave
+    cap, 'blocked' by a fixed limit, '-' unverified"""
+    o = r.get("occ")
+    if not o or "why" in o:
+        return "-"
+    if o["next"] is None:
+        return "blocked" if o["blocked"] else "best"
+    return f"{tier_text(o, 'next')}:" + "+".join(f"{n[0]}{c}" for n, _, _, _, c in o["needs"])
 
 
 def bank(js):
@@ -355,7 +491,7 @@ def lint_object(path):
             vg = hsaco_run.kernel_meta(path, n).get(".vgpr_count")
         except SystemExit:
             vg = None
-        r = lint_listing(n, sl, sa, (vg, None, None))
+        r = lint_listing(n, sl, sa, (vg, None))
         r["family"] = re.split(r"[<(]", dn, maxsplit=1)[0].split("::")[-1].strip() or n
         r["object"] = os.path.basename(path)
         r["bank_conf"] = r["bank_extra"] = None
@@ -363,17 +499,101 @@ def lint_object(path):
     return rows
 
 
-def lint_file(path):
-    """the rows of one code object: one kernel (a Loom compile) or several (another engine's build)"""
+def lint_file(path, rga=None):
+    """the rows of one code object: one kernel (a Loom compile) or several (another engine's build); RGA: live registers (--livereg)"""
     syms = kernel_symbols(path)
     if len(syms) == 1 and syms[0][0] == os.path.basename(path).rsplit(".", 1)[0]:
-        return [lint(path)]
-    return lint_object(path)
+        return [lint(path, rga)]
+    rows = lint_object(path)
+    for r in rows:
+        if rga is not None:
+            r["live"] = {"error": "rga: a multi-kernel object is not analysed"}
+    return rows
 
 
-def lint(path):
+LIVE_ROW = re.compile(r"^\s*\d+ \|\s*(\d+) \|[^|]*\| (?:label_\d+:\s*)?(.*)$")   # Line | Rn | register map | instruction
+
+
+def rga_tool(explicit=None):
+    """RGA (Radeon GPU Analyzer, `rga -s bin`): --rga, else RGA from the environment or the machine env file; None when absent"""
+    p = explicit or os.environ.get("RGA")
+    if not p:
+        f = os.environ.get("LSK_ENV") or os.path.expanduser("~/.config/loom-strix-kits/env")
+        m = re.search(r"(?m)^RGA=(\S+)", open(f).read()) if os.path.exists(f) else None
+        p = m.group(1) if m else None
+    return p if p and os.access(p, os.X_OK) else None
+
+
+def live_rows(text):
+    """(live VGPRs, instruction) per instruction of an RGA --livereg file, in program order"""
+    return [(int(m.group(1)), m.group(2).strip()) for m in map(LIVE_ROW.match, text.split("\n")) if m]
+
+
+def live(rows, ins, addr, budget):
+    """live-register figures of one kernel from RGA's rows matched to our listing (E527 / E531 / E533): {peak, loop_peak, at (offset
+    in the hot loop, mnemonic), floor (the loop's minimum: the carried values no schedule frees), over (loop instructions with more
+    live VGPRs than BUDGET, the next reachable tier's), loop}; {error} when the rows are not our instructions one for one (fail closed)"""
+    mn = lambda x: re.sub(r"(?:_e32|_e64|_dpp|_sdwa)+$", "", x.split()[0]) if x.split() else ""   # RGA drops encoding suffixes
+    if len(rows) != len(ins):
+        return {"error": f"rga: {len(rows)} rows for {len(ins)} instructions"}
+    j = next((j for j, (x, (_, y)) in enumerate(zip(ins, rows)) if mn(x) != mn(y)), None)
+    if j is not None:
+        what = "cannot decode" if rows[j][1].startswith("<unknown>") else f"has {rows[j][1].split()[0]!r} for"
+        return {"error": f"rga {what} instruction {j}, {ins[j].split()[0]!r}"}
+    out = {"peak": max((n for n, _ in rows), default=0)}
+    h = hot(ins, addr)
+    if h:
+        seg = [n for n, _ in rows[h[0]:h[1] + 1]]
+        k = max(range(len(seg)), key=seg.__getitem__)
+        out.update(loop=(h[0], h[1]), loop_peak=seg[k], at=(k, ins[h[0] + k].split()[0]), floor=min(seg),
+                   over=None if budget is None else sum(1 for n in seg if n > budget))
+    return out
+
+
+def rga_live(path, rga):
+    """RGA's live VGPR rows for one code object (a temporary dir per call), or {error}"""
+    import tempfile
+    if not rga:
+        return {"error": "rga: not found (--rga, or RGA in the environment / machine env file)"}
+    with tempfile.TemporaryDirectory(prefix="kl_rga.") as d:
+        p = subprocess.run([rga, "-s", "bin", "--isa", f"{d}/k.isa", "--livereg", f"{d}/k.live", "--co", path],
+                           capture_output=True, text=True)
+        fs = glob.glob(f"{d}/*.live")
+        if p.returncode or len(fs) != 1:
+            why = [x for x in (p.stdout + p.stderr).split("\n") if "rror" in x or "failed" in x]
+            return {"error": "rga: " + ((why[-1].strip() if why else f"exit {p.returncode}, {len(fs)} .live files")[:160])}
+        return live_rows(open(fs[0]).read())
+
+
+def live_text(r):
+    """the 'live' column: peak/floor/over (the kernel's peak live VGPRs, the hot loop's minimum, its instructions over the next tier's
+    VGPR budget); '-' without --livereg; 'unknown' when RGA failed (the line says why)"""
+    x = r.get("live")
+    if x is None:
+        return "-"
+    if "error" in x:
+        return "unknown"
+    return f"{x['peak']}/{x.get('floor', '-')}/{'-' if x.get('over') is None else x['over']}"
+
+
+def live_budget(r):
+    """the VGPRs a wave may hold at the next reachable tier (tier_state()'s VGPR cut, or today's count when only another resource must
+    move); None at the best tier, blocked or unverified (no over count then)"""
+    o = r.get("occ")
+    if not o or "why" in o or o["next"] is None:
+        return None
+    cut = [mx for n, _, _, mx, _ in o["needs"] if n == "vgpr"]
+    return cut[0] if cut else r.get("vgpr")
+
+
+def lint(path, rga=None):
     ins, addr = disasm(path)
     r = lint_listing(os.path.basename(path)[:-6], ins, addr, residency(path[:-6] + ".json"))
+    if rga is not None:
+        rows = rga_live(path, rga)
+        budget = live_budget(r)
+        r["live"] = rows if isinstance(rows, dict) else live(rows, ins, addr, budget)
+        r["live_budget"] = budget
     r["bank_conf"], r["bank_extra"] = bank(path[:-6] + ".json")
     ldsbank(r, path[:-6] + ".json", ins)
     return r
@@ -418,10 +638,13 @@ def ldsbank(r, js, ins):
         r.setdefault("notes", []).append("ldsbank")
 
 
-def lint_listing(name, ins, addr, res=(None, None, None)):
+def lint_listing(name, ins, addr, res=(None, None)):
     """the lint of one kernel's decoded listing (instructions, byte addresses), as lint() reports it"""
     r = {"kernel": name, "instr": len(ins), "flags": []}
-    r["vgpr"], r["waves"], r["to_next"] = res
+    r["vgpr"], r["occ"] = res
+    o = r["occ"] if r["occ"] and "why" not in r["occ"] else None
+    r["waves"], r["waves_bound"] = (o["tier"], o["bound"]) if o else (None, None)
+    r["next_tier"], r["to_next"] = (o["next"], {n: c for n, _, _, _, c in o["needs"]}) if o else (None, None)
     h = hot(ins, addr)
     if h is None or not any(ins[j].startswith(MM) for j in common_path(ins, h[2], h[0], h[1])):
         b = full = ins                                                # no multiply loop: the whole kernel (e.g. a dequant pass)
@@ -1211,6 +1434,9 @@ def main():
     ap.add_argument("--barriers", action="store_true", help="print every barrier of every analysed kernel with the hazard pairs it "
                     "orders and the potential races (computed only then), not only the kernels with a barrier that orders nothing or "
                     "that the check could not model")
+    ap.add_argument("--livereg", action="store_true", help="RGA's live VGPRs per instruction (rga -s bin --livereg): the 'live' "
+                    "column peak/floor/over and a line per kernel whose loop floor exceeds the next tier's VGPR budget")
+    ap.add_argument("--rga", help="with --livereg: the rga binary (default: RGA from the environment or the machine env file)")
     ap.add_argument("--flagged", action="store_true", help="print flagged kernels only")
     ap.add_argument("--strict", action="store_true", help="exit 1 when any kernel is flagged")
     a = ap.parse_args()
@@ -1228,6 +1454,9 @@ def main():
         srcs += sorted(glob.glob(os.path.join(x, "program", "*.loom"))) if os.path.isdir(x) else [x]
     texts += [open(x).read() for x in srcs]
     starts = kernel_starts(progs + srcs)
+    rga = None
+    if a.livereg:
+        rga = rga_tool(a.rga) or ""                       # "" : every kernel reports unknown (rga: not found), never a number
     stats, prompt = served_stats(a.profile) if a.profile else ({}, None)
     ms = collections.Counter({k: v[0] for k, v in stats.items()})
     files = []
@@ -1236,7 +1465,7 @@ def main():
     if not files:
         sys.exit("kernel_lint: no code objects")
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
-        rows = [r for rs in ex.map(lint_file, files) for r in rs]
+        rows = [r for rs in ex.map(lambda f: lint_file(f, rga), files) for r in rs]
     outl = outliers(rows)
     tiny(rows, stats)
     barriers(rows, kernel_texts(texts), func_texts(texts), a.roots, a.barriers)
@@ -1251,17 +1480,25 @@ def main():
                 r["flags"] += ["regress:" + x for x in regressions(r, lint(b))]
     rows.sort(key=lambda r: (-bool(r["flags"]), -ms.get(r["kernel"], 0), -len(r["flags"]), -(sites or {}).get(r["kernel"], 0), r["kernel"]))
     print(f"{'kernel':42s} {'where':>6s} {'loop':>5s} {'comm':>5s} {'mm':>4s} {'other/op':>8s} {'sel':>4s} {'pk':>3s} {'bfe':>4s} {'scr':>4s} {'mov':>4s} "
-          f"{'run':>4s} {'vgpr':>4s} {'w/S':>3s} {'next':>4s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
+          f"{'run':>4s} {'vgpr':>4s} {'w/S':>8s} {'next':>16s} {'live':>11s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
     for r in rows:
         if a.flagged and not r["flags"]:
             continue
         f = lambda v: "-" if v is None else str(v)
         s = "-" if sites is None else str(sites.get(r["kernel"], 0))
         print(f"{r['kernel']:42s} {r['where']:>6s} {r['loop']:5d} {r['common']:5d} {r['wmma'] or r['dot']:4d} {f(r['other_per_op']):>8s} {r['select']:4d} {r['pk']:3d} "
-              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {f(r['waves']):>3s} {f(r['to_next']):>4s} {r['pf']:>5s} {s:>5s} "
+              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {tier_text(r['occ'] if r.get('waves') is not None else None):>8s} {next_text(r):>16s} {live_text(r):>11s} {r['pf']:>5s} {s:>5s} "
               f"{f(r['lds_waits_per_op']):>5s} {f(r['cover_min']):>4s} {r['in_flight']:3d} {f(r.get('bank_extra')):>5s} "
               f"{('%.1f' % ms[r['kernel']]) if r['kernel'] in ms else '-':>8s}  "
               f"{' '.join(r['flags'])}{('  [' + ' '.join(r['notes']) + ']') if r.get('notes') else ''}")
+    for r in sorted(rows, key=lambda r: r["kernel"]):
+        x = r.get("live")
+        if x and "error" in x:
+            print(f"livereg {r['kernel']}: unknown ({x['error']})")
+        elif x and x.get("over"):
+            print(f"livereg {r['kernel']}: peak {x['peak']} live VGPRs; hot loop peak {x['loop_peak']} at +{x['at'][0]} {x['at'][1]}, floor "
+                  f"{x['floor']}; {x['over']} of {x['loop'][1] - x['loop'][0] + 1} loop instructions above the {r['live_budget']}-VGPR budget "
+                  f"of {tier_text(r['occ'], 'next')} waves/SIMD" + (" (the floor too: the carried values alone exceed it)" if x["floor"] > r["live_budget"] else ""))
     for k, (v, med, n) in sorted(outl.items()):
         print(f"outlier {k}: {v} non-MMA instructions per MMA vs a median of {med} over {n} peers")
     for r in rows:
