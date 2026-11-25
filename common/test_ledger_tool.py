@@ -29,9 +29,24 @@ CARD = """#!/bin/bash
 # predict: decode ratio 0.97-0.99
 # kill: ratio CI includes 1.0
 # budget: 45 min
+# bound: flash2 60.1 s (limit 29.7 s; best engine none measured), best case 1.2 % of the request (amdahl.py), resolved by served lane ABBA (floor 0.5 %)
 # result: paired decode time \\S+ \\(95 % CI over turns\\): all ([0-9.]+)
 set -u
 """
+# kernel_lint tables (verbatim rows, HRX-like 11-25): the base (pkg-e480, live), pkg-cmb2 (E521: the three-lever flash2 candidate
+# after the clash fix) and pkg-cmb (E520: the same levers before it, the V-tile prefetch lost: cover 58 -> 23 while the loop moved)
+HDR = ("kernel                                      where  loop  comm   mm other/op  sel  pk  bfe  scr  mov  run vgpr w/S next    pf "
+       "sites  ldsW  cov fly  bank       ms  flags\n")
+LINT_BASE = HDR + """g_attention_flash2_f16o                      loop   952   952   32     28.8  113   0   16    0   90   65  240   6    -  kept    16   1.5   58   0     0        -  copies  [addr64]
+g_attention_flash2_partial_f16o              loop  1003  1003   32     30.3  113   0   16    0   93   50  252   5   12  kept    16  1.62   86   3     0        -  copies  [addr64]
+kernel_lint: 2 kernels, 2 flagged
+"""
+LINT_CMB2 = HDR + """g_attention_flash2_f16o                      loop   903   903   32     27.2  113   0   16    0   72   58  237   6    -  kept    16   1.5  147   1     0        -  copies
+g_attention_flash2_partial_f16o              loop   950   950   32     28.7  113   0   16    0   59   43  237   6    -  kept    16  1.59   10   3     0        -  copies
+"""
+LINT_CMB_E520 = HDR + """g_attention_flash2_f16o                      loop   897   897   32     27.0  113   0   16    0   72   58  237   -    - drain     -   1.5   23   1     -        -  copies
+g_attention_flash2_partial_f16o              loop   944   944   32     28.5  113   0   16    0   59   43  237   -    - drain     -  1.59    8   3     -        -  copies
+"""   # kernel_lint on W/static-1125/combo/lint/combo.*.hsaco (E520's build)
 fails = []
 
 
@@ -118,6 +133,104 @@ def main():
         case("a measurement with its own stop, and an && chain with no measurement: OK", cli("probe-card", "check", plain)[0] == 0)
         quoted = w("q215.sh", CARD + "# events_ab.sh a && b (a comment)\necho 'hsaco_run.py && x'\n")
         case("a comment or a quoted string naming a tool is not a measurement", cli("probe-card", "check", quoted)[0] == 0)
+
+        # bound line. Recurrence (HRX-like E536 / E538, rules section 2 'Price the lever'): levers were built and timed with no
+        # stated price (the part's time, its limit, the best case for the whole request); exactly one well-formed bound line.
+        nob = w("q216.sh", "".join(l + "\n" for l in CARD.split("\n") if not l.startswith("# bound:")))
+        rc, out = cli("probe-card", "check", nob)
+        case(f"no '# bound:' line: MISSING ({out.strip()[:60]})", rc == 1 and "0 '# bound:' lines" in out)
+        bl = [l for l in CARD.split("\n") if l.startswith("# bound:")][0]
+        for alt, ok_, what in (("# bound: n/a (diagnosis)", True, "n/a (diagnosis)"),
+                               (bl.replace("flash2 60.1", "flash2 now 60.1"), True, "with 'now'"),
+                               (bl.replace("none measured", "llama.cpp 41.2 s"), True, "a measured best engine"),
+                               ("# bound: n/a", False, "n/a without (diagnosis)"),
+                               ("# bound: n/a (tool)", False, "n/a (tool)"),
+                               ("# bound: flash2 is slow", False, "free text"),
+                               (bl.replace(" (amdahl.py)", ""), False, "no amdahl.py source"),
+                               (bl.replace("(amdahl.py)", "(estimate)"), False, "a source other than amdahl.py"),
+                               (bl.replace(" (floor 0.5 %)", ""), False, "no floor"),
+                               (bl.replace("limit 29.7 s; ", ""), False, "no limit"),
+                               (bl + "\n" + bl, False, "two bound lines")):
+            p = w("q217.sh", CARD.replace(bl, alt))
+            rc, out = cli("probe-card", "check", p)
+            case(f"bound {what}: {'OK' if ok_ else 'MISSING'} ({out.strip()[:70]})", (rc == 0) == ok_)
+        # compiler lines. Recurrence (E110, E230, E318; HRX-like E520): a predicted static delta was never checked in the built
+        # binary, so a timing tested a change that was not there; each line must parse with a metric kernel_lint prints.
+        cl = "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 903"
+        for alt, ok_, what in ((cl, True, "a well-formed line"),
+                               (cl + "\n# compiler: g_attention_flash2(_partial)?_f16o vgpr 252 -> 237 (partial)", True, "two lines, a note"),
+                               (cl.replace("loop_instructions", "valu_per_tile"), False, "an unknown metric (VALU per tile is not printed)"),
+                               (cl.replace("loop_instructions", "s_barrier"), False, "s_barrier (not in kernel_lint's table)"),
+                               (cl.replace("g_attention_flash2_f16o", "g_attention_flash2_(f16o"), False, "a regex that does not compile"),
+                               (cl.replace(" -> 903", " 903"), False, "no arrow"),
+                               (cl.replace("952 -> 903", "952 -> fewer"), False, "a word for a number")):
+            p = w("q218.sh", CARD.replace("# result:", alt + "\n# result:"))
+            rc, out = cli("probe-card", "check", p)
+            case(f"compiler {what}: {'OK' if ok_ else 'MISSING'} ({out.strip()[:70]})", (rc == 0) == ok_)
+        # compiler-check against the built and base tables (E520's shape: the loop moved as predicted, the cover did not)
+        base, cmb2, e520 = w("lint-base.txt", LINT_BASE), w("lint-cmb2.txt", LINT_CMB2), w("lint-e520.txt", LINT_CMB_E520)
+        q205 = w("q219.sh", CARD.replace("# result:", cl + "\n# compiler: g_attention_flash2_f16o load_cover 58 -> 147\n# result:"))
+        rc, out = cli("compiler-check", q205, cmb2, base)
+        case(f"compiler-check, pkg-cmb2 vs live: both deltas present, COMPILER: OK ({out.strip()[-40:]})", rc == 0 and "COMPILER: OK" in out)
+        rc, out = cli("compiler-check", q205, e520, base)
+        case(f"compiler-check, E520's pkg-cmb vs live: the cover delta ABSENT, the loop line ok ({[l for l in out.split(chr(10)) if 'ABSENT' in l][:1]})",
+             rc == 1 and "load_cover" in out and "COMPILER: ABSENT" in out and out.count("COMPILER ABSENT") == 1)
+        rc, out = cli("compiler-check", q205, base, base)
+        case("compiler-check, the base against itself: both ABSENT (nothing moved)", rc == 1 and out.count("COMPILER ABSENT") == 2)
+        for line, what in (("# compiler: g_attention_flash2_f16o loop_instructions 952 -> 940", "a delta half as large (12 predicted, 49 read)"),
+                           ("# compiler: g_attention_flash2_f16o loop_instructions 952 -> 1000", "the wrong direction"),
+                           ("# compiler: g_attention_flash2_f16o loop_instructions 800 -> 903", "a base value far from FROM"),
+                           ("# compiler: g_attention_flash2_f16o vgpr 240 -> 240", "'unchanged' predicted, 240 -> 237 read"),
+                           ("# compiler: g_attention_flash2 loop_instructions 952 -> 903", "a regex matching no kernel (full match)"),
+                           ("# compiler: g_attention_flash2.*_f16o loop_instructions 952 -> 903", "one of two matched kernels off (partial 1003 -> 950)"),
+                           ("# compiler: g_attention_flash2_f16o pf 1 -> 2", "a metric not in the list")):
+            p = w("q220.sh", CARD.replace("# result:", line + "\n# result:"))
+            rc, out = cli("compiler-check", p, cmb2, base)
+            case(f"compiler-check, {what}: refused ({out.strip().splitlines()[-1]})", rc == 1)
+        rc, out = cli("compiler-check", w("q221.sh", CARD.replace("# result:", "# compiler: g_attention_flash2_f16o vgpr 240 -> 237\n# result:")), cmb2, base)
+        case("compiler-check, an exact delta (VGPR 240 -> 237): OK", rc == 0)
+        rc, out = cli("compiler-check", w("q223.sh", CARD.replace("# result:", "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 910\n# result:")), cmb2, base)
+        case("compiler-check, a loop count within 2 % of TO (910 predicted, 903 read): OK", rc == 0)
+        rc, out = cli("compiler-check", w("q224.sh", CARD.replace("# result:", "# compiler: g_attention_flash2_f16o vgpr 240 -> 238\n# result:")), cmb2, base)
+        case("compiler-check, VGPR is exact (238 predicted, 237 read): refused", rc == 1)
+        rc, out = cli("compiler-check", w("q225.sh", CARD.replace("# result:", "# compiler: g_attention_flash2_f16o waves 6 -> 6\n# result:")), e520, base)
+        case(f"compiler-check, a '-' value (no residency in the E520 table): refused ({out.strip()[-60:]})", rc == 1 and "no value" in out)
+        near = w("lint-951.txt", LINT_BASE.replace("   952   952", "   951   951", 1))
+        rc, out = cli("compiler-check", w("q226.sh", CARD.replace("# result:", "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 945\n# result:")), near, base)
+        case("compiler-check, 952 -> 945 predicted, 951 read (inside both 2 % bands, 1 of 7 moved): refused", rc == 1)
+        def pair(b_loop, a_loop, line, n):
+            bt = w(f"lint-b{n}.txt", LINT_BASE.replace("   952   952", f"   {b_loop}   {b_loop}", 1))
+            at = w(f"lint-a{n}.txt", LINT_BASE.replace("   952   952", f"   {a_loop}   {a_loop}", 1))
+            return cli("compiler-check", w(f"q23{n}.sh", CARD.replace("# result:", line + "\n# result:")), bt, at)
+        rc, out = pair(903, 952, "# compiler: g_attention_flash2_f16o loop_instructions 1000 -> 903", 0)
+        case("compiler-check, base 952 far from FROM 1000, built at TO, moved in the direction: refused", rc == 1)
+        rc, out = pair(958, 952, "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 945", 1)
+        case("compiler-check, 952 -> 945 predicted, 952 -> 958 read (both inside their bands, moved the other way): refused", rc == 1)
+        rc, out = pair(940, 960, "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 952", 2)
+        case("compiler-check, unchanged predicted, 960 -> 940 read (each inside 952's band, moved 20 > 19): refused", rc == 1)
+        rc, out = pair(950, 955, "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 952", 3)
+        case("compiler-check, unchanged predicted, 955 -> 950 read: OK", rc == 0)
+        rc, out = cli("verdict", w("q227.sh", "".join(l + "\n" for l in CARD.split("\n") if not l.startswith("# bound:"))), "0.98")
+        case(f"verdict does not need the bound line (an admission line, checked before the run): INSIDE ({out.strip()[:40]})", rc == 0)
+        only = w("lint-only.txt", LINT_CMB2.split("g_attention_flash2_partial")[0])
+        rc, out = cli("compiler-check", w("q222.sh", CARD.replace("# result:", "# compiler: g_attention_flash2.*_f16o vgpr 252 -> 237\n# result:")), only, base)
+        case("compiler-check, a matched kernel in one table only: refused", rc == 1 and "table only" in out)
+        mixed = w("lint-mixed.txt", LINT_CMB2 + LINT_BASE.split("\n", 1)[1])
+        rc, out = cli("compiler-check", q205, mixed, base)
+        case(f"compiler-check, a table holding two builds (a kernel twice): error, exit 2 ({out.strip()[:60]})", rc == 2 and "twice" in out)
+        rc, out = cli("compiler-check", q205, w("notlint.txt", "nothing\n"), base)
+        case("compiler-check, a file without kernel_lint's header: error, exit 2", rc == 2 and "no kernel_lint header" in out)
+        d = os.path.join(t, "lintdir")
+        os.makedirs(d)
+        open(os.path.join(d, "lint.txt"), "w").write(LINT_CMB2)
+        open(os.path.join(d, "run.log"), "w").write("build log\n")
+        rc, out = cli("compiler-check", q205, d, base)
+        case("compiler-check, a directory holding one table: read", rc == 0)
+        open(os.path.join(d, "lint2.txt"), "w").write(LINT_CMB2)
+        rc, out = cli("compiler-check", q205, d, base)
+        case("compiler-check, a directory holding two tables: error, exit 2", rc == 2 and "2 kernel_lint tables" in out)
+        rc, out = cli("compiler-check", good, cmb2, base)
+        case("compiler-check, a step without compiler lines: OK, nothing predicted", rc == 0 and "nothing predicted" in out)
 
         # verdict. Recurrence: a measured figure outside its prediction was taken as the lever's effect, not checked as the measurement.
         summ = "paired decode time pkg-b/pkg-a (95 % CI over turns): all {} [0.9, 1.0]; h1 0.95\n"

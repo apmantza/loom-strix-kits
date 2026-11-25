@@ -25,6 +25,11 @@ Header contract (lines of the leading comment block, after a shebang):
   # predict: <metric> <lo>-<hi>          e.g. 'decode ratio 0.97-0.99' (also lo..hi, lo to hi); lo <= hi
   # kill: <condition>                    what result stops the lever (free text)
   # budget: <minutes>                    the step's time budget, > 0 (an optional 'min' after the number)
+  # bound: PART [now] X (limit Y; best engine Z | none measured), best case B of the request (amdahl.py), resolved by M (floor F)
+                                       exactly one: the lever's price (rules section 2, 'Price the lever'; HRX-like E536 / E538);
+                                       a diagnosis or tool step: '# bound: n/a (diagnosis)'. Anything else is refused.
+  # compiler: KERNEL_REGEX METRIC FROM -> TO [(note)]   optional, one per predicted static delta in the built package: the regex
+                                       compiles, METRIC is a kernel_lint table column (COMPILER_METRICS), FROM / TO numbers
   # result: <regex>                      optional: one capture group, the result figure (the last match in the result file wins)
   # result-file: <path>                  optional: where verdict reads it (relative to the step's directory)
 
@@ -38,12 +43,21 @@ Subcommands and verdict lines (exit 0 ok, 1 refused / outside / owed, 2 usage or
                             --switch-var="..." values and `env A=1 cmd` prefixes, minus --exclude-switches-from's) plus the
                             searched terms (switches: exact name; searched: case-insensitive, from a word start). Loss words are
                             matched after negated forms ('not slower') are removed. It matches words, not diagnoses.
-  probe-card check STEP     PROBE: OK | MISSING                       predict, kill and budget present and well formed
+  probe-card check STEP     PROBE: OK | MISSING                       predict, kill, budget and bound present and well formed;
+                                                                      compiler lines (if any) well formed
+  compiler-check STEP BUILT BASE   COMPILER: OK | ABSENT            each '# compiler:' line against kernel_lint's table (its stdout,
+                            saved; or a directory holding exactly one such file) of the built package and of the base: every kernel
+                            the regex fully matches, present in both tables, must read FROM in BASE and TO in BUILT within the
+                            metric's tolerance (exact for vgpr, waves, scratch, in_flight, selects; 2 % otherwise) and have moved
+                            from BASE by at least half the predicted delta, in its direction (FROM == TO: unchanged within it). A regex matching no kernel, a kernel in one table only, a '-' value, a table with
+                            a kernel twice (two builds mixed) or without kernel_lint's header: ABSENT / error. Recurrence: E520's
+                            three-lever flash2 build lost the V-tile prefetch (cover 58 -> 23) while its loop count moved as
+                            predicted; the delta a hypothesis predicts is checked before any GPU minute (E110, E230, E318).
   verdict STEP [RESULT]     VERDICT: INSIDE | OUTSIDE                 RESULT: a file (the header's result regex, last match) or a
                             number; default the header's result-file. OUTSIDE: debug the measurement before believing it.
   owed                      OWED: N                                   kept wins with targets no later row marked ported / dropped
 --grandfather N: steps whose name carries a number <= N (first digit run of the basename) pass with a note (written before the check).
-usage: ledger_tool.py [--ledger LOG.md [--ledger ARCHIVE.md]] [--id REGEX] [--result-from K] {preflight,probe-card check,verdict,owed} ..."""
+usage: ledger_tool.py [--ledger LOG.md [--ledger ARCHIVE.md]] [--id REGEX] [--result-from K] {preflight,probe-card check,compiler-check,verdict,owed} ..."""
 import argparse
 import os
 import re
@@ -61,6 +75,21 @@ PREDICT = re.compile(r"^#\s*predict:\s*(?P<metric>.*?\S)\s+(?P<lo>" + NUM + r")\
 KILL = re.compile(r"^#\s*kill:\s*\S")
 BUDGET = re.compile(r"^#\s*budget:\s*(" + NUM + r")\s*(?:min|minutes)?(?:\s*\(.*\))?\s*$")
 TARGET = re.compile(r"^[\w.:+/-]+$")
+BOUND = re.compile(r"^#\s*bound:\s*(?P<part>\S.*?)\s+(?:now\s+)?(?P<now>" + NUM + r")\s*[^\s(),;]*\s*"
+                   r"\(limit\s+(?P<limit>" + NUM + r")[^;()]*;\s*best engine\s+(?P<engine>[^()]*?\S)\s*\)\s*,\s*"
+                   r"best case\s+(?P<best>" + NUM + r")\s*%?[^()]*?\s+of the request\s*\((?P<tool>[^()]*amdahl\.py[^()]*)\)\s*,\s*"
+                   r"resolved by\s+(?P<by>[^()]*?\S)\s*\(floor\s+(?P<floor>" + NUM + r")[^()]*\)\s*$")
+BOUND_NA = re.compile(r"^#\s*bound:\s*n/a \(diagnosis\)\s*$")
+COMPILER = re.compile(r"^#\s*compiler:\s*(?P<rx>\S+)\s+(?P<metric>\S+)\s+(?P<frm>" + NUM + r")\s*->\s*(?P<to>" + NUM +
+                      r")\s*(?:\([^()]*\))?\s*$")
+# metric -> kernel_lint table column (the columns kernel_lint.py prints; 'VALU per tile' and s_barrier are not printed: refused)
+COMPILER_METRICS = {"loop_instructions": "loop", "common_path": "comm", "non_mma_per_mma": "other/op", "selects": "sel",
+                    "scratch": "scr", "moves": "mov", "move_run": "run", "vgpr": "vgpr", "waves": "w/S", "load_cover": "cov",
+                    "in_flight": "fly", "lds_waits_per_mma": "ldsW"}
+# tolerance (share of the predicted value): exact for counts where one unit is the effect (registers, waves, spills, loads in
+# flight, selects); 2 % for counts a scheduler moves by a few instructions between builds
+COMPILER_TOL = {m: 0.0 for m in ("vgpr", "waves", "scratch", "in_flight", "selects")}
+COMPILER_TOL.update({m: 0.02 for m in COMPILER_METRICS if m not in COMPILER_TOL})
 END = r"(?=[;|()`]|\.(?:\s|$)|$)"
 ARCHIVE = re.compile(r"^Archive:\s*(\S+)\s*$")
 
@@ -237,6 +266,32 @@ def card(step):
             f["budget"] = float(m.group(1))
         else:
             f["kill"] = ls[0].split(":", 1)[1].strip()
+    ls = [l for l in hd if re.match(r"^#\s*bound:", l)]
+    if len(ls) != 1:
+        probs.append(f"{len(ls)} '# bound:' lines (need exactly one: '# bound: PART now X (limit Y; best engine Z | none measured), "
+                     "best case B of the request (amdahl.py), resolved by M (floor F)' or '# bound: n/a (diagnosis)')")
+    elif BOUND_NA.match(ls[0]):
+        f["bound"] = None
+    elif BOUND.match(ls[0]):
+        f["bound"] = BOUND.match(ls[0]).groupdict()
+    else:
+        probs.append(f"'# bound:' line not in a known form: {ls[0]!r}")
+    f["compiler"] = []
+    for l in (l for l in hd if re.match(r"^#\s*compiler:", l)):
+        m = COMPILER.match(l)
+        if not m:
+            probs.append(f"'# compiler:' line not in a known form (KERNEL_REGEX METRIC FROM -> TO): {l!r}")
+            continue
+        if m.group("metric") not in COMPILER_METRICS:
+            probs.append(f"'# compiler:' metric {m.group('metric')!r} is not one kernel_lint prints "
+                         f"({', '.join(sorted(COMPILER_METRICS))}): {l!r}")
+            continue
+        try:
+            rx = re.compile(m.group("rx"))
+        except re.error as e:
+            probs.append(f"'# compiler:' regex does not compile ({e}): {l!r}")
+            continue
+        f["compiler"].append((l, rx, m.group("metric"), float(m.group("frm")), float(m.group("to"))))
     for key in ("result", "result-file"):
         ls = [l.split(":", 1)[1].strip() for l in hd if re.match(r"^#\s*" + key + r":", l)]
         if len(ls) > 1:
@@ -273,6 +328,7 @@ def chains(text):
 def verdict(step, result=None):
     """(line, exit code, detail lines)"""
     f, probs = card(step)
+    probs = [p for p in probs if "'# bound:'" not in p and "'# compiler:'" not in p]   # admission lines: probe-card check's job
     if "predict" not in f or probs:
         return "VERDICT: ERROR", 2, ["probe card not valid: " + "; ".join(probs or ["no predict line"])]
     metric, lo, hi = f["predict"]
@@ -330,6 +386,71 @@ def owed(log):
     return items, probs
 
 
+def lint_table(path):
+    """{kernel: {column: float or None}} from kernel_lint's saved stdout (PATH, or the one file in a directory that holds its
+    header); raises ValueError on no header, a kernel twice, or a row that does not split into the header's columns"""
+    if os.path.isdir(path):
+        hits = [os.path.join(path, n) for n in sorted(os.listdir(path)) if os.path.isfile(os.path.join(path, n))
+                and open(os.path.join(path, n), errors="replace").readline().split()[:3] == ["kernel", "where", "loop"]]
+        if len(hits) != 1:
+            raise ValueError(f"{path}: {len(hits)} kernel_lint tables in the directory (need exactly one; pass the file)")
+        path = hits[0]
+    cols, rows = None, {}
+    for line in open(path, errors="replace"):
+        w = line.split()
+        if w[:3] == ["kernel", "where", "loop"]:
+            if cols is not None:
+                raise ValueError(f"{path}: two kernel_lint headers (two runs in one file)")
+            cols = w[:w.index("flags")] if "flags" in w else w
+            continue
+        if cols is None or len(w) < len(cols) or w[1] not in ("loop", "kernel"):
+            continue
+        if w[0] in rows:
+            raise ValueError(f"{path}: kernel {w[0]} twice (two builds in one table)")
+        vals = {}
+        for c, v in zip(cols[2:], w[2:len(cols)]):
+            try:
+                vals[c] = None if v == "-" else float(v)
+            except ValueError:
+                vals[c] = v
+        rows[w[0]] = vals
+    if cols is None:
+        raise ValueError(f"{path}: no kernel_lint header ('kernel where loop ...')")
+    return rows
+
+
+def compiler_check(step, built, base):
+    """(lines, problems): each '# compiler:' line against the built and base kernel_lint tables"""
+    f, probs = card(step)
+    probs = [p for p in probs if "compiler:" in p]
+    if not f["compiler"] and not probs:
+        return ["no '# compiler:' lines: nothing predicted"], []
+    tb, ta = lint_table(built), lint_table(base)
+    out = []
+    for line, rx, metric, frm, to in f["compiler"]:
+        col, tol = COMPILER_METRICS[metric], COMPILER_TOL[metric]
+        near = lambda v, x: abs(v - x) <= tol * abs(x)
+        names = sorted(k for k in set(tb) | set(ta) if rx.fullmatch(k))
+        if not names:
+            probs.append(f"{line!r}: the regex matches no kernel in either table")
+            continue
+        for k in names:
+            if k not in tb or k not in ta:
+                probs.append(f"{line!r}: {k} is in the {'base' if k in ta else 'built'} table only")
+                continue
+            a, b = ta[k].get(col), tb[k].get(col)
+            if not isinstance(a, float) or not isinstance(b, float):
+                probs.append(f"{line!r}: {k} {col} has no value (base {a!r}, built {b!r})")
+                continue
+            moved = near(a, frm) and near(b, to) and (abs(b - a) <= tol * abs(frm) if frm == to else
+                                                       (b - a) * (to - frm) > 0 and abs(b - a) >= abs(to - frm) / 2)
+            out.append(f"  {k} {metric}: base {a:g} built {b:g} (predicted {frm:g} -> {to:g}): {'ok' if moved else 'ABSENT'}")
+            if not moved:
+                probs.append(f"{line!r}: {k} {metric} read {a:g} -> {b:g}, predicted {frm:g} -> {to:g} (within {100 * tol:g} %, at "
+                             "least half the delta in its direction): go back to source, not to a timing")
+    return out, probs
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--ledger", action="append", help="the experiment log (markdown table; default LEDGER.md); repeat to add "
@@ -347,6 +468,10 @@ def main(argv=None):
     p.add_argument("action", choices=["check"])
     p.add_argument("step")
     p.add_argument("--grandfather", type=int)
+    p = sub.add_parser("compiler-check")
+    p.add_argument("step")
+    p.add_argument("built", help="kernel_lint's saved stdout for the built package (or a directory holding exactly one)")
+    p.add_argument("base", help="the same for the base package")
     p = sub.add_parser("verdict")
     p.add_argument("step")
     p.add_argument("result", nargs="?")
@@ -369,6 +494,18 @@ def main(argv=None):
             print(f"PROBE: OK ({name}: predict {m} {lo:g}-{hi:g}; kill {f['kill'][:60]!r}; budget {f['budget']:g} min"
                   + ("; result regex" if "result" in f else "; no result regex: judge by hand") + ")")
             return 0
+        if a.cmd == "compiler-check":
+            try:
+                lines, probs = compiler_check(a.step, a.built, a.base)
+            except ValueError as e:
+                print(f"COMPILER: ERROR {e}")
+                return 2
+            for x in lines:
+                print(x)
+            for x in probs:
+                print(f"COMPILER ABSENT {os.path.basename(a.step)}: {x}")
+            print("COMPILER: " + ("ABSENT" if probs else "OK"))
+            return 1 if probs else 0
         if a.cmd == "verdict":
             line, rc, detail = verdict(a.step, a.result)
             print(line)
