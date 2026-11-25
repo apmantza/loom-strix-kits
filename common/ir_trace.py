@@ -18,6 +18,11 @@ never against the served binary. The tool prints the served-vs-control distance 
   op whose result is used, a block's last op (terminator), or a label; moving across a block boundary, above a definition of an
   operand, below a use of a result, or after a terminator. Use source value names (%pl7_1, %one_f): numbered names (%1674) are
   renumbered by every pass. Waits cannot be edited here (they are emitted later); a load whose result is used cannot be deleted.
+  A move onto the op's own position (after its predecessor, before its successor) is a no-op. Only SSA def-use and block
+  membership are checked: moves across s_barrier, low.schedule.fence or a memory dependence, and deleting a store or a barrier, are
+  accepted unchecked, so an edited kernel may compute wrong results by design: a timing ablation, never a candidate.
+  Outputs (X.hsaco, X.json, X.loom, X.control.*) appear only when every step succeeded; a refusal or a failed assembly removes a
+  stale X.* first and leaves the attempt under WORK/failed/.
 
 bisect: evaluate a predicate after every pass and name the first pass from which it holds through the end.
   PRED := present /A/ | order /A/ /B/ | between /A/ /B/ /C/
@@ -27,7 +32,13 @@ bisect: evaluate a predicate after every pass and name the first pass from which
   with --region loop, the default, or the whole kernel with --region all) of the served code object and of each snapshot that
   assembles with --pipeline=none (prepared-Low ones); refused (exit 2) when the served binary and the reassembled final snapshot
   disagree (the round trip changed the property, so reassembly cannot locate it). An asm property already present at the first
-  assemblable snapshot is reported as placed at code emission from IR present there: name the IR-level cause with --on ir.
+  assemblable snapshot is reported as placed at code emission from IR present there; the asm view sees only the snapshots that
+  assemble (flash2: events 65-69, after amdgpu-materialize-hal-kernel-abi; events 56-64 are Low but are not ABI-complete), so name
+  the IR-level cause over earlier passes with --on ir. `between` and `order` follow listing order, not control-flow paths (a wait on
+  a branch not taken still counts), and look only at the first A: a later A with its own B / C is never examined.
+  Comments and string literals are blanked before any anchor or brace is matched (code, not prose).
+'served' everywhere means this tool's default-pipeline single-root compile (`loom-compile PROGRAM --target=amdgpu:gfx1151
+--root=ROOT`, as kernel_lint compiles), not a loom-serve launch-site specialisation (common/serve_code_dump.py dumps those).
 usage: ir_trace.py ablate PROGRAM ROOT --edit EDIT [--edit EDIT ...] --out X.hsaco [--work DIR] [--loom-compile PATH]
        ir_trace.py bisect PROGRAM ROOT --pred PRED [--on ir|asm] [--region loop|all] [--work DIR] [--loom-compile PATH]
 exit: 0 done, 2 refused (anchor, guard, predicate, control), 3 the compiler failed (its message is printed)."""
@@ -36,6 +47,7 @@ import collections
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -98,6 +110,14 @@ def assemble(lc, low, out, report=True):
 
 
 # ------------------------------------------------------------------------------------------------------------ IR text
+STRING_OR_COMMENT = re.compile(r'"(?:\\.|[^"\\])*"|//.*')
+
+
+def code(line):
+    """a line as code: string literals blanked to "" and a // comment dropped (anchors, braces and names match code, not prose)"""
+    return STRING_OR_COMMENT.sub(lambda m: '""' if m.group(0).startswith('"') else "", line)
+
+
 def body(lines, root):
     """(first, last) line indices of ROOT's body (exclusive of its def line and closing brace) in a Loom text"""
     pat = re.compile(r'^(low\.)?kernel\.def\b.*\bexport\("' + re.escape(root) + r'"\)')
@@ -106,9 +126,11 @@ def body(lines, root):
         raise Refused(f"{len(starts)} definitions of kernel {root} in the text (need exactly one)")
     s, depth = starts[0], 0
     for j in range(s, len(lines)):                    # brace depth: a source kernel is `{ config } launch(...) { body }`
-        t = re.sub(r'"(?:\\.|[^"\\])*"', '""', lines[j])
+        t = code(lines[j])
         depth += t.count("{") - t.count("}")
         if depth == 0 and j > s:
+            if not any(code(x).strip() for x in lines[s + 1:j]):
+                raise Refused(f"kernel {root}: empty body")
             return s + 1, j - 1
     raise Refused(f"kernel {root}: no closing brace")
 
@@ -183,7 +205,8 @@ def blocks(lines, lo, hi):
 
 
 def is_op(t):
-    return bool(t) and not LABEL.match(t) and not t.startswith("//")
+    """T is a stripped code() line"""
+    return bool(t) and not LABEL.match(t)
 
 
 def find(lines, lo, hi, op, prev=None, nxt=None, what=""):
@@ -208,43 +231,52 @@ def uses_of(lines, lo, hi, names, skip):
     return [i for i in range(lo, hi + 1) if i != skip and defs_uses(lines[i])[1] & names]
 
 
+def last_op(cl, blk, i, hi):
+    """no op line follows line I in its block"""
+    return not any(is_op(cl[k].strip()) for k in range(i + 1, hi + 1) if blk[k] == blk[i])
+
+
 def apply_edit(lines, root, e):
-    """apply one parsed edit to a module's lines (a new list) and return (lines, a one-line description)"""
+    """apply one parsed edit to a module's lines (a new list) and return (lines, a one-line description); every check reads the
+    code() view of the lines (comments and strings blanked), the output keeps the original text"""
     lo, hi = body(lines, root)
+    src, lines = lines, [code(x) for x in lines]
     i = find(lines, lo, hi, e["op"], e.get("prev"), e.get("next"), f"edit {e['text']!r}")
-    t = lines[i].strip()
+    t = src[i].strip()
     blk = blocks(lines, lo, hi)
-    last_in_block = i == hi or LABEL.match(lines[i + 1].strip()) or blk.get(i + 1) != blk[i]
-    if last_in_block:
+    if last_op(lines, blk, i, hi):
         raise Refused(f"edit {e['text']!r}: line {i + 1} is its block's last op (a terminator): {t[:120]}")
-    d, _ = defs_uses(t)
+    d, _ = defs_uses(lines[i])
     if e["action"] == "delete":
         used = uses_of(lines, lo, hi, d, i)
         if used:
             raise Refused(f"edit {e['text']!r}: line {i + 1} defines {sorted(d)}, read at line(s) {[u + 1 for u in used[:6]]}: "
                           "deleting it would leave a use without a definition")
-        return lines[:i] + lines[i + 1:], f"deleted line {i + 1}: {t}"
+        return src[:i] + src[i + 1:], f"deleted line {i + 1}: {t}"
     where, tre = e["to"]
     j = find(lines, lo, hi, tre, what=f"edit {e['text']!r} target")
     if j == i:
         raise Refused(f"edit {e['text']!r}: the target is the moved op itself")
     if blk[j] != blk[i]:
         raise Refused(f"edit {e['text']!r}: target line {j + 1} is in another block than line {i + 1}")
-    pos = j if where == "before" else j + 1           # insertion index in the original numbering
-    if where == "after" and (j == hi or blk.get(j + 1) != blk[j]):
+    if where == "after" and last_op(lines, blk, j, hi):
         raise Refused(f"edit {e['text']!r}: cannot move after the block's last op (line {j + 1})")
-    _, u = defs_uses(t)
-    if pos < i:                                       # moving up: no operand may be defined in [pos, i)
-        bad = [k for k in range(pos, i) if defs_uses(lines[k])[0] & u]
+    pos = j if where == "before" else j + 1           # insertion index in the original numbering
+    dest = pos if pos <= i else pos - 1               # the op's index once removed and reinserted
+    if dest == i:                                     # after its predecessor / before its successor: nothing moves (review F1)
+        return src[:], f"no-op: line {i + 1} is already {where} line {j + 1}: {t}"
+    _, u = defs_uses(lines[i])
+    if dest < i:                                      # moving up: the op crosses [dest, i); none may define an operand
+        bad = [k for k in range(dest, i) if defs_uses(lines[k])[0] & u]
         if bad:
             raise Refused(f"edit {e['text']!r}: an operand is defined at line {bad[0] + 1}, between the target and the op")
-    else:                                             # moving down: no result may be read in (i, pos)
-        bad = [k for k in range(i + 1, pos) if defs_uses(lines[k])[1] & d]
+    else:                                             # moving down: the op crosses (i, dest]; none may read a result
+        bad = [k for k in range(i + 1, dest + 1) if defs_uses(lines[k])[1] & d]
         if bad:
             raise Refused(f"edit {e['text']!r}: a result is read at line {bad[0] + 1}, between the op and the target")
-    out = lines[:]
+    out = src[:]
     moved = out.pop(i)
-    out.insert(pos if pos < i else pos - 1, moved)
+    out.insert(dest, moved)
     return out, f"moved line {i + 1} {where} line {j + 1}: {t}"
 
 
@@ -284,7 +316,7 @@ def evaluate(pred, lines):
 def ir_region(path, root):
     lines = open(path).read().split("\n")
     lo, hi = body(lines, root)
-    return [l.strip() for l in lines[lo:hi + 1]]
+    return [code(l).strip() for l in lines[lo:hi + 1]]
 
 
 def asm_region(hs, region):
@@ -317,8 +349,17 @@ def opcode_delta(a, b):
 
 def cmd_ablate(a):
     lc = compiler(a.loom_compile)
+    base = os.path.splitext(a.out)[0]
+    outs = [a.out, base + ".json", base + ".loom", base + ".control.loom", base + ".control.hsaco", base + ".control.json"]
+    for f in outs:                                     # a stale object from an earlier run must not survive a refusal (review F5)
+        if os.path.exists(f):
+            os.remove(f)
     edits = [parse_edit(s) for s in a.edit]            # syntax refused before any compile
-    work = a.work or os.path.splitext(a.out)[0] + ".work"
+    work = a.work or base + ".work"
+    stage = os.path.join(work, "failed")               # built here; moved to the --out names only when everything succeeded
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage)
+    st = {f: os.path.join(stage, os.path.basename(f)) for f in outs}
     ev, served = trace(lc, a.program, a.root, work)
     final = ev[-1]
     print(f"snapshot: event {final['event_ordinal']} after {final['pass']} ({final['stage']}), {len(ev)} events; {final['path']}")
@@ -327,19 +368,20 @@ def cmd_ablate(a):
     for e in edits:
         lines, what = apply_edit(lines, a.root, e)
         print(f"  {e['action']}: {what[:160]}")
-    base = os.path.splitext(a.out)[0]
-    ctrl_low, edit_low = base + ".control.loom", base + ".loom"
-    open(ctrl_low, "w").write(text)
-    open(edit_low, "w").write("\n".join(lines))
-    assemble(lc, ctrl_low, base + ".control.hsaco")
-    assemble(lc, edit_low, a.out)
+    open(st[base + ".control.loom"], "w").write(text)
+    open(st[base + ".loom"], "w").write("\n".join(lines))
+    assemble(lc, st[base + ".control.loom"], st[base + ".control.hsaco"])
+    assemble(lc, st[base + ".loom"], st[a.out])
     s, _ = disasm(served)
-    c, _ = disasm(base + ".control.hsaco")
-    x, _ = disasm(a.out)
+    c, _ = disasm(st[base + ".control.hsaco"])
+    x, _ = disasm(st[a.out])
+    for f in outs:
+        os.replace(st[f], f)
+    os.rmdir(stage)
     rt = "identical" if s == c else f"DIFFERS ({len(s)} -> {len(c)} instructions, opcode delta {opcode_delta(s, c)})"
     print(f"round trip served -> control (unedited, --pipeline=none): {rt}")
     print(f"control -> edited: {len(c)} -> {len(x)} instructions, opcode delta {opcode_delta(c, x)}")
-    print(f"wrote {a.out} (+ .json report), control {base}.control.hsaco, Low {edit_low} / {ctrl_low}; trace {work}/trace")
+    print(f"wrote {a.out} (+ .json report), control {base}.control.hsaco, Low {base}.loom / {base}.control.loom; trace {work}/trace")
     print("judge the ablation against the control, not the served binary" + ("" if s == c else " (the round trip changed it)"))
     return 0
 
@@ -390,8 +432,12 @@ def cmd_bisect(a):
     elif a.on == "ir" and k == 0:
         print("verdict: holds in the input program and after every pass: no pass introduced it (the program text did)")
     elif a.on == "asm" and k == 0:
-        print(f"verdict: holds from the first assemblable snapshot (event {rows[0][0]}, after {rows[0][1]}): placed at code "
-              "emission from IR present there; no prepared-Low pass to blame (use --on ir for earlier passes)")
+        a0, an = int(rows[0][0]), int(rows[-2][0])
+        low = next((int(e["event_ordinal"]) for e in ev if e["pass"] == "source-to-low"), None)
+        early = (f"events {low}-{a0 - 1} are Low but do not assemble, events before {low} are source IR"
+                 if low is not None and low < a0 else f"events before {a0} do not assemble")
+        print(f"verdict: holds from the first assemblable snapshot (event {a0}, after {rows[0][1]}): placed at code emission from "
+              f"IR present there; no assembling snapshot (events {a0}-{an}) to blame; {early}: use --on ir for them")
     else:
         print(f"verdict: first holds after event {rows[k][0]} {rows[k][1]} (state before: {states[k - 1]}) and through the end")
     return 0

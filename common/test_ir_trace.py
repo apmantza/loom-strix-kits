@@ -13,6 +13,7 @@ usage: test_ir_trace.py                                   (text-level cases, no 
        test_ir_trace.py --program LIVE.loom --root ROOT [--nob3 NOB3.loom] [--sf SF.loom --fixed FIXED.loom]
                                                           (also compiles: ablate on live, bisect on E520's pair)"""
 import argparse
+import json
 import os
 import re
 import shutil
@@ -23,6 +24,7 @@ import tempfile
 H = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, H)
 import ir_trace as it  # noqa: E402
+from loop_census import disasm  # noqa: E402
 
 fails = 0
 
@@ -116,7 +118,7 @@ def text_cases():
     r = refused(edit, "move /^%ld = / to=before:/^%d = /")
     ok(r is not None and "another block" in r, "moving across a block boundary refused")
     r = refused(edit, "move /^%free = / to=after:/^low.cond_br /")
-    ok(r is not None, "moving after a terminator refused")
+    ok(r is not None and "cannot move after the block's last op" in r, "moving after a terminator refused, for that reason")
     out, _ = edit("move /^%ld = / to=after:/^%c = /")
     b = body_text(out)
     ok(b.index("%ld = global_load_b32_vaddr %b") == b.index("%c = v_add_u32 %b, %a") + 1, "a legal move lands after its target")
@@ -149,8 +151,74 @@ def text_cases():
     ok((lo, hi) == (1, 4), "a source kernel's body spans its launch region (`} launch(...) {`) up to its own closing brace")
     ok(it.evaluate(it.parse_pred("present /^%vh = vector.load/"), [l.strip() for l in src[lo:hi + 1]])[0] == "H",
        "an anchor after `} launch` is found in a source kernel (E520's V loads)")
+    r2_cases()
     ok(it.first_steady(list("NNHH")) == 2 and it.first_steady(list("HNH")) == 2 and it.first_steady(list("HHN")) is None
        and it.first_steady(list("UHH")) == 1 and it.first_steady(list("HHH")) == 0, "first_steady: the pass from which H lasts")
+
+
+def safe(fn, *a):
+    """the edit's result, or ([], the refusal) so a wrongly refused edit is one FAIL, not a crash"""
+    try:
+        return fn(*a)
+    except it.Refused as e:
+        return [], f"refused: {e}"
+
+
+def r2_cases():
+    """review r2: F1 (a move onto its own position swapped two lines unchecked), F2 / F3 (comments read as code), M10, M13, M15, M17"""
+    # F1: after the predecessor / before the successor is the op's own position: a no-op, byte-identical text, never a swap
+    for e in ("move /^%b = / to=after:/^%a = /",                    # dependent pair (%b reads %a): the swap put a use above its def
+              "move /^%a = / to=before:/^%b = /",
+              "move /^s_barrier$/ prev=/^%pl7_1 = / to=before:/^%free = /",  # independent pair: the swap was silent
+              "move /^%free = / to=before:/^low.cond_br /"):
+        try:
+            out, what = edit(e)
+            ok(out == L() and "no-op" in what, f"F1: {e!r} leaves the text identical and says no-op")
+        except it.Refused as x:
+            ok(False, f"F1: {e!r} refused instead of a no-op: {x}")
+    # F1: every real move checks the lines it actually crosses, one line either way
+    r = refused(edit, "move /^%b = / to=before:/^%a = /")
+    ok(r is not None and "operand is defined" in r, "F1: moving up over the operand's definition by one line refused")
+    r = refused(edit, "move /^%a = / to=after:/^%b = /")
+    ok(r is not None and "result is read" in r, "F1: moving down over the result's use by one line refused")
+    out, what = safe(edit, "move /^%free = / to=after:/^%pl7_1 = /")
+    b = body_text(out)
+    w = b.index("%pl7_1 = v_wmma_f32_16x16x16_f16 %c, %c, %c")
+    ok(b[w + 1:w + 3] == ["%free = v_mov_b32 3", "s_barrier"] and len(out) == len(L()) and "no-op" not in what,
+       "F1: an independent one-line move up swaps exactly that pair")
+    # M15: the target is the op itself
+    r = refused(edit, "move /^%ld = / to=after:/^%ld = /")
+    ok(r is not None and "the moved op itself" in r, "M15: a move onto the op itself refused")
+    # M13: labels are not ops
+    r = refused(edit, "delete /^\\^_bb1:/")
+    ok(r is not None and "matches 0 lines" in r, "M13: a block label cannot be deleted (not an op)")
+    # M17 / F2: comments are not code, for edits and for predicates; strings neither
+    com = L()
+    k = com.index("  %free = v_mov_b32 3")
+    com[k:k] = ["  // %free = v_mov_b32 3 (a comment quoting the op)"]
+    out, _ = safe(it.apply_edit, com, "k", it.parse_edit("delete /%free = v_mov_b32/"))
+    ok("  // %free = v_mov_b32 3 (a comment quoting the op)" in out and "  %free = v_mov_b32 3" not in out,
+       "M17: an anchor quoted in a comment matches only the op")
+    r = refused(lambda: it.apply_edit(com, "k", it.parse_edit("delete /quoting the op/")))
+    ok(r is not None and "matches 0 lines" in r, "M17: a comment line is not an op")
+    d = tempfile.mkdtemp(prefix="test_ir_trace.r2.", dir=os.environ.get("TEST_IR_TRACE_TMP"))
+    src = os.path.join(d, "c.loom")
+    open(src, "w").write('kernel.def export("k") @k() {\n  // S exchange slots: mine and my partner\'s (wave ^ 1).\n'
+                         '  %x = op {name = "partner"}\n  %y = other %x\n}\n')
+    reg = it.ir_region(src, "k")
+    ok(it.evaluate(it.parse_pred("present /partner/"), reg)[0] == "N", "F2: a needle in a comment or a string does not hold")
+    ok(it.evaluate(it.parse_pred("order /partner/ /^%y = /"), reg)[0] == "U", "F2: a comment-only anchor is undefined (U)")
+    ok(it.evaluate(it.parse_pred("order /^%x = / /^%y = /"), reg)[0] == "H", "F2: code lines still match")
+    shutil.rmtree(d)
+    # F3: braces in comments do not move the body's end; an empty body is refused
+    cb = ['kernel.def export("k") @k() {', "  // close the tile }", "  %x = op", "  // open {", "  %y = op %x", "}",
+          'kernel.def export("k2") @k2() {', "  %z = op", "}"]
+    ok(safe(it.body, cb, "k") == (1, 4), "F3: a '}' or '{' in a comment does not end or extend the body")
+    r = refused(it.body, ['kernel.def export("e") @e() {', "}"], "e")
+    ok(r is not None and "empty body" in r, "F3: an empty kernel body refused")
+    # M10: between looks for B after A only
+    P = lambda s, lines: it.evaluate(it.parse_pred(s), lines)[0]  # noqa: E731
+    ok(P("between /A/ /B/ /C/", ["B", "A", "x", "C"]) == "N", "M10: a B before A does not count")
 
 
 def run(args):
@@ -163,11 +231,40 @@ def compile_cases(a, d):
     rc, out = run(["ablate", a.program, a.root, "--out", f"{d}/x.hsaco"] + b3)
     ok(rc == 0 and "control -> edited" in out and "opcode delta {'s_barrier': -2}" in out,
        "ablate: B3 removed at Low; control -> edited is exactly s_barrier -2")
-    ok(os.path.exists(f"{d}/x.json") and os.path.exists(f"{d}/x.control.hsaco"), "ablate writes the report and the control")
+    rep_ = json.load(open(f"{d}/x.json")) if os.path.exists(f"{d}/x.json") else {}
+    ok(rep_.get("kind") == "loom.compile_report" and rep_.get("function") == a.root, "ablate writes the edited object's compile report")
+    if os.path.exists(f"{d}/x.control.hsaco"):
+        ci, _ = disasm(f"{d}/x.control.hsaco")
+        xi, _ = disasm(f"{d}/x.hsaco")
+        ok(sum(l.startswith("s_barrier") for l in ci) == 6 and sum(l.startswith("s_barrier") for l in xi) == 4,
+           "ablate's control keeps live's 6 barriers, the edit has 4")
+    else:
+        ok(False, "ablate writes the control")
     m = re.search(r"round trip served -> control \(unedited, --pipeline=none\): (.*)", out)
-    ok(m is not None, f"ablate reports the round trip ({m.group(1)[:60] if m else 'missing'})")
+    ok(m is not None and m.group(1).startswith("DIFFERS (4805 -> 4808 instructions"),
+       f"ablate reports live's round-trip distance 4805 -> 4808 ({m.group(1)[:60] if m else 'missing'})")
+    # F5: a refusal removes a stale object and writes nothing new
+    open(f"{d}/y.hsaco", "w").write("stale")
+    open(f"{d}/y.json", "w").write("stale")
     rc2, out2 = run(["ablate", a.program, a.root, "--out", f"{d}/y.hsaco", "--edit", "delete /^s_barrier$/"])
-    ok(rc2 == 2 and "anchor matches 6 lines" in out2 and not os.path.exists(f"{d}/y.hsaco"), "ablate: ambiguous anchor exits 2, no object")
+    ok(rc2 == 2 and "anchor matches 6 lines" in out2, "ablate: ambiguous anchor exits 2")
+    ok(not [f for f in os.listdir(d) if f.startswith("y.") and f != "y.work"], "F5: the refusal left no y.* object (the stale one removed)")
+    # F1 on live: a move onto its own position is a no-op, and the edited object equals the control
+    rc4, out4 = run(["ablate", a.program, a.root, "--out", f"{d}/z.hsaco", "--edit", "move /^%sp0_pt_sxb = / to=after:/^%sp0_pt_sxa = /"])
+    ok(rc4 == 0 and "no-op" in out4 and os.path.exists(f"{d}/z.hsaco")
+       and open(f"{d}/z.hsaco", "rb").read() == open(f"{d}/z.control.hsaco", "rb").read(),
+       "F1 on live: a move onto its own position is a no-op, byte-identical to the control")
+    # F5: an edit the assembler rejects (a stand-in compiler at the process boundary that fails on the edited Low) leaves no object
+    fake = f"{d}/fail_edited.sh"
+    open(fake, "w").write(f'#!/bin/sh\ncase "$1" in */failed/w.loom) echo "error: stand-in rejects the edit" >&2; exit 1;; esac\n'
+                          f'exec "{it.compiler()}" "$@"\n')
+    os.chmod(fake, 0o755)
+    open(f"{d}/w.hsaco", "w").write("stale")
+    rc5, out5 = run(["ablate", a.program, a.root, "--out", f"{d}/w.hsaco", "--loom-compile", fake, "--edit",
+                     "delete /^s_barrier$/ prev=/^%pl7_1 = v_wmma/"])
+    ok(rc5 == 3 and "stand-in rejects" in out5 and not [f for f in os.listdir(d) if f.startswith("w.") and f != "w.work"],
+       "F5: a failed assembly exits 3 and leaves no w.* object (stale one removed; the attempt stays under w.work/failed)")
+    ok(os.path.exists(f"{d}/w.work/failed/w.loom"), "F5: the failed edit is kept under WORK/failed for diagnosis")
     # the round trip moves live's second QK chain (offset 8448) behind the first one's loads: a property the reassembly changes
     qk = r"order /^ds_load_b128 \S+, \S+ offset:8448$/ /^ds_load_b128 \S+, \S+ offset:64$/"
     rc3, out3 = run(["bisect", a.program, a.root, "--on", "asm", "--region", "all", "--pred", qk, "--work", f"{d}/rt"])
