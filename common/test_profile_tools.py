@@ -543,6 +543,86 @@ class LaneBase(unittest.TestCase):
         self.assertEqual(self.gate(runs, "--noise-floor", fl).returncode, 1)
         self.assertEqual(self.gate(runs, "--noise-floor", fl, "--no-slower", "0.5").returncode, 0)
 
+    def custom(self, name, chunks):
+        """one run of the given prefill chunks, each a list of per-layer dispatch times (ms), one submission per chunk"""
+        es = []
+        for n, durs in enumerate(chunks):
+            es += chunked(9 + n, durs)
+        return run_dir(self.root, name, es)
+
+    @staticmethod
+    def layers(base, hi=None, excess=0.0, lo=None):
+        """16 layers at base; layers 4-15 at hi; layers 0-2 at lo; excess / 2 added to layers 6 and 7"""
+        out = [base] * 16
+        if hi is not None:
+            out[4:] = [hi] * 12
+        if lo is not None:
+            out[:3] = [lo] * 3
+        out[6] += excess / 2
+        out[7] += excess / 2
+        return out
+
+    def test_base_noise_takes_the_lane_floor(self):
+        # review r2 survivor (bnoise without the floor): a base rise of 4 % inside a 6 % lane floor is no measured rise under
+        # --no-slower (the floor is the lane's start-to-start spread, E485); total down (the reference starts carry the excess)
+        fl = os.path.join(self.root, "floor.json")
+        open(fl, "w").write(json.dumps({"prefill: attention": 6.0}))
+        runs = [self.arm("1-r", 100.0, 400.0), self.arm("2-c", 104.0, 0.0), self.arm("3-c", 104.0, 5.0), self.arm("4-r", 100.0, 410.0)]
+        r = self.gate(runs, "--no-slower", "0.5", "--noise-floor", fl)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("base +4.00 %, bar +6.00 %", r.stdout)
+
+    def test_base_rise_bar_takes_the_mode_allowance(self):
+        # review r2 survivor (base rise bar = its noise only): --no-slower 5 allows a 5 % rise; a base +4 % with no spread passes
+        runs = [self.arm("1-r", 100.0, 400.0), self.arm("2-c", 104.0, 0.0), self.arm("3-c", 104.0, 5.0), self.arm("4-r", 100.0, 410.0)]
+        r = self.gate(runs, "--no-slower", "5")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("base +4.00 %, bar +5.00 %", r.stdout)
+
+    def test_quiet_noise_takes_the_candidate_spread(self):
+        # review r2 survivor (qnoise without spread(cq)): the candidate's quiet groups 1520 / 1656.8 ms (spread 8.6 %, mean -0.7 %)
+        # do not show a drop; the base (-5 %, no spread) alone must not pass
+        runs = [self.custom("1-ref", [self.layers(100.0), self.layers(100.0)]),
+                self.custom("2-cand", [self.layers(95.0), self.layers(95.0, excess=160.0)]),
+                self.custom("3-cand", [self.layers(95.0, hi=95.0 * 1.12), self.layers(95.0, excess=170.0)]),
+                self.custom("4-ref", [self.layers(100.0), self.layers(100.0, excess=5.0)])]
+        r = self.gate(runs)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("base -5.00 % not taken: quiet groups -0.72 % (bar -8.61 %)", r.stdout)
+
+    def test_runs_with_different_group_counts_have_no_quiet_groups(self):
+        # review r2 survivor (group-count check -> True): a run with a chunk more than the others cannot line its groups up: no
+        # quiet groups, no IndexError
+        runs = [self.custom("1-ref", [self.layers(100.0)] * 3), self.custom("2-cand", [self.layers(95.0)] * 2),
+                self.custom("3-cand", [self.layers(95.0)] * 2), self.custom("4-ref", [self.layers(100.0)] * 2)]
+        r = self.gate(runs)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("quiet groups (", r.stdout)
+
+    def test_quiet_drop_bar_takes_min_drop(self):
+        # review r2 survivor (quiet bar ignores --min-drop-pct): base -10 % beyond a 5 % minimum, quiet groups -0.55 %: the quiet
+        # groups did not drop by the minimum, so the base does not pass
+        c1 = self.layers(90.0, hi=90.0 * 1.14)   # rank 4 at 90, the other 12 at 102.6 (inside 1.15 x 90: quiet)
+        runs = [self.custom("1-ref", [self.layers(100.0), self.layers(100.0)]),
+                self.custom("2-cand", [c1, self.layers(90.0, excess=169.0)]),
+                self.custom("3-cand", [c1, self.layers(90.0, excess=179.0)]),
+                self.custom("4-ref", [self.layers(100.0), self.layers(100.0, excess=5.0)])]
+        r = self.gate(runs, "--min-drop-pct", "5")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("base -10.00 % not taken: quiet groups -0.55 % (bar -5.00 %)", r.stdout)
+
+    def test_quiet_threshold_is_relative_to_rank_r(self):
+        # review r2 survivor (x[-1] < q * x[0]): a group whose 3 fastest layers run at 0.8 x and slowest at 1.1 x its 4th-fastest
+        # is quiet (1.1 <= 1.15); read against the fastest it would not be, and q205's shape would lose its quiet groups
+        runs = [self.custom("1-ref", [self.layers(100.0, hi=100.0, lo=80.0), self.layers(100.0)]),
+                self.custom("2-cand", [self.layers(95.0, lo=76.0)[:15] + [104.5], self.layers(95.0, excess=160.0)]),
+                self.custom("3-cand", [self.layers(95.0, lo=76.0)[:15] + [104.5], self.layers(95.0, excess=170.0)]),
+                self.custom("4-ref", [self.layers(100.0, lo=80.0)[:15] + [110.0], self.layers(100.0, excess=5.0)])]
+        r = self.gate(runs)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("quiet groups (1 of 2)", r.stdout)
+
     def test_zero_base_cannot_be_measured(self):
         # a base of 0 (every group's R-th fastest dispatch read 0 ns) gives no ratio: the lane cannot be measured, never a pass
         # through a NaN comparison (--no-slower's 'rise > bar' is False for NaN)

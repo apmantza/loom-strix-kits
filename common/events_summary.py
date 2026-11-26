@@ -40,6 +40,11 @@ Base and excess (HRX-like E625): a lane whose MODEL.json entry declares a work m
   The table's last column says what was read and why (no base model; base unavailable: a group not of N dispatches; excess
   alike / differs); the verdict line names the excess and the total for the targeted lane. q205: total -0.57 % inside 1.50 % noise,
   base -6.0 %, quiet groups (below ~48k context) -4.8 %: the candidate's excess was 6.8 / 7.0 s vs 4.2 / 3.4 s.
+  Accepted residual (lane-gate review r2, r2probe.py): a candidate faster at short context and slower at long context can pass
+  the speed gate on its base: its long-context slowdown reads as excess, the quiet groups are the short-context chunks, and the
+  total stays inside its noise (probe: total +0.48 %, quiet groups -19.9 %). No mechanism guards it: --no-slower and
+  --guard-others still stop on any total rise beyond noise, a profile never passes a candidate to go-live, and the seeded agent
+  bench decides.
 """
 import argparse
 import glob
