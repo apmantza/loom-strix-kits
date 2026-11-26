@@ -5254,7 +5254,7 @@ if not KS:
 text = re.sub(r"check\.expect\.close (actual\(.*\)) : (.*)$", r"check.expect.approximate \1 : \2, \2", "\n".join(cases), flags=re.M)
 open(os.path.join(out, f"cases{KS}.loom-test"), "w", newline="\n").write(text)
 if not KS:   # the scope run_kernel_tests.sh prints ('ktest scope: ...'; a go-live verdict needs full: HRX-like ktest_verdict.sh)
-    ktest_select.write_scope(out, KT_ONLY, len(re.findall(r"(?m)^check\.case public @", text)), _total)
+    ktest_select.write_scope(out, len(re.findall(r"(?m)^check\.case public @", text)), _total)   # scope from os.environ (section switches)
 if KT_ONLY is not None and not KS:   # the inputs of the cases left out (the sections that ran anyway wrote them)
     _used = set(re.findall(r'path\("([^"]+)"\)', text))
     _drop = [f for f in os.listdir(out) if f.endswith(".npy") and f not in _used]

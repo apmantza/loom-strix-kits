@@ -4,3 +4,4 @@ pkg*/
 state/
 __pycache__/
 *.pyc
+kit/.test_tmp/

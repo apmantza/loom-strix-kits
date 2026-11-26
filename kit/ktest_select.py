@@ -260,11 +260,43 @@ def coverage(lib, selected):
 SCOPE_FILE = "ktest_scope.json"
 
 
-def write_scope(out, kernels, kept, total):
-    """record OUT's generation: KERNELS None (every case: full) or the selected kernels (subset), with KEPT of TOTAL cases"""
+# The generator's environment reads that change which cases a run generates, with their defaults (None: unset or empty). A run is full
+# only when every one is at its default and nothing is selected (review r1 #1: SPLIT_VZERO_TESTS=0 / FLASH_TESTS=0 runs read 'full').
+# kit/test_run_kernel_tests.py checks this table against the generator's own os.environ reads.
+SECTION_SWITCHES = {"GEMM_TESTS": "1", "L17_TESTS": "1", "DRAFTER_TESTS": "1", "FLASH_TESTS": "1", "MOE_TESTS": "1",
+                    "MOE_GEMM_TESTS": "1", "SPLIT_VZERO_TESTS": "1", "WIDTH_EQ_TESTS": "1",
+                    "L17_VSPLIT_TESTS": None, "KTEST_GEMM_ALL": None, "KTEST_GEMM_ERR": None}
+# *_TESTS / KTEST_* names that are no section switch: the selection itself, a child run's suffix (children write no scope), and the
+# runner tooling's own variables (inherited from common/ktest.sh's caller). Any other such name in the environment forces subset.
+NOT_SECTION_SWITCHES = {"KTEST_KERNELS": "the selection (scope_record names it)", "KTEST_HEADS_SFX": "a child run's file suffix",
+                        "KTEST_KEEP": "runner cleanup", "KTEST_BASE": "common/ktest.sh base re-run",
+                        "KTEST_CHANGED": "common/ktest.sh selection input", "KTEST_SCOPE_OK": "HRX-like verdict admission",
+                        "KTEST_NEG_REWORK": "HRX-like verdict"}
+
+
+def scope_record(env, kept, generated):
+    """the generation's scope from its environment ENV: full only with no KTEST_KERNELS, every SECTION_SWITCHES at its default and no
+    unknown *_TESTS / KTEST_* name; else subset with the reasons (each 'NAME=value')"""
+    why = []
+    if "KTEST_KERNELS" in env:
+        why.append("KTEST_KERNELS=" + ",".join(sorted(k for k in env["KTEST_KERNELS"].split(",") if k)))
+    for k in sorted(env):
+        v = env[k]
+        if k in SECTION_SWITCHES:
+            d = SECTION_SWITCHES[k]
+            if (v != d) if d is not None else (v != ""):
+                why.append(f"{k}={v}")
+        elif (k.endswith("_TESTS") or k.startswith("KTEST_")) and k not in NOT_SECTION_SWITCHES:
+            why.append(f"{k}={v} (unknown section switch)")
+    rec = {"scope": "subset", "why": why} if why else {"scope": "full"}
+    rec.update(cases=kept, generated=generated)
+    return rec
+
+
+def write_scope(out, kept, generated, env=None):
+    """record OUT's generation (scope_record of ENV, default the process's environment) beside its cases"""
     import json
-    rec = {"scope": "full"} if kernels is None else {"scope": "subset", "kernels": sorted(kernels)}
-    rec.update(cases=kept, of=total)
+    rec = scope_record(os.environ if env is None else env, kept, generated)
     with open(os.path.join(out, SCOPE_FILE), "w") as fh:
         json.dump(rec, fh)
 
@@ -277,8 +309,8 @@ def scope_line(testdir):
             r = json.load(fh)
         if r.get("scope") == "full":
             return "ktest scope: full"
-        if r.get("scope") == "subset":
-            return f"ktest scope: subset ({r['cases']} of {r['of']} cases; kernels {','.join(r['kernels']) or 'none (smoke only)'})"
+        if r.get("scope") == "subset" and r.get("why"):
+            return f"ktest scope: subset ({', '.join(r['why'])}; {r['cases']} cases kept of {r['generated']} generated)"
         why = f"unrecognized record {json.dumps(r)[:200]}"
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         why = f"no readable {SCOPE_FILE}: {e}"
