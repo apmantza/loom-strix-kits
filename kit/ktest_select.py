@@ -11,7 +11,11 @@ without a twin: it cannot be compiled for gfx12) is skipped, so one test file co
 prints the kernels common/binary_gate.py's rows (--json; common/cand_lint.py writes PKG.lint/bgate.json) report CHANGED, NEW or
 text-only, comma-separated (empty: nothing changed), for a selected generation (make_kernel_tests.py KTEST_KERNELS: by_kernels).
 Exit 1 with the reason when the changed set is unknown (an unreadable file, a row the gate could not judge: ERROR, an unknown
-verdict, or --cand / --base not the packages verdict.json beside the rows names): the caller then runs the full suite."""
+verdict, or --cand / --base not the packages verdict.json beside the rows names): the caller then runs the full suite.
+
+       ktest_select.py combine LIB.loom CASES.loom-test OUT.loom             (run_kernel_tests.sh; any step that runs cases itself)
+writes LIB + CASES as one loom-test file, reordered by dual_target.encodings_first: the cases sit past the package's ~160k lines, so
+their encodings lie beyond hrx-loom's 16-bit SSA encoding ids (ENCODING/004; HRX-like E609, E616). Exit 1 when the reorder refuses."""
 import os
 import re
 import sys
@@ -240,7 +244,22 @@ def coverage(lib, selected):
     return sorted(launched), sorted(launched - tested)
 
 
+def combine(lib, cases):
+    """LIB + CASES as one loom-test text, reordered so every encoding-typed line sits within hrx-loom's 16-bit value ids
+    (dual_target.encodings_first; ValueError when it cannot)"""
+    return dual_target.encodings_first(lib + cases)
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["combine"]:
+        if len(sys.argv) != 5:
+            sys.exit(__doc__)
+        try:
+            text = combine(open(sys.argv[2]).read(), open(sys.argv[3]).read())
+        except ValueError as e:
+            sys.exit(f"ktest_select: combine refused: {e}")
+        open(sys.argv[4], "w", newline="\n").write(text)
+        sys.exit(0)
     if sys.argv[1:2] == ["changed"]:
         import argparse
         ap = argparse.ArgumentParser(prog="ktest_select.py changed")
