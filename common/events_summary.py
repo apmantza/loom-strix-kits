@@ -34,7 +34,7 @@ import re
 import statistics as st
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))   # realpath: the HRX-like skill links this file, not its siblings
 from ceiling import floor, hardware  # noqa: E402
 
 
@@ -124,10 +124,18 @@ def summarize(ev, prompt, d):
 
 
 def busy_clock(run):
-    """The run's median shader clock while busy (GHz) from its gpu_telemetry summary (tel.txt), or None."""
-    p = os.path.join(run, "tel.txt")
-    m = re.search(r"while busy: .*?clock ([0-9.]+) ", open(p).read()) if os.path.exists(p) else None
-    return float(m.group(1)) if m else None
+    """(the run's median shader clock while busy in GHz, its source) or (None, None): from the recorded samples (tel.tsv, 1 MHz),
+    else from the gpu_telemetry summary (tel.txt; 2 decimals before 11-26, 0.46 % steps against a 0.27 % lane floor: HRX-like E624)"""
+    tsv, txt = os.path.join(run, "tel.tsv"), os.path.join(run, "tel.txt")
+    if os.path.exists(tsv) and os.path.getsize(tsv):   # imported here: test_events_ab.sh stubs the CLI and leaves tel.tsv empty
+        from gpu_telemetry import busy_clock as tel_busy_clock
+        c = tel_busy_clock(tsv)
+        if c:
+            return c, "tel.tsv"
+    m = re.search(r"while busy: .*?clock ([0-9.]+) ", open(txt).read()) if os.path.exists(txt) else None
+    if not m:
+        return None, None
+    return float(m.group(1)), ("tel.txt" if len(m.group(1).partition(".")[2]) >= 3 else "coarse tel.txt")
 
 
 def cycles_table(runs, res, lanes):
@@ -136,10 +144,12 @@ def cycles_table(runs, res, lanes):
     5 %. Informational: the gate still judges seconds. The busy clock is the whole run's, prefill-dominated: decode lanes run at
     another clock (~2.5 GHz) and are memory-bound; read their seconds (q187's ABBA: GEMMs 1.8 % -> 0.1 %, matvecs 0.2 % -> 1.7 %). The spread columns compare the runs in seconds and in cycles; a lane whose
     cycle spread is the smaller one is clock-bound across these runs."""
-    clk = [busy_clock(r) for r in runs]
+    got = [busy_clock(r) for r in runs]
+    clk = [c for c, _ in got]
     missing = [res[i][0] for i, c in enumerate(clk) if c is None]
     if missing:
-        return [f"\ncycles: no busy clock (tel.txt) for {', '.join(missing)}: not printed"]
+        return [f"\ncycles: no busy clock (tel.tsv / tel.txt) for {', '.join(missing)}: not printed"]
+    coarse = [res[i][0] for i, (_, src) in enumerate(got) if src == "coarse tel.txt"]
     out = ["\n| lane (cycles = time x busy clock) | " + " | ".join(f"{r[0]} @ {c:.3f} GHz" for r, c in zip(res, clk))
            + " | spread s | spread cycles |", "|---|" + "---|" * (len(res) + 2)]
     for i, ln in enumerate(lanes):
@@ -149,6 +159,8 @@ def cycles_table(runs, res, lanes):
         cu = "G" if unit == "s" else "M/step"
         sp = (f"{spread(secs):.1f} %", f"{spread(cyc):.1f} %") if len(res) > 1 and all(x == x for x in secs) else ("-", "-")
         out.append(f"| {ln['lane']} | " + " | ".join(f"{x:.2f} {cu}" for x in cyc) + f" | {sp[0]} | {sp[1]} |")
+    if coarse:
+        out.append(f"clock from a 2-decimal tel.txt (no tel.tsv) for {', '.join(coarse)}: steps of ~0.46 %, coarser than a 0.3 % lane floor")
     return out
 
 

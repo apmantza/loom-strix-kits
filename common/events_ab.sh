@@ -3,7 +3,7 @@
 # (each lane against its hardware floor, kits/<kit>/lanes.json). Per run: stop other servers (and a managed one, LSK_STOP_HOOK),
 # start from the same thermal state (cool_wait.sh), wait for a quiet machine, record free large memory blocks (mem_admit.py frag),
 # serve with the kit's flags plus device profiling into a bundle, record telemetry beside the request (gpu_telemetry.py: clock,
-# power, temperature, busy %, and the CPU beside the server; events_summary's cycles table reads the busy clock from tel.txt),
+# power, temperature, busy %, and the CPU beside the server; events_summary's cycles table reads the busy clock from tel.tsv),
 # send profile_req.py's long request, check the served context against the label (a > 5 % mismatch stops the script: a profile
 # labelled 81k that served 66k is not the cell it claims, HRX-like E421), stop and wait for the server to exit (it writes the
 # bundle), export the dispatch events with iree-profile. The managed server comes back on every exit (LSK_RESTORE_HOOK).

@@ -147,7 +147,7 @@ class EventsSummary(unittest.TestCase):
         os.remove(os.path.join(b, "tel.txt"))
         r = summary(a, b)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("cycles: no busy clock (tel.txt) for 2-hot", r.stdout)
+        self.assertIn("cycles: no busy clock (tel.tsv / tel.txt) for 2-hot", r.stdout)
 
     def test_refuses_unreadable_prompt(self):
         # the served size decides every floor: a request record without prompt_tokens is a refusal, not a default
@@ -313,6 +313,52 @@ class LaneGate(unittest.TestCase):
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         r = summary(*runs, "--top", "0", "--gate", "prefill: attention", "--ref", "1", "--cand", "2,3")
         self.assertEqual(r.returncode, 2)   # one reference run has no spread: no noise estimate, no verdict
+
+
+FIX = os.path.join(HERE, "..", "kit", "fixtures")
+
+
+class BusyClock(unittest.TestCase):
+    """HRX-like E624: the cycles table read tel.txt's 2-decimal busy clock (2.18 / 2.19 GHz: 0.46 % steps) against a 0.27 % lane
+    floor; q205's tel.tsv medians were 2.176 / 2.185 / 2.186 / 2.180."""
+
+    def test_clock_difference_below_two_decimals_shows(self):
+        # two runs whose busy clocks differ by 0.2 % (2.180 vs 2.184 GHz) must read different clocks and cycles
+        with tempfile.TemporaryDirectory() as root:
+            runs = []
+            for name, ghz in (("1-a", 2.180), ("2-b", 2.184)):
+                d = run_dir(root, name, [ev("g_attention_flash2", 7, 50.0), ev("g_gemm_f16_swiglu_m256", 7, 1000.0, (272, 16, 1))])
+                with open(os.path.join(d, "tel.tsv"), "w") as f:
+                    for i in range(20):
+                        f.write(f"{1000 + i * 0.1:.2f}\t100\t85.0\t{ghz:.3f}\t80\t1600\t1000\t1104\t80\t0.5\t900\t0\n")
+                with open(os.path.join(d, "tel.txt"), "w") as f:   # the summary as events_ab.sh writes it, by the producer itself
+                    f.write(subprocess.run([sys.executable, "-I", os.path.join(HERE, "gpu_telemetry.py"), "summary",
+                                            os.path.join(d, "tel.tsv"), name], capture_output=True, text=True).stdout)
+                runs.append(d)
+            r = summary(*runs, "--top", "0")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("1-a @ 2.180 GHz | 2-b @ 2.184 GHz", r.stdout)
+            line = next(x for x in r.stdout.splitlines() if x.startswith("| prefill: GEMMs") and "G |" in x)
+            self.assertIn("2.18 G | 2.18 G", line)   # 1.0 s x 2.180 vs 1.0 s x 2.184: same seconds, cycles 0.2 % apart
+            self.assertIn("| 0.0 % | 0.2 % |", line)
+
+    def test_old_tel_txt_still_parses(self):
+        # an 11-25 run directory (q205's 1-e480) holds a 2-decimal tel.txt; a run without its tel.tsv still reads that clock
+        with tempfile.TemporaryDirectory() as root:
+            d = run_dir(root, "1-e480", [ev("g_attention_flash2", 7, 50.0), ev("g_gemm_f16_swiglu_m256", 7, 1000.0, (272, 16, 1))])
+            open(os.path.join(d, "tel.txt"), "w").write(open(os.path.join(FIX, "tel_q205_1-e480.txt")).read())
+            r = summary(d, "--top", "0")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("1-e480 @ 2.180 GHz", r.stdout)
+            self.assertIn("clock from a 2-decimal tel.txt (no tel.tsv) for 1-e480", r.stdout)   # and says it is coarse
+            # the same 11-25 directory with its tel.tsv beside (every events_ab run wrote both): the recorded samples decide
+            with open(os.path.join(d, "tel.tsv"), "w") as f:
+                for i, ghz in enumerate(["2.172", "2.176", "2.176", "2.190", "2.170", "2.280", "1.100"]):
+                    f.write(f"{1000 + i * 0.1:.2f}\t{0 if ghz == '1.100' else 100}\t85.0\t{ghz}\t80\t1600\t1000\t1104\t80\t0.5\t900\t0\n")
+            r = summary(d, "--top", "0")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("1-e480 @ 2.176 GHz", r.stdout)   # the busy samples' median (the idle 1.100 is not busy)
+            self.assertNotIn("2-decimal tel.txt", r.stdout)
 
 
 class LaneBreakdown(unittest.TestCase):

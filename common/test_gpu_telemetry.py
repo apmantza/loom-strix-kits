@@ -77,6 +77,17 @@ with tempfile.TemporaryDirectory() as root:
          and "busy >= 50 % in 100%" in out and "power 85.00" in out and "fclk 1600.00" in out and "cpu 71.00" in out)
 
 with tempfile.TemporaryDirectory() as root:
+    # HRX-like E624: the summary printed the shader clock with 2 decimals (2.18 / 2.19 GHz: 0.46 % steps) while the cycles table it
+    # feeds is compared with a 0.27 % lane floor; a 0.2 % clock difference (2.180 vs 2.184) must survive the summary
+    outs = []
+    for ghz in ("2.180", "2.184"):
+        p = os.path.join(root, ghz + ".tsv")
+        open(p, "w").write("".join(f"{1000 + i:.2f}\t100\t85.0\t{ghz}\t80\t1600\t1000\t1104\t80\t0.5\t900\t0\n" for i in range(9)))
+        outs.append(run("summary", p, "x")[1])
+    case("summary: the busy clock at the recorded 1 MHz (3 decimals), not 2", "clock 2.180 (p10 2.180" in outs[0]
+         and "clock 2.184 (p10 2.184" in outs[1])
+
+with tempfile.TemporaryDirectory() as root:
     # E371: a pp_dpm table caught mid-transition has no '*' level; a 0 clock must not drag the p10 to 0
     fake_sysfs(root, fclk_active=False)
     tsv, rows = recorded(root)

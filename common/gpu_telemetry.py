@@ -20,7 +20,8 @@ usage: gpu_telemetry.py [--root DIR] record OUT.tsv [--pid PID]   runs until kil
            t busy power_w clock_ghz temp_c fclk_mhz mclk_mhz socclk_mhz cpu_tctl_c load1 cpu_pct other_cpu_pct
            (a column the machine does not expose is empty; the first sample's CPU columns are empty: they are deltas)
        gpu_telemetry.py [--root DIR] summary OUT.tsv [LABEL] [--cpu-max CORES]   medians and p10 / p90 over the samples with
-           busy >= 50 %, the busy share, and the CPU line (`cpu: unknown` for a file recorded without CPU columns)
+           busy >= 50 %, the busy share, and the CPU line (`cpu: unknown` for a file recorded without CPU columns); the clock
+           with 3 decimals (the recorded 1 MHz: 2 decimals stepped 0.46 %, HRX-like E624; summaries before 11-26 have 2)
        gpu_telemetry.py [--root DIR] temp                       the edge temperature now, in whole C (a bench's thermal start gate)
 --root: the directory that holds sys/ and proc/ (default /; a test points it at a fake tree). Exit 2 when no GPU card is found."""
 import glob
@@ -146,26 +147,44 @@ def record(out, root="/", period=0.1, pid=None):
 CONTAMINATED_SHARE = 0.10   # share of samples above --cpu-max that flags a run
 
 
-def summary(path, label="", cpu_max=2.0):
+def samples(path):
+    """(all rows, rows with busy >= 50 %) of a recorded tsv"""
     rows = [l.rstrip("\n").split("\t") for l in open(path) if l.count("\t") >= 4]
+    return rows, [r for r in rows if int(r[1]) >= 50]
+
+
+def busy_values(rows, busy, i):
+    """column i over the busy samples (all samples when none is busy), as the summary's medians use them"""
+    xs = [float(r[i]) for r in busy] or [float(r[i]) for r in rows]
+    if i >= 5:   # a pp_dpm_* table caught mid-transition shows no active level (0): not a clock (E371)
+        xs = [x for x in xs if x > 0] or [0.0]
+    return xs
+
+
+def busy_clock(path):
+    """the median shader clock while busy (GHz) at the recorded 1 MHz resolution, or None without samples
+    (events_summary's cycles table: HRX-like E624, tel.txt's 2-decimal clock stepped 0.46 % against a 0.27 % lane floor)"""
+    rows, busy = samples(path)
+    return statistics.median(busy_values(rows, busy, 3)) if rows else None
+
+
+def summary(path, label="", cpu_max=2.0):
+    rows, busy = samples(path)
     if not rows:
         print(f"  telemetry {label}: no samples")
         return 1
-    busy = [r for r in rows if int(r[1]) >= 50]
     q = lambda xs, f: sorted(xs)[min(len(xs) - 1, int(f * len(xs)))]
 
-    def col(i):
-        xs = [float(r[i]) for r in busy] or [float(r[i]) for r in rows]
-        if i >= 5:   # a pp_dpm_* table caught mid-transition shows no active level (0): not a clock (E371)
-            xs = [x for x in xs if x > 0] or [0.0]
-        return f"{statistics.median(xs):.2f} (p10 {q(xs, 0.1):.2f}, p90 {q(xs, 0.9):.2f})"
+    def col(i, d=2):
+        xs = busy_values(rows, busy, i)
+        return f"{statistics.median(xs):.{d}f} (p10 {q(xs, 0.1):.{d}f}, p90 {q(xs, 0.9):.{d}f})"
     more = ""
     if all(len(r) >= 9 and r[5] for r in rows):
         more = f"; fclk {col(5)} MHz, mclk {col(6)} MHz, socclk {col(7)} MHz"
         if all(r[8] for r in rows):
             more += f", cpu {col(8)} C"
     print(f"  telemetry {label}: {len(rows)} samples, busy >= 50 % in {len(busy) / len(rows):.0%}; while busy: power {col(2)} W, "
-          f"clock {col(3)} GHz, temp {col(4)} C" + more)
+          f"clock {col(3, 3)} GHz, temp {col(4)} C" + more)
     print(cpu_line(rows, label, cpu_max))
     return 0
 
