@@ -8,6 +8,7 @@
 #     environment block: every run must leave its start, environment, memfrag, telemetry, request and events files.
 #   - HRX-like E415: CPU work beside a timed run slows it: a run whose CPU line is not 'clean' (CONTAMINATED, or unknown)
 #     makes the profile UNTRUSTED (exit 2), never a silent pass.
+#   - HRX-like E631: other GPU clients beside the server: a gpu line that is not 'clean' makes the profile UNTRUSTED (exit 2).
 #   - the profile bundle is written when the server exits, after its port has closed: the export waits for the process.
 # usage: test_events_ab.sh          EVENTS_AB=FILE tests another copy of events_ab.sh (mutants); exit 0 when every check passes
 set -u
@@ -80,6 +81,8 @@ elif a[0] == "summary":
     tag = a[2]
     print(f"  telemetry {tag}: 10 samples, busy >= 50 % in 99%; while busy: power 85.0 (p10 85.0, p90 85.0) W, "
           f"clock 2.15 (p10 2.15, p90 2.15) GHz, temp 80 (p10 80, p90 80) C")
+    g = dict(kv.split("=") for kv in os.environ.get("STUB_GPU", "").split(",") if kv).get(tag, "clean")
+    print(f"  gpu {tag}: unknown (no GPU client record)" if g == "unknown" else f"  gpu {tag}: {g}: other GPU clients stub")
     flag = dict(kv.split("=") for kv in os.environ.get("STUB_CPU", "").split(",") if kv).get(tag, "clean")
     print(f"  cpu {tag}: unknown (no CPU columns)" if flag == "unknown" else f"  cpu {tag}: {flag}: other CPU stub")
 EOF
@@ -135,6 +138,13 @@ check "a CONTAMINATED run: exit 2 after the summary, names the run" \
   "[ \$(cat $T/contam.rc) = 2 ] && grep -q EVENTS_AB_DONE $T/contam.out && grep -q \"^EVENTS: UNTRUSTED: CPU telemetry not 'clean' .* in run(s) 3-other \" $T/contam.out && tail -1 $T/work/contam/summary.md | grep -q 'EVENTS: UNTRUSTED'"
 run unknown STUB_CPU=1-a=unknown
 check "an unknown CPU line: exit 2 (fail closed)" "[ \$(cat $T/unknown.rc) = 2 ] && grep -q 'in run(s) 1-a ' $T/unknown.out"
+
+# HRX-like E631: other GPU clients (desktop compositor, browser, a second compute process) time-share the GPU beside the server
+run gcontam STUB_GPU=2-other=GPU-CONTAMINATED
+check "a GPU-CONTAMINATED run: exit 2 after the summary, names the run as GPU (not CPU)" \
+  "[ \$(cat $T/gcontam.rc) = 2 ] && grep -q \"^EVENTS: UNTRUSTED: GPU clients not 'clean' .* in run(s) 2-other \" $T/gcontam.out && ! grep -q 'CPU telemetry not' $T/gcontam.out"
+run gunknown STUB_GPU=4-a=unknown
+check "an unknown gpu line (no client record): exit 2 (fail closed)" "[ \$(cat $T/gunknown.rc) = 2 ] && grep -q 'GPU clients not .* in run(s) 4-a ' $T/gunknown.out"
 
 run slowexit STUB_EXIT_DELAY=1.5
 check "a server that writes its bundle 1.5 s after its port closes: every run exported" \

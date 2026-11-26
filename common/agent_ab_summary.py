@@ -91,9 +91,18 @@ for tag in tags:
         p = f"{out}/{tag}.{ext}"
         txt = open(p).read().rstrip("\n") if os.path.exists(p) else f"  {tag}: no {ext}"
         print(txt)
-    tel = open(f"{out}/{tag}.tel.txt").read() if os.path.exists(f"{out}/{tag}.tel.txt") else ""
-    if "CONTAMINATED" in tel: untrusted.append(f"{tag} CONTAMINATED by CPU work")
-    elif ": clean:" not in tel: untrusted.append(f"{tag} CPU unknown")
+    tel = open(f"{out}/{tag}.tel.txt").read().splitlines() if os.path.exists(f"{out}/{tag}.tel.txt") else []
+    # each flag from its own line (the gpu line also says 'clean:' / 'CONTAMINATED'): only 'clean' is trusted
+    cpu = next((l for l in tel if l.startswith(f"  cpu {tag}: ")), "")
+    if cpu.startswith(f"  cpu {tag}: CONTAMINATED"): untrusted.append(f"{tag} CONTAMINATED by CPU work")
+    elif not cpu.startswith(f"  cpu {tag}: clean: "): untrusted.append(f"{tag} CPU unknown")
+    # other GPU clients (HRX-like E631). gpu_telemetry prints the gpu line before the cpu line, so a tel.txt with a cpu line and no
+    # gpu line was written before 11-26: reported, not distrusted, so old benches still re-analyse; a gpu line that is not clean
+    # (GPU-CONTAMINATED, or unknown: no client record) makes the bench UNTRUSTED
+    gpu = next((l for l in tel if l.startswith(f"  gpu {tag}: ")), None)
+    if gpu is None: print(f"  gpu {tag}: not recorded (tel.txt before 11-26)")
+    elif gpu.startswith(f"  gpu {tag}: GPU-CONTAMINATED"): untrusted.append(f"{tag} GPU-CONTAMINATED by other GPU clients")
+    elif not gpu.startswith(f"  gpu {tag}: clean: "): untrusted.append(f"{tag} GPU clients unknown")
 # clock and power per arm and half, side by side (R5, HRX-like E450 / E475): at a power cap a candidate that holds a lower clock at the
 # same power spends more energy per cycle, so its served loss may be a power cost rather than a slower kernel. Informational, never a
 # verdict: A/As of one package read 2.19 vs 2.30 GHz between server starts (E475), so a delta inside ~5 % says nothing alone.
