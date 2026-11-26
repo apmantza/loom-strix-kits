@@ -355,7 +355,8 @@ class LaneBase(unittest.TestCase):
 
     def test_q205_base_decides_when_excess_differs(self):
         # recurrence: E619/E625, q205 STOPped on 'did not move' while its base dropped 6 % (cmb2 excess 6.8 / 7.0 s vs 4.2 / 3.4 s)
-        r = summary(*self.q205(), "--top", "0", "--gate", "prefill: attention", "--ref", "1,4", "--cand", "2,3")
+        runs = self.q205()
+        r = summary(*runs, "--top", "0", "--gate", "prefill: attention", "--ref", "1,4", "--cand", "2,3")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         per_run = next(x for x in r.stdout.splitlines() if x.startswith("| prefill: attention") and "base" in x and "excess" in x)
         self.assertIn("61.21 / 57.01 / 4.20 s", per_run)   # 1-e480: total / base / excess (s), 42 groups x 16 x the 4th-fastest
@@ -363,8 +364,15 @@ class LaneBase(unittest.TestCase):
         verdict = next(x for x in r.stdout.splitlines() if x.startswith("LANE GATE:"))
         self.assertIn("PASS-TO-BENCH", verdict)
         self.assertIn("on its base (-6.01 %", verdict)
+        self.assertIn("quiet groups -4.78 %", verdict)    # the excess-free groups (below ~48k context) agree: E625's -4.8 %
         self.assertIn("excess 3.81 -> 6.89 s", verdict)    # the verdict names the excess and that it decided
         self.assertIn("total -0.57 %", verdict)            # the total stays in the verdict
+        # a floor between the quiet groups' drop and the base's (5 %: base -6.01 %, quiet -4.78 %): the quiet groups do not agree
+        fl = os.path.join(self.root, "floor.json")
+        open(fl, "w").write(json.dumps({"prefill: attention": 5.0}))
+        r = summary(*runs, "--top", "0", "--gate", "prefill: attention", "--ref", "1,4", "--cand", "2,3", "--noise-floor", fl)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("base -6.01 % not taken: quiet groups -4.78 % (bar -5.00 %)", r.stdout)
 
     def gate(self, runs, *extra, model=None):
         return subprocess.run([sys.executable, "-I", os.path.join(HERE, "events_summary.py"), model or MODEL, *runs, "--top", "0",
@@ -388,37 +396,152 @@ class LaneBase(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         verdict = next(x for x in r.stdout.splitlines() if x.startswith("LANE GATE:"))
         self.assertIn("did not move beyond noise", verdict)
-        self.assertNotIn("on its base", verdict)
-        self.assertIn("total (excess alike)", r.stdout)
+        self.assertNotIn("on its base (", verdict)
+        self.assertIn("total and base (excess alike)", r.stdout)
 
     def test_excess_in_one_arm_decides_on_base(self):
-        # the same base drop with the excess only in the candidate's starts (q205's shape): the base decides and passes
-        runs = [self.arm("1-ref", 100.0, 0.0), self.arm("2-cand", 95.0, 400.0), self.arm("3-cand", 95.0, 410.0),
+        # q205's shape: base -5 %, total flat (the candidate's starts carry the excess), the excess-free chunk -5 %: passes on base
+        runs = [self.arm("1-ref", 100.0, 0.0), self.arm("2-cand", 95.0, 160.0), self.arm("3-cand", 95.0, 170.0),
                 self.arm("4-ref", 100.0, 5.0)]
         r = self.gate(runs)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("on its base (-5.00 %", r.stdout)
+        self.assertIn("quiet groups -5.00 %", r.stdout)
         # the lane's measured floor (--noise-floor) bounds the base's noise too: two runs per arm understate it (E485)
         fl = os.path.join(self.root, "floor.json")
         open(fl, "w").write(json.dumps({"prefill: attention": 6.0}))
         r = self.gate(runs, "--noise-floor", fl)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
-        self.assertIn("did not move beyond noise on its base: skip the bench (-5.00 %, bar -6.00 %)", r.stdout)
-        # and a base rise hidden by a smaller excess in the candidate still reads as slower under --no-slower
+        self.assertIn("did not move beyond noise: skip the bench", r.stdout)
+        # a base rise hidden by a smaller excess in the candidate still reads as slower under --no-slower
         runs2 = [self.arm("1-r", 100.0, 400.0), self.arm("2-c", 104.0, 0.0), self.arm("3-c", 104.0, 5.0), self.arm("4-r", 100.0, 410.0)]
         r = self.gate(runs2, "--no-slower", "0.5")
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("targeted lane got slower beyond noise on its base: +4.00 %", r.stdout)
 
-    def test_guarded_lane_judged_on_its_base(self):
-        # the guard on another lane uses the same rule: flash2's excess only in the candidate's starts (+12 % total, base unchanged)
-        # must not stop a GEMM candidate as 'another lane got slower'
+    def test_total_rise_stops_whatever_the_base(self):
+        # review r1 F1: the excess the candidate's starts carry may be the candidate's own (a regression shaped like the machine
+        # state): a total rise beyond noise stops in every mode, even when the base dropped and the excess differs
+        runs = [self.arm("1-ref", 100.0, 0.0), self.arm("2-cand", 95.0, 400.0), self.arm("3-cand", 95.0, 410.0),
+                self.arm("4-ref", 100.0, 5.0)]
+        for extra in ((), ("--no-slower", "0.5")):
+            r = self.gate(runs, *extra)
+            self.assertEqual(r.returncode, 1, f"{extra}: {r.stdout + r.stderr}")
+            self.assertNotIn("PASS-TO-BENCH", r.stdout)
+
+    def test_guarded_lane_stops_on_total_rise(self):
+        # review r1 F1, guard path: flash2's excess only in the candidate's starts (+12 % total, base unchanged) may be the
+        # candidate's doing: the guard stops on the total, never excuses it by the base
         runs = [self.arm("1-ref", 100.0, 0.0, gemm=1000.0), self.arm("2-cand", 100.0, 400.0, gemm=930.0),
                 self.arm("3-cand", 100.0, 390.0, gemm=932.0), self.arm("4-ref", 100.0, 5.0, gemm=1002.0)]
         r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "events_summary.py"), MODEL, *runs, "--top", "0", "--gate",
                             "prefill: GEMMs", "--ref", "1,4", "--cand", "2,3", "--guard-others", "2"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("another lane got slower: prefill: attention (flash2) +12.3 %", r.stdout)
+
+    def test_guarded_lane_stops_on_base_rise(self):
+        # the guard also reads the base: a candidate that slows every flash2 layer 6 % while its starts carry less excess (total
+        # flat) is slower; the base shows it
+        runs = [self.arm("1-ref", 100.0, 200.0, gemm=1000.0), self.arm("2-cand", 106.0, 10.0, gemm=930.0),
+                self.arm("3-cand", 106.0, 15.0, gemm=932.0), self.arm("4-ref", 100.0, 210.0, gemm=1002.0)]
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "events_summary.py"), MODEL, *runs, "--top", "0", "--gate",
+                            "prefill: GEMMs", "--ref", "1,4", "--cand", "2,3", "--guard-others", "2"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("another lane got slower on its base: prefill: attention (flash2) +6.0 %", r.stdout)
+
+    def test_excess_ranges_compared_at_the_larger(self):
+        # review r1 F3: the excess 'differs' only beyond the LARGER arm's range: ref excess 0 / 20 (range 20), cand 100 / 300
+        # (range 200), means 10 vs 200 (190 apart): alike, so the base cannot pass a total that did not move
+        runs = [self.arm("1-ref", 100.0, 0.0), self.arm("2-cand", 95.0, 100.0), self.arm("3-cand", 95.0, 300.0),
+                self.arm("4-ref", 100.0, 20.0)]
+        r = self.gate(runs)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("total and base (excess alike)", r.stdout)
+
+    def test_candidate_base_spread_is_noise(self):
+        # review r1 F3: the candidate's own base spread counts in the base's noise: bases 100 / 100 vs 100 / 112 (+6 %, spread
+        # 11.3 %) is no measured rise under --no-slower (a gate on the reference spread alone would stop it)
+        runs = [self.arm("1-ref", 100.0, 0.0), self.arm("2-cand", 100.0, 0.0), self.arm("3-cand", 112.0, 0.0),
+                self.arm("4-ref", 100.0, 0.0)]
+        r = self.gate(runs, "--no-slower", "0.5")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("[decided prefill: attention (flash2) on its base: excess 0.00 -> 0.40 s differs", r.stdout)
+
+    def q194(self, transform=None):
+        """q194's A/A flash2 dispatches (starts 1-4; 2 and 3 the identical copy), transform applied to runs 2 and 3"""
+        fx = json.load(open(os.path.join(FIX, "events_q194_flash2.json")))
+        runs = []
+        for n, (name, rows) in enumerate(fx["runs"].items()):
+            es = [{"type": "dispatch_event", "event_id": i, "submission_id": s, "key": k, "workgroup_count": wg,
+                   "duration_ns": ns, "valid": True} for i, s, k, wg, ns in rows]
+            if transform and n in (1, 2):
+                es = transform(es)
+            sub = es[0]["submission_id"]
+            es += [ev("g_gemm_f16_store_m256", sub, 1000.0 * (0.95 if transform and n in (1, 2) else 1.0), (40, 16, 1)),
+                   ev("g_attention_vsplit", 10 ** 6, 1.0), ev("g_mv_q5_k_k5120_t8_q8", 10 ** 6, 2.0), ev("g_dfl_attention", 10 ** 6, 0.5),
+                   ev("g_gdn_recurrence_rec", 10 ** 6, 0.3), ev("g_rope", 10 ** 6, 0.1)]
+            runs.append(run_dir(self.root, name, es, prompt=81430))
+        return runs
+
+    @staticmethod
+    def groups(es):
+        g = {}
+        for e in es:
+            if e["key"].startswith("g_attention_flash2"):
+                g.setdefault((e["submission_id"], e["key"], tuple(e["workgroup_count"])), []).append(e)
+        return g
+
+    def late(self, es):
+        """review r1 synth.py late: layers >= 6 of the chunks from the 13th on (context >= ~48k) 1.4x slower: a regression the
+        candidate causes, shaped like E625's machine-state excess"""
+        g = self.groups(es)
+        subs = sorted({k[0] for k in g})
+        for (s, _, _), v in g.items():
+            if subs.index(s) >= 12:
+                for li, e in enumerate(sorted(v, key=lambda e: e["event_id"])):
+                    if li >= 6:
+                        e["duration_ns"] = int(e["duration_ns"] * 1.4)
+        return es
+
+    def dispersed(self, es):
+        """review r1 synth.py disp: per group half the layers 10 % faster, half 10 % slower: no work saved, more spread"""
+        for n, v in enumerate(self.groups(es).values()):
+            f = [0.9, 1.1] * 8
+            for e, x in zip(v, f[n % 2:] + f[:n % 2]):
+                e["duration_ns"] = int(e["duration_ns"] * x)
+        return es
+
+    def test_late_regression_stops_no_slower(self):
+        # review r1 F1 (synth late): total +17 %, base flat: --no-slower passed it on the base (the old total-only gate stopped)
+        r = self.gate(self.q194(self.late), "--no-slower", "0.5")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("targeted lane got slower beyond noise: +17.25 %", r.stdout)
+
+    def test_late_regression_stops_guard(self):
+        # review r1 F1 (synth guard): GEMMs -5 % with that flash2 regression: the guard must stop on flash2's total
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "events_summary.py"), MODEL, *self.q194(self.late), "--top", "0",
+                            "--gate", "prefill: GEMMs", "--ref", "1,4", "--cand", "2,3", "--guard-others", "2"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("another lane got slower: prefill: attention (flash2) +17.2 %", r.stdout)
+
+    def test_dispersion_is_not_a_speedup(self):
+        # review r1 F2 (synth disp): more spread at the same mean reads as a base drop (-8 %) with no work saved; with the kit's
+        # flash2 floor the total did not move (-1 %, floor 2.54 %): the base drop needs the excess-free groups to agree, and
+        # dispersion leaves none, so it stops
+        fl = os.path.join(self.root, "floor.json")
+        open(fl, "w").write(json.dumps({"prefill: attention": 2.54}))
+        r = self.gate(self.q194(self.dispersed), "--noise-floor", fl)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        verdict = next(x for x in r.stdout.splitlines() if x.startswith("LANE GATE:"))
+        self.assertIn("did not move beyond noise", verdict)
+        self.assertIn("no quiet groups", verdict)
+
+    def test_q194_aa_does_not_pass_on_base(self):
+        # the A/A copy (q194 starts 1-4) under the kit floor: neither a speed-up nor a slowdown
+        fl = os.path.join(self.root, "floor.json")
+        open(fl, "w").write(json.dumps({"prefill: attention": 2.54}))
+        runs = self.q194()
+        self.assertEqual(self.gate(runs, "--noise-floor", fl).returncode, 1)
+        self.assertEqual(self.gate(runs, "--noise-floor", fl, "--no-slower", "0.5").returncode, 0)
 
     def test_zero_base_cannot_be_measured(self):
         # a base of 0 (every group's R-th fastest dispatch read 0 ns) gives no ratio: the lane cannot be measured, never a pass
@@ -451,12 +574,68 @@ class LaneBase(unittest.TestCase):
 
     def test_bad_model_refused(self):
         # a base model whose rank is outside its group (or not an integer) is a configuration error: exit 2, no verdict
-        for bad in ({"group_size": 16, "rank": 17}, {"group_size": 16, "rank": 0}, {"group_size": "16", "rank": 4}, {"rank": 4}):
+        for bad in ({"group_size": 16, "rank": 17}, {"group_size": 16, "rank": 0}, {"group_size": "16", "rank": 4}, {"rank": 4},
+                    {"group_size": 16, "rank": 4, "slow_ratio": 1.0}, {"group_size": 16, "rank": 4, "slow_ratio": "1.15"}):
             def mut(d, bad=bad):
                 next(ln for ln in d["lanes"] if ln["lane"].startswith("prefill: attention"))["base"] = bad
             r = self.gate([self.arm(f"{i}-x{len(os.listdir(self.root))}", 100.0, 0.0) for i in range(1, 5)], model=model_with(self.root, mut))
             self.assertEqual(r.returncode, 2, f"{bad}: {r.stdout + r.stderr}")
             self.assertNotIn("LANE GATE:", r.stdout)
+
+
+SPEC = {
+    # review r1 round-2 state-space table (the hand-off's): verdict per gate mode for the lane's total (t) and base (b) moving
+    # up / flat / down beyond their own noise, the excess alike (a) or differing (d), and the excess-free ('quiet') groups
+    # dropping (q+) or not (q-). Speed: PASS-base = passes on the base. Guard: STOP = the guarded lane stops the candidate.
+    "speed": """
+        b=up      b=flat    b=down,a  b=down,d,q+  b=down,d,q-  b=none
+t=up    STOP      STOP      STOP      STOP         STOP         STOP
+t=flat  STOP      STOP      STOP      PASS-base    STOP         STOP
+t=down  STOP      PASS      PASS      PASS         PASS         PASS
+""",
+    "no_slower": """
+        b=up      b=flat    b=down,a  b=down,d,q+  b=down,d,q-  b=none
+t=up    STOP      STOP      STOP      STOP         STOP         STOP
+t=flat  STOP      PASS      PASS      PASS         PASS         PASS
+t=down  STOP      PASS      PASS      PASS         PASS         PASS
+""",
+    "guard": """
+        b=up      b=flat    b=down,a  b=down,d,q+  b=down,d,q-  b=none
+t=up    STOP      STOP      STOP      STOP         STOP         STOP
+t=flat  STOP      PASS      PASS      PASS         PASS         PASS
+t=down  STOP      PASS      PASS      PASS         PASS         PASS
+""",
+}
+
+
+class GateTable(unittest.TestCase):
+    """events_summary.verdict implements SPEC cell by cell, for both excess states where the column does not name one; an
+    unmeasured total or base stops in every mode (fail closed)"""
+
+    def test_every_cell(self):
+        sys.path.insert(0, HERE)
+        import events_summary as es_mod
+        cols = {"b=up": [("up", e, q) for e in ("alike", "differs") for q in ("down", "not")],
+                "b=flat": [("flat", e, q) for e in ("alike", "differs") for q in ("down", "not")],
+                "b=down,a": [("down", "alike", q) for q in ("down", "not")],
+                "b=down,d,q+": [("down", "differs", "down")], "b=down,d,q-": [("down", "differs", "not")],
+                "b=none": [(None, None, None)]}
+        for mode, text in SPEC.items():
+            lines = [ln.split() for ln in text.strip().splitlines()]
+            head = lines[0]
+            for row in lines[1:]:
+                t = row[0][2:]
+                for col, want in zip(head, row[1:]):
+                    for b, e, q in cols[col]:
+                        got, measure, _ = es_mod.verdict(mode, t, b, e, q)
+                        exp = "PASS" if want.startswith("PASS") else "STOP"
+                        self.assertEqual(got, exp, f"{mode} t={t} {col} ({b}, {e}, {q}): {got}")
+                        if want == "PASS-base":
+                            self.assertEqual(measure, "base", f"{mode} t={t} {col}")
+            for b in ("up", "flat", "down", None, "unmeasured"):
+                self.assertEqual(es_mod.verdict(mode, "unmeasured", b, "differs", "down")[0], "STOP", f"{mode} t unmeasured")
+            for t in ("up", "flat", "down"):
+                self.assertEqual(es_mod.verdict(mode, t, "unmeasured", "differs", "down")[0], "STOP", f"{mode} b unmeasured")
 
 
 class BusyClock(unittest.TestCase):

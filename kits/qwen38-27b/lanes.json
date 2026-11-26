@@ -123,6 +123,8 @@
    "base": {
     "group_size": 16,
     "rank": 4,
+    "slow_ratio": 1.15,
+    "_src_slow_ratio": "slow_map.py's threshold (HRX-like E625): a dispatch above 1.15 x its group's 4th-fastest is a slow one; groups with none in every run are the 'quiet' groups that must agree before the base passes a speed-up (lane-gate review r1 F2). q205: 18 of 42 quiet (the chunks below ~48k context, 23 % of the lane), -4.78 %; q194 A/A: 16 of 42, +0.08 %",
     "_src": "HRX-like E625 (W/static-1126/f2-shape/robust_all.py, slow_map.txt): a prefill chunk runs each flash2 kernel once per attention layer (16) in one submission, same grid, same context, so the 16 dispatches of a (submission, kernel, workgroups) group do equal work; the 4th-fastest of them is the base rate (slow dispatches, 1.2-1.8x, sat at layer >= 6 and context >= ~48k only). q205 (static-1125/q205-lanes): 42 groups of 16 per run; A/A q194 (8 starts) base ratio 1.0009, spread 0.6 % vs the total's 4.2 %"
    }
   },
