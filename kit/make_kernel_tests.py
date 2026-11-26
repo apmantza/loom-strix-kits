@@ -127,7 +127,7 @@ def kt_section(kernels, build):
     n = len(cases)
     build()
     ktest_select.check_declared(cases[n:], kernels, kt_defined() or set(kernels))
-def save(n, a): np.save(os.path.join(out, n + KS + ".npy"), a)
+def save(n, a): ktest_select.save_npy(os.path.join(out, n + KS + ".npy"), a)   # written, then out of the page cache (E625)
 
 
 def negtwin(case, *subs):

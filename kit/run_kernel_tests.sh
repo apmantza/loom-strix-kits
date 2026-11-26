@@ -13,7 +13,7 @@ cleanup() {
   local rc=$1
   trap - EXIT INT TERM HUP
   if [ "${KTEST_KEEP:-0}" = 1 ]; then
-    echo "inputs kept (KTEST_KEEP=1): $PWD"
+    "$bin/python" "$here/ktest_select.py" drop . || echo "inputs kept (KTEST_KEEP=1): $PWD (page-cache drop failed)"
   elif [ "$rc" -eq 0 ]; then
     find . -maxdepth 1 \( -name '*.npy' -o -name combined.loom \) \( -type f -o -type l \) -delete && echo "inputs removed (all passed; KTEST_KEEP=1 keeps them)"
   elif [ -s failed_cases.txt ] && "$bin/python" "$here/ktest_select.py" prune . failed_cases.txt; then

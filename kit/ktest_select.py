@@ -21,7 +21,11 @@ their encodings lie beyond hrx-loom's 16-bit SSA encoding ids (ENCODING/004; HRX
 prints 'ktest scope: full', 'ktest scope: subset (...)' or 'ktest scope: unknown (...)' from TESTDIR's ktest_scope.json (write_scope).
 
        ktest_select.py prune TESTDIR FAILED.txt                              (run_kernel_tests.sh, after a failed run)
-removes TESTDIR's .npy inputs but those the cases named in FAILED.txt (one per line) read. Exit 1 when it cannot tell (no case text)."""
+removes TESTDIR's .npy inputs but those the cases named in FAILED.txt (one per line) read, and drops the kept ones from the page
+cache. Exit 1 when it cannot tell (no case text).
+
+       ktest_select.py drop TESTDIR                                          (run_kernel_tests.sh, KTEST_KEEP=1)
+drops TESTDIR's .npy inputs from the page cache (drop_cache: fsync, then POSIX_FADV_DONTNEED)."""
 import os
 import re
 import sys
@@ -291,9 +295,38 @@ def inputs_of(cases, names):
     return got
 
 
+def drop_cache(path):
+    """write PATH's dirty pages back, then drop its pages from the page cache (POSIX_FADV_DONTNEED skips dirty pages). Generated
+    inputs are written once and read once by loom-test; 18-37 GB of them per suite stayed cached and crowded host memory (HRX-like
+    E625: deleting 89 GB of kept inputs took page cache 61 -> 44 GB and free order-10 blocks 324 -> 1,822)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
+def save_npy(path, a):
+    """np.save A to PATH, then drop it from the page cache (make_kernel_tests.save: every generated input)"""
+    import numpy as np
+    with open(path, "wb") as fh:
+        np.save(fh, a)
+    drop_cache(path)
+
+
+def drop_inputs(testdir):
+    """drop every .npy in TESTDIR from the page cache (run_kernel_tests.sh, inputs kept with KTEST_KEEP=1); the count"""
+    files = [f for f in os.listdir(testdir) if f.endswith(".npy")]
+    for f in files:
+        drop_cache(os.path.join(testdir, f))
+    return len(files)
+
+
 def prune_inputs(testdir, failed):
     """run_kernel_tests.sh's cleanup after a failed run: keep the .npy inputs the FAILED cases (names) read in TESTDIR's
-    cases_used.loom-test (else cases.loom-test), remove the rest; ValueError without a case text. (kept, removed) file names."""
+    cases_used.loom-test (else cases.loom-test), remove the rest, drop the kept ones from the page cache; ValueError without a case
+    text. (kept, removed) file names."""
     src = next((os.path.join(testdir, f) for f in ("cases_used.loom-test", "cases.loom-test") if os.path.exists(os.path.join(testdir, f))), None)
     if src is None:
         raise ValueError(f"no cases_used.loom-test / cases.loom-test in {testdir}")
@@ -303,6 +336,7 @@ def prune_inputs(testdir, failed):
     for f in sorted(os.listdir(testdir)):
         if f.endswith(".npy"):
             if f in keep:
+                drop_cache(os.path.join(testdir, f))   # loom-test read it into the page cache
                 kept.append(f)
             else:
                 os.remove(os.path.join(testdir, f))
@@ -337,6 +371,11 @@ if __name__ == "__main__":
             sys.exit(f"ktest_select: prune refused: {e}")
         print(f"kept {len(kept)} input files of the failing cases ({len(failed)}) in {os.path.abspath(sys.argv[2])}; removed {len(removed)} "
               "(KTEST_KEEP=1 keeps all)")
+        sys.exit(0)
+    if sys.argv[1:2] == ["drop"]:
+        if len(sys.argv) != 3:
+            sys.exit(__doc__)
+        print(f"inputs kept (KTEST_KEEP=1): {drop_inputs(sys.argv[2])} files in {os.path.abspath(sys.argv[2])}, dropped from the page cache")
         sys.exit(0)
     if sys.argv[1:2] == ["scope"]:
         print(scope_line(sys.argv[2] if len(sys.argv) > 2 else "."))

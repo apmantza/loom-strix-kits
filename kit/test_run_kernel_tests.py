@@ -4,7 +4,8 @@
     (timeout, scope stop) kept them too; now only the failing cases' inputs stay, and only on a failure;
   - a subset run reading as a full one (C11 / E532): the run log states the scope the generator wrote, and says 'unknown' when no
     scope record sits beside the cases (scripts/ktest_verdict.sh refuses anything but 'full' unless told);
-usage: python3 -m unittest kit/test_run_kernel_tests.py"""
+  - kept inputs left in the page cache (KTEST_KEEP=1, or a failure's kept inputs): they are dropped after the run.
+usage: python3 -m unittest kit/test_run_kernel_tests.py   (needs a disk-backed kit dir for the residency test; tmpfs skips it)"""
 import json
 import os
 import shutil
@@ -53,8 +54,41 @@ sys.exit(1 if bad else 0)
 """
 
 
+def fs_type(path):
+    return subprocess.run(["stat", "-f", "-c", "%T", path], capture_output=True, text=True).stdout.strip()
+
+
+def resident(path):
+    """pages of PATH in the page cache, (resident, total): mmap + mincore through ctypes (no fincore / vmtouch on this box)"""
+    import ctypes
+    import mmap
+    libc = ctypes.CDLL(None, use_errno=True)
+    size = os.path.getsize(path)
+    if not size:
+        return 0, 0
+    page = mmap.PAGESIZE
+    n = (size + page - 1) // page
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        addr = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0)
+        if addr in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_errno(), "mmap")
+        vec = (ctypes.c_ubyte * n)()
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        if libc.mincore(ctypes.c_void_p(addr), size, vec) != 0:
+            raise OSError(ctypes.get_errno(), "mincore")
+        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.munmap(ctypes.c_void_p(addr), size)
+        return sum(b & 1 for b in vec), n
+    finally:
+        os.close(fd)
+
+
 class Runner(unittest.TestCase):
     def setUp(self):
+        # disk-backed (the kit dir), never /tmp: tmpfs pages are not page cache that DONTNEED can drop
         self.t = tempfile.mkdtemp(prefix=".test_run_kernel_tests.", dir=HERE)
         t = self.t
         self.venv = os.path.join(t, "venv")
@@ -142,6 +176,40 @@ class Runner(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn(want, out)
 
+    def test_kept_inputs_dropped_from_cache(self):
+        if fs_type(self.dir) in ("tmpfs", "ramfs"):
+            self.skipTest(f"{self.dir} is {fs_type(self.dir)}: no page cache to drop")
+        rc, out = self.run_tests(STUB_MODE="pass", KTEST_KEEP="1")   # the stub read every input: resident before the cleanup
+        self.assertEqual(rc, 0, out)
+        res = {n: resident(os.path.join(self.dir, n)) for n in FILES}
+        self.assertTrue(all(r == 0 for r, _ in res.values()), res)
+        rc, out = self.run_tests(STUB_MODE="fail:b_one")   # a failure's kept inputs too
+        res = {n: resident(os.path.join(self.dir, n)) for n in self.npy()}
+        self.assertEqual(sorted(res), ["b_x.npy", "shared_w.npy"], out)
+        self.assertTrue(all(r == 0 for r, _ in res.values()), res)
+
+
+class SaveNpy(unittest.TestCase):   # make_kernel_tests.save: every generated input leaves the page cache once written
+    def setUp(self):
+        self.t = tempfile.mkdtemp(prefix=".test_save_npy.", dir=HERE)
+
+    def tearDown(self):
+        shutil.rmtree(self.t)
+
+    def test_written_file_not_resident(self):
+        if fs_type(self.t) in ("tmpfs", "ramfs"):
+            self.skipTest(f"{self.t} is {fs_type(self.t)}")
+        import numpy as np
+        a = np.arange(4 << 20, dtype=np.float32)   # 16 MiB
+        p = os.path.join(self.t, "x.npy")
+        ks.save_npy(p, a)
+        r, n = resident(p)
+        self.assertEqual(r, 0, f"{r} of {n} pages resident after save_npy")
+        self.assertTrue((np.load(p) == a).all())
+        # the probe itself: a plain np.save leaves the file resident (else this test could not see a missing drop)
+        q = os.path.join(self.t, "y.npy")
+        np.save(q, a)
+        self.assertGreater(resident(q)[0], 0)
 
 
 class Prune(unittest.TestCase):
