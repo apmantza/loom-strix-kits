@@ -63,3 +63,9 @@
   the causal diagonal) held 384 of a decode kernel's 496 selects, yet runs once per split, so a change that removed selects there
   was worth ~0 (HRX-like E334). Before attributing time to a count, check which branch guards it (common/loop_census.py prints the
   guarded regions) or time it (stamps, ablations).
+
+- **Never build a .loom by concatenating files** (`cat program.loom cases.loom-test`): hrx-loom 0.1-0.3 keeps an SSA encoding's
+  value id in 16 bits, so an encoding-typed kernel past the module's 65,536th value names an unrelated earlier value (ENCODING/004
+  at parse, or `source value %N has no target remap` in loom-serve). Join through `kit/ktest_select.py combine LIB CASES OUT`, which
+  reorders with dual_target.encodings_first. It hit three times on one model: the package build, the kernel-test file and a race-step
+  file written by hand beside the fixed one (HRX-like E21, E609, E616).
