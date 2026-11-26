@@ -1,0 +1,2 @@
+  telemetry 1-e480: 2050 samples, busy >= 50 % in 98%; while busy: power 85.00 (p10 84.90, p90 85.20) W, clock 2.18 (p10 2.16, p90 2.28) GHz, temp 80.00 (p10 74.00, p90 83.00) C; fclk 1600.00 (p10 1600.00, p90 1600.00) MHz, mclk 1000.00 (p10 1000.00, p90 1000.00) MHz, socclk 1104.00 (p10 1104.00, p90 1104.00) MHz, cpu 81.00 (p10 75.00, p90 83.00) C
+  cpu 1-e480: clean: other CPU (beside the server) median 0.00 cores (p90 0.99), > 3 cores in 0% of samples (flag above 10%); load1 median 0.77 (max 1.02)

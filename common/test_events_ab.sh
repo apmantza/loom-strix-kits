@@ -73,7 +73,7 @@ open(os.environ["STUB_LOG"], "a").write("gpu_telemetry.py " + " ".join(a) + "\n"
 if a[0] == "temp":
     print(40)
 elif a[0] == "record":
-    open(a[1], "w").close()
+    open(a[1], "w").close()   # empty: events_summary imports the real gpu_telemetry only for a tel.tsv with samples
     while True:
         time.sleep(1)
 elif a[0] == "summary":
