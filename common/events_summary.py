@@ -25,6 +25,14 @@ usage: events_summary.py MODEL.json RUN [RUN ...] [--top 12] [--split KERNEL[:CU
   --noise-floor FILE.json: a per-lane noise floor in %, {"LANE substring": PCT, ...} (each key names exactly one lane, else
   exit 2): a lane's noise is max(its spread, its floor). Two runs per arm understate a lane's start-to-start spread (HRX-like
   E485: flash2 4.2 % over 8 starts where one ABBA read 3.19 %); measure the floors with an A/A over several starts. Default: none.
+Base and excess (HRX-like E625): a lane whose MODEL.json entry declares a work model, "base": {"group_size": N, "rank": R}, runs
+  N equal-work dispatches per (submission, kernel, workgroups) group (flash2: one per attention layer of a prefill chunk). Its
+  base is, per group, N x the R-th fastest dispatch; its excess = total - base (machine-state slow dispatches: flash2 read 1.2-1.8x
+  at layer >= 6 and context >= ~48k, 0.2 s on some nights and 3.4-7 s on others). Every run prints total / base / excess for such
+  lanes. The gate judges a lane on its base, with the base's own noise (and the lane's floor), only when the arms' mean excesses
+  differ by more than the larger arm's excess range; otherwise on its total. The table's last column and the verdict line say
+  which decided and why (no base model; base unavailable: a group not of N dispatches; excess alike; excess differs). q205: total
+  -0.57 % inside 1.50 % noise, base -6.0 %: the candidate's excess was 6.8 / 7.0 s vs 4.2 / 3.4 s.
 """
 import argparse
 import glob
@@ -110,7 +118,8 @@ def summarize(ev, prompt, d):
         p[0] += 1
         p[1] += e["duration_ns"] / 1e9
     steps = verify_steps(ev, pre, lane_of, lanes)
-    rows = []
+    bases = lane_bases(ev, lane_of, lanes)
+    rows, based = [], {}
     for ln in lanes:
         n, s = per[ln["lane"]]
         f = floor(ln["floor"], m, hw, context=prompt, prompt=prompt)
@@ -120,7 +129,46 @@ def summarize(ev, prompt, d):
         else:
             meas, unit = s, "s"
         rows.append((ln["lane"], n, meas, unit, f, (f / meas * 100) if f is not None and meas else None))
-    return steps, sum(e["duration_ns"] for e in ev) / 1e9, rows
+        if ln["lane"] in bases:
+            b, why = bases[ln["lane"]]
+            based[len(rows) - 1] = (None, why) if b is None else ((b * meas / s if s else float("nan")), None)   # same unit as meas
+    return steps, sum(e["duration_ns"] for e in ev) / 1e9, rows, based
+
+
+def base_model(ln):
+    """(group_size, rank) of a lane's declared work model, None without one; exit 2 on a malformed one"""
+    m = ln.get("base")
+    if m is None:
+        return None
+    n, r = (m.get("group_size"), m.get("rank")) if isinstance(m, dict) else (None, None)
+    if not all(isinstance(x, int) and not isinstance(x, bool) for x in (n, r)) or not 1 <= r <= n:
+        print(f"events_summary: lane {ln['lane']!r}: base {m!r}: want {{\"group_size\": N, \"rank\": R}}, integers, 1 <= R <= N",
+              file=sys.stderr)
+        sys.exit(2)
+    return n, r
+
+
+def lane_bases(ev, lane_of, lanes):
+    """{lane name: (base s, None) or (None, why)} for the lanes with a work model (see the module doc)"""
+    models = {ln["lane"]: base_model(ln) for ln in lanes}
+    groups = {name: {} for name, m in models.items() if m}
+    for e in ev:
+        g = groups.get(lane_of(e))
+        if g is not None:
+            g.setdefault((e["submission_id"], e["key"], tuple(e.get("workgroup_count", []))), []).append(e["duration_ns"])
+    out = {}
+    for name, g in groups.items():
+        n, r = models[name]
+        bad = [(k, len(v)) for k, v in g.items() if len(v) != n]
+        if not g:
+            out[name] = (None, "no dispatches")
+        elif bad:
+            (_, key, wg), cnt = bad[0]
+            out[name] = (None, f"model does not fit: {len(bad)} of {len(g)} (submission, kernel, workgroups) groups hold "
+                               f"other than {n} dispatches (first: {key} {list(wg)} x {cnt})")
+        else:
+            out[name] = (sum(n * sorted(v)[r - 1] for v in g.values()) / 1e9, None)
+    return out
 
 
 def busy_clock(run):
@@ -136,6 +184,25 @@ def busy_clock(run):
     if not m:
         return None, None
     return float(m.group(1)), ("tel.txt" if len(m.group(1).partition(".")[2]) >= 3 else "coarse tel.txt")
+
+
+def base_table(res, lanes):
+    """total / base / excess per run for every lane with a work model (module doc), or no lines"""
+    out = []
+    for i, ln in enumerate(lanes):
+        if i not in res[0][7]:
+            continue
+        if not out:
+            out = ["\n| lane (base: per group of N equal-work dispatches, N x the R-th fastest; excess = total - base) | "
+                   + " | ".join(r[0] for r in res) + " |", "|---|" + "---|" * len(res)]
+        n, r = base_model(ln)
+        cells = []
+        for x in res:
+            tot, unit = x[5][i][2], x[5][i][3]
+            b, why = x[7][i]
+            cells.append(f"{tot:.2f} / {b:.2f} / {tot - b:.2f} {unit}" if b is not None else f"{tot:.2f} {unit}, no base: {why}")
+        out.append(f"| {ln['lane']}: total / base / excess (N {n}, R {r}) | " + " | ".join(cells) + " |")
+    return out
 
 
 def cycles_table(runs, res, lanes):
@@ -201,6 +268,23 @@ def noise_floors(path, names):
     return out
 
 
+def on_base(res, i, ref, cand, rv, cv):
+    """whether lane i is judged on its base (module doc): {"decides", "why", "rb", "cb", "re", "ce", "esp"}; rb/cb (bases per
+    reference / candidate run, the lane's unit) are None when any run has no base. Decides when the arms' mean excesses differ by
+    more than the larger arm's excess range: an excess alike in both arms is noise on both sides and the total keeps it."""
+    got = [res[j][7].get(i) for j in ref + cand]
+    out = {"decides": False, "rb": None, "cb": None, "re": None, "ce": None, "esp": None}
+    if any(g is None for g in got):
+        return dict(out, why="no base model")
+    if any(g[0] is None for g in got):
+        return dict(out, why="base unavailable: " + next(g[1] for g in got if g[0] is None))
+    rb, cb = [g[0] for g in got[:len(ref)]], [g[0] for g in got[len(ref):]]
+    re_, ce = [t - b for t, b in zip(rv, rb)], [t - b for t, b in zip(cv, cb)]
+    esp = max(max(re_) - min(re_), max(ce) - min(ce))
+    decides = abs(st.mean(ce) - st.mean(re_)) > esp
+    return dict(out, decides=decides, why="excess differs" if decides else "excess alike", rb=rb, cb=cb, re=re_, ce=ce, esp=esp)
+
+
 def lane_gate(a, d, res):
     """One-sided lane gate (see the module doc): returns the exit code, 0 = PASS-TO-BENCH, 1 = STOP."""
     names = [ln["lane"] for ln in d["lanes"]]
@@ -224,10 +308,10 @@ def lane_gate(a, d, res):
     floors = noise_floors(a.noise_floor, names) if a.noise_floor else {}
     if floors is None:
         return 2
-    stops = []
+    stops, notes = [], []
     print(f"\nlane gate: reference {', '.join(res[i][0] for i in ref)}; candidate {', '.join(res[i][0] for i in cand)}")
-    print("| lane | reference mean | candidate mean | change | noise |")
-    print("|---|---|---|---|---|")
+    print("| lane | reference mean | candidate mean | change | noise | decides |")
+    print("|---|---|---|---|---|---|")
     for i, name in enumerate(names):
         rv = [res[r][5][i][2] for r in ref]
         cv = [res[c][5][i][2] for c in cand]
@@ -242,23 +326,41 @@ def lane_gate(a, d, res):
         ok = rm > 0 and noise == noise and cm == cm and all(res[j][5][i][1] for j in ref + cand)
         chg = (cm - rm) / rm * 100 if ok else float("nan")
         mark = " (gated)" if i == gi else ""
-        print(f"| {name}{mark} | {rm:.3f} {unit} | {cm:.3f} {unit} | {chg:+.2f} % | {noise:.2f} %{' (floor)' if floored else ''} |")
+        base = on_base(res, i, ref, cand, rv, cv)
+        print(f"| {name}{mark} | {rm:.3f} {unit} | {cm:.3f} {unit} | {chg:+.2f} % | {noise:.2f} %{' (floor)' if floored else ''} "
+              f"| {'base' if base['decides'] else 'total'} ({base['why']}) |")
+        if base["rb"] is not None:
+            rb, cb, re_, ce = base["rb"], base["cb"], base["re"], base["ce"]
+            bnoise = max(spread(rb), spread(cb), floors.get(i, 0.0))
+            ratio = st.mean(cb) / st.mean(rb) if st.mean(rb) > 0 else float("nan")
+            bchg = (ratio - 1) * 100
+            print(f"| {name}: base | {st.mean(rb):.3f} {unit} | {st.mean(cb):.3f} {unit} | {bchg:+.2f} % (ratio {ratio:.4f}) "
+                  f"| {bnoise:.2f} % | |")
+            print(f"| {name}: excess | {st.mean(re_):.3f} {unit} | {st.mean(ce):.3f} {unit} | {st.mean(ce) - st.mean(re_):+.3f} {unit} "
+                  f"| range {base['esp']:.3f} {unit} | |")
+            if base["decides"]:
+                notes.append(f"{name} on its base: excess {st.mean(re_):.2f} -> {st.mean(ce):.2f} {unit} differs beyond its range "
+                             f"{base['esp']:.2f} {unit}; total {chg:+.2f} %")
+                chg, noise = bchg, bnoise
+                ok = ok and bchg == bchg
+        on = " on its base" if base["decides"] else ""
         if i == gi:
             bar = max(noise, a.min_drop_pct) if ok else float("nan")
+            tie = max(noise, a.no_slower) if a.no_slower is not None else None
+            told = f"{on} ({chg:+.2f} %, bar " + (f"+{tie:.2f} %)" if tie is not None else f"-{bar:.2f} %)")
             if not ok:
                 stops.append(f"targeted lane {name} cannot be measured in these runs")
-            elif a.no_slower is not None:
-                tie = max(noise, a.no_slower)
+            elif tie is not None:
                 if chg > tie:
-                    stops.append(f"targeted lane got slower beyond noise: {chg:+.2f} % (bar +{tie:.2f} %)")
+                    stops.append(f"targeted lane got slower beyond noise{on}: {chg:+.2f} % (bar +{tie:.2f} %)")
             elif not -chg > bar:
-                stops.append(f"targeted lane did not move beyond noise: skip the bench ({chg:+.2f} %, bar -{bar:.2f} %)")
+                stops.append(f"targeted lane did not move beyond noise{on}: skip the bench ({chg:+.2f} %, bar -{bar:.2f} %)")
         elif a.guard_others is not None:
             if not ok:
                 if rm != 0 or cm != 0:   # a lane absent from both sides has nothing to guard
                     stops.append(f"another lane cannot be measured: {name}")
             elif chg > max(noise, a.guard_others):
-                stops.append(f"another lane got slower: {name} {chg:+.1f} %")
+                stops.append(f"another lane got slower: {name} {chg:+.1f} %{on}")
     kset = lambda idx: {k for j in idx for k in res[j][6]}
     rk, ck = kset(ref), kset(cand)
     for label, only, idx in (("candidate-only", ck - rk, cand), ("reference-only", rk - ck, ref)):
@@ -272,8 +374,9 @@ def lane_gate(a, d, res):
         if not any(rx.search(k) for k, _ in ck - rk):
             stops.append(f"no candidate-only kernel matches {a.expect_kernel!r}: the switch did not reach serving")
     print("\nLANE GATE: " + (f"STOP ({'; '.join(stops)})" if stops else
-                              (f"PASS-TO-BENCH ({names[gi]} not slower beyond noise; the agent bench decides)" if a.no_slower is not None
-                               else f"PASS-TO-BENCH ({names[gi]} dropped beyond noise; the agent bench decides)")))
+                              (f"PASS-TO-BENCH ({names[gi]} not slower beyond noise{told}; the agent bench decides)" if a.no_slower is not None
+                               else f"PASS-TO-BENCH ({names[gi]} dropped beyond noise{told}; the agent bench decides)"))
+          + (f" [decided {'; '.join(notes)}]" if notes else ""))
     return 1 if stops else 0
 
 
@@ -309,7 +412,8 @@ def main():
     res = []
     for run in a.runs:
         ev, prompt = load(run)
-        res.append((os.path.basename(os.path.normpath(run)), ev, prompt) + summarize(ev, prompt, d) + (kernels(ev),))
+        steps, busy, rows, based = summarize(ev, prompt, d)
+        res.append((os.path.basename(os.path.normpath(run)), ev, prompt, steps, busy, rows, kernels(ev), based))
     print("| lane | floor | " + " | ".join(f"{r[0]}: measured (% of floor)" for r in res) + " |")
     print("|---|---|" + "---|" * len(res))
     for i, ln in enumerate(d["lanes"]):
@@ -319,6 +423,7 @@ def main():
             _, n, meas, unit, f, pct = r[5][i]
             cells.append(f"{meas:.2f} {unit}" + (f" ({pct:.0f} %)" if pct is not None else "") + f", {n} disp")
         print(f"| {name} | " + (f"{f:.2f} {unit}" if f is not None else "-") + " | " + " | ".join(cells) + " |")
+    print("\n".join(base_table(res, d["lanes"])))
     print("\n".join(cycles_table(a.runs, res, d["lanes"])))
     for r in res:
         print(f"\n{r[0]}: prompt {r[2]} tokens, {r[3]} verify steps, device busy {r[4]:.1f} s")

@@ -119,7 +119,12 @@
    "lane": "prefill: attention (flash2)",
    "phase": "prefill",
    "regex": "^g_attention_flash2",
-   "floor": "prefill_attn"
+   "floor": "prefill_attn",
+   "base": {
+    "group_size": 16,
+    "rank": 4,
+    "_src": "HRX-like E625 (W/static-1126/f2-shape/robust_all.py, slow_map.txt): a prefill chunk runs each flash2 kernel once per attention layer (16) in one submission, same grid, same context, so the 16 dispatches of a (submission, kernel, workgroups) group do equal work; the 4th-fastest of them is the base rate (slow dispatches, 1.2-1.8x, sat at layer >= 6 and context >= ~48k only). q205 (static-1125/q205-lanes): 42 groups of 16 per run; A/A q194 (8 starts) base ratio 1.0009, spread 0.6 % vs the total's 4.2 %"
+   }
   },
   {
    "lane": "prefill: weight dequant to f16 scratch",
