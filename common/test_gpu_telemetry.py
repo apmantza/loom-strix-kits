@@ -3,6 +3,7 @@
 usage: python3 test_gpu_telemetry.py (exit 1 on a failure)"""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -186,7 +187,9 @@ def fake_clients(root):
     drm_fd(root, 100, 5, "chrome", 7, {"gfx": 10 * ms, "compute": 0})        # one client, two fds (dup / fork): counted once
     drm_fd(root, 100, 6, "chrome", 7, {"gfx": 10 * ms, "compute": 0})
     drm_fd(root, 100, 3, "chrome", 7, {"gfx": 999 * ms}, target="/dev/null")   # not a DRM file: never read as one
+    drm_fd(root, 150, 9, "chrome-gpu", 7, {"gfx": 10 * ms, "compute": 0})    # the same client passed to a second process: lowest pid owns it
     drm_fd(root, 200, 4, "ptyxis", 9, {"gfx": 50 * ms})
+    drm_fd(root, 250, 4, "Xwayland", 30, {"gfx": 300 * ms})                 # its counter resets during the run (busy_desktop)
     drm_fd(root, 300, 6, "loom-serve", 11, {"dma": 1 * ms})                  # the measured server (--pid 300): excluded
     drm_fd(root, 500, 4, "otherdrv", 13, {"render": 7 * ms}, drv="i915")      # another driver's GPU
     os.makedirs(os.path.join(root, "proc/400/fd"))                            # another user's process: fd/ unreadable
@@ -211,7 +214,10 @@ def busy_desktop(root):
     ms = 1000000
     drm_fd(root, 100, 5, "chrome", 7, {"gfx": 610 * ms, "compute": 0})       # +600 ms, seen through both fds
     drm_fd(root, 100, 6, "chrome", 7, {"gfx": 610 * ms, "compute": 0})
+    drm_fd(root, 150, 9, "chrome-gpu", 7, {"gfx": 610 * ms, "compute": 0})   # the same client through a second pid: once, as chrome 100
     drm_fd(root, 200, 4, "ptyxis", 9, {"gfx": 51 * ms})                       # +1 ms
+    drm_fd(root, 250, 4, "Xwayland", 30, {"gfx": 0})                          # a counter that went down (-300 ms) subtracts nothing
+    drm_fd(root, 500, 4, "otherdrv", 13, {"render": 2007 * ms}, drv="i915")   # another driver's GPU, busy: not this GPU's client
     drm_fd(root, 300, 6, "loom-serve", 11, {"dma": 5001 * ms})                # the server: +5 s, not another client
     drm_fd(root, 600, 8, "gnome-shell", 21, {"gfx": 49 * ms})                 # a client opened during the run: from 0
 
@@ -239,9 +245,12 @@ with tempfile.TemporaryDirectory() as root:
     case("clients: 650 ms of other engine time in ~1 s -> GPU-CONTAMINATED naming chrome first", rc == 0
          and g.startswith("  gpu h2-b: GPU-CONTAMINATED (chrome 100 600.0 ms"))
     case("clients: two fds of one drm-client-id counted once (600 ms, not 1200)", "chrome 100 600.0 ms" in g and "1200" not in g)
+    case("clients: a client id held by two pids belongs to the lowest pid, counted once", "chrome-gpu" not in g)
+    case("clients: a counter that went down (a reset) subtracts nothing from the total", "Xwayland" not in g)
     case("clients: the measured server (--pid) is not another client", "loom-serve" not in g and "5000" not in g)
     case("clients: a client opened during the run counts from 0", "gnome-shell 600 49.0 ms" in g)
-    case("clients: other drivers and non-DRM fds are not read", "otherdrv" not in g and "999" not in g)
+    case("clients: other drivers (busy during the run) and non-DRM fds are not read", "otherdrv" not in g and "999" not in g
+         and "2000" not in g)
     case("clients: total other engine time 650.0 ms", "other GPU clients 650.0 ms" in g)
     rc, out, _ = run("summary", tsv, "h2-b", "--gpu-max", "90")
     case("clients: --gpu-max sets the share of wall (650 ms in ~1 s is clean below 90 %)", "  gpu h2-b: clean: " in out
@@ -265,6 +274,24 @@ with tempfile.TemporaryDirectory() as root:
     rc, out, _ = run("summary", tsv, "h1-x")
     case("clients: a tel.tsv recorded before client snapshots (no .clients.jsonl) -> gpu unknown, the rest unchanged",
          rc == 0 and "  gpu h1-x: unknown (no GPU client record" in out and "telemetry h1-x:" in out)
+
+with tempfile.TemporaryDirectory() as root:
+    # periodic snapshots (GPU_TEL_CLIENT_PERIOD, 5 s by default, shortened here): a client that exits mid-run keeps the engine
+    # time seen up to its last snapshot; without the periodic ones only start and end exist and its time is lost
+    fake_clients(root)
+    drm_fd(root, 800, 4, "short-lived", 40, {"gfx": 0})
+    out_p = os.path.join(root, "p.tel.tsv")
+    p = subprocess.Popen([sys.executable, TOOL, "--root", root, "record", out_p, "--pid", "300"],
+                         env=dict(os.environ, GPU_TEL_CLIENT_PERIOD="0.2"))
+    time.sleep(0.3)
+    drm_fd(root, 800, 4, "short-lived", 40, {"gfx": 40 * 1000000})
+    time.sleep(0.6)                                                           # >= 2 periodic snapshots see the 40 ms
+    shutil.rmtree(os.path.join(root, "proc/800"))                             # the client exits
+    time.sleep(0.4)
+    p.terminate(); p.wait()
+    rc, out, _ = run("summary", out_p, "h1-p")
+    case("clients: periodic snapshots between start and end (period crossed)", len(open(out_p[:-4] + ".clients.jsonl").readlines()) >= 4)
+    case("clients: a client that exited mid-run keeps its time up to its last snapshot", "short-lived 800 40.0 ms" in out)
 
 with tempfile.TemporaryDirectory() as root:
     # an engine counter in a unit or shape this parser does not know (a kernel that changes fdinfo) is not read as 0: unknown

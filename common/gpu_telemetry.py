@@ -26,6 +26,9 @@ The summary's `gpu LABEL:` line, printed before the cpu line: other clients' eng
 client new during the run from 0), as a share of that wall time; GPU-CONTAMINATED when the share exceeds --gpu-max % (default 1)
 or another KFD process existed (its time cannot be measured); unknown without two snapshots (no .clients.jsonl: recorded before
 11-26, or killed before its final snapshot). Engine time is time a client's jobs held a ring, an upper bound on interference.
+Not seen: a GPU client (DRM or KFD) that opens and exits entirely between two snapshots (CLIENT_PERIOD, env GPU_TEL_CLIENT_PERIOD
+for tests); graphics clients of root or another user are unreadable, counted in 'unreadable N' but not attributed, and the flag
+does not refuse on them; a child of the server sharing its DRM client would read as another client (loom-serve does not fork today).
 
 usage: gpu_telemetry.py [--root DIR] record OUT.tsv [--pid PID]   runs until killed; one line per sample:
            t busy power_w clock_ghz temp_c fclk_mhz mclk_mhz socclk_mhz cpu_tctl_c load1 cpu_pct other_cpu_pct
@@ -207,10 +210,10 @@ def record(out, root="/", period=0.1, pid=None):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # the callers' `kill $TEL`: leave through the final client snapshot
     with open(out, "w", buffering=1) as f, open(clients_path(out), "w", buffering=1) as cf:
         snapshot(cf, root, pid)
-        last = time.time()
+        last, every = time.time(), float(os.environ.get("GPU_TEL_CLIENT_PERIOD", CLIENT_PERIOD))   # env: tests cross the period
         try:
             while True:
-                if time.time() - last >= CLIENT_PERIOD:
+                if time.time() - last >= every:
                     snapshot(cf, root, pid)
                     last = time.time()
                 try:
