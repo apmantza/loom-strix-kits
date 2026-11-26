@@ -18,7 +18,10 @@ writes LIB + CASES as one loom-test file, reordered by dual_target.encodings_fir
 their encodings lie beyond hrx-loom's 16-bit SSA encoding ids (ENCODING/004; HRX-like E609, E616). Exit 1 when the reorder refuses.
 
        ktest_select.py scope [TESTDIR]                                       (run_kernel_tests.sh)
-prints 'ktest scope: full', 'ktest scope: subset (...)' or 'ktest scope: unknown (...)' from TESTDIR's ktest_scope.json (write_scope)."""
+prints 'ktest scope: full', 'ktest scope: subset (...)' or 'ktest scope: unknown (...)' from TESTDIR's ktest_scope.json (write_scope).
+
+       ktest_select.py prune TESTDIR FAILED.txt                              (run_kernel_tests.sh, after a failed run)
+removes TESTDIR's .npy inputs but those the cases named in FAILED.txt (one per line) read. Exit 1 when it cannot tell (no case text)."""
 import os
 import re
 import sys
@@ -278,6 +281,35 @@ def scope_line(testdir):
     return f"ktest scope: unknown ({why})"
 
 
+def inputs_of(cases, names):
+    """the input files (check.file.read.npy paths) the cases NAMES of a cases text read"""
+    got = set()
+    for b in re.split(r'(?m)^(?=check\.case |kernel\.def )', cases):
+        m = CASE.match(b)
+        if m and m.group(1) in names:
+            got |= set(re.findall(r'path\("([^"]+)"\)', b))
+    return got
+
+
+def prune_inputs(testdir, failed):
+    """run_kernel_tests.sh's cleanup after a failed run: keep the .npy inputs the FAILED cases (names) read in TESTDIR's
+    cases_used.loom-test (else cases.loom-test), remove the rest; ValueError without a case text. (kept, removed) file names."""
+    src = next((os.path.join(testdir, f) for f in ("cases_used.loom-test", "cases.loom-test") if os.path.exists(os.path.join(testdir, f))), None)
+    if src is None:
+        raise ValueError(f"no cases_used.loom-test / cases.loom-test in {testdir}")
+    with open(src) as fh:
+        keep = inputs_of(fh.read(), set(failed))
+    kept, removed = [], []
+    for f in sorted(os.listdir(testdir)):
+        if f.endswith(".npy"):
+            if f in keep:
+                kept.append(f)
+            else:
+                os.remove(os.path.join(testdir, f))
+                removed.append(f)
+    return kept, removed
+
+
 def combine(lib, cases):
     """LIB + CASES as one loom-test text, reordered so every encoding-typed line sits within hrx-loom's 16-bit value ids
     (dual_target.encodings_first; ValueError when it cannot)"""
@@ -293,6 +325,18 @@ if __name__ == "__main__":
         except ValueError as e:
             sys.exit(f"ktest_select: combine refused: {e}")
         open(sys.argv[4], "w", newline="\n").write(text)
+        sys.exit(0)
+    if sys.argv[1:2] == ["prune"]:
+        if len(sys.argv) != 4:
+            sys.exit(__doc__)
+        with open(sys.argv[3]) as fh:
+            failed = [x.strip() for x in fh if x.strip()]
+        try:
+            kept, removed = prune_inputs(sys.argv[2], failed)
+        except (ValueError, OSError) as e:
+            sys.exit(f"ktest_select: prune refused: {e}")
+        print(f"kept {len(kept)} input files of the failing cases ({len(failed)}) in {os.path.abspath(sys.argv[2])}; removed {len(removed)} "
+              "(KTEST_KEEP=1 keeps all)")
         sys.exit(0)
     if sys.argv[1:2] == ["scope"]:
         print(scope_line(sys.argv[2] if len(sys.argv) > 2 else "."))

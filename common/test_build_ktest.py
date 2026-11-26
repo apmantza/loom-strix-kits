@@ -5,7 +5,8 @@ scripts, stubbed kit/build.py, cand_lint.py, make_kernel_tests.py and run_kernel
   - build.sh not forwarding LINT_ALLOW / LINT_ACCEPT to cand_lint (verify r2 V10 / V11: the untouched-kernel verdict silently
     unjudged);
   - ktest.sh not rerunning the full suite when the generator refuses a selection (exit 3, review R2), or selecting with a gate file
-    made for another package or another build of it (F5 and its verify r2 residual).
+    made for another package or another build of it (F5 and its verify r2 residual);
+  - a failed or interrupted generation leaving its partial inputs behind (11-26, HRX-like E625: generated .npy outlived their runs).
 usage: python3 -m unittest common/test_build_ktest.py"""
 import hashlib
 import json
@@ -35,9 +36,13 @@ if sel and os.environ.get("STUB_REFUSE"):
     print("selected generation: stub refuses"); sys.exit(3)
 os.makedirs(sys.argv[2], exist_ok=True)
 open(os.path.join(sys.argv[2], "cases.loom-test"), "w").write("check.case public @a {\\n}\\n")
+open(os.path.join(sys.argv[2], "a_x.npy"), "wb").write(b"x")
+if os.environ.get("STUB_GENFAIL"):
+    print("stub generation fails"); sys.exit(1)
 print("stub " + ("selected " + os.environ["KTEST_KERNELS"] if sel else "full") + " generation")
 """
 RUN_STUB = """#!/bin/bash
+[ -n "${STUB_RUNFAIL:-}" ] && { echo "FAIL a"; echo "0/1 passed"; exit 1; }
 echo "1/1 passed"
 """
 
@@ -169,6 +174,18 @@ class Ktest(Stub):
             f.write("env B=1 kit/build.py kits/k/config.json cand\n")
         rc, out = self.run_sh("ktest.sh", "k", "cand", "t", KTEST_CHANGED="cand.lint/bgate.json")
         self.assertIn("changed set unknown: full suite", out)
+
+    def test_failed_generation_removes_its_inputs(self):   # a generation that stops half-way leaves no .npy behind
+        rc, out = self.run_sh("ktest.sh", "k", "cand", "t", STUB_GENFAIL="1")
+        self.assertNotEqual(rc, 0, out)
+        t = os.path.join(self.work, "t")
+        self.assertEqual([f for f in os.listdir(t) if f.endswith(".npy")], [], out)
+        rc, out = self.run_sh("ktest.sh", "k", "cand", "t", STUB_GENFAIL="1", KTEST_KEEP="1")
+        self.assertEqual([f for f in os.listdir(t) if f.endswith(".npy")], ["a_x.npy"], out)
+        # a finished generation is the runner's to clean: the inputs a failing run kept (its failing cases') stay
+        rc, out = self.run_sh("ktest.sh", "k", "cand", "t", STUB_RUNFAIL="1")
+        self.assertNotEqual(rc, 0, out)
+        self.assertEqual([f for f in os.listdir(t) if f.endswith(".npy")], ["a_x.npy"], out)
 
     def test_gate_file_of_another_base(self):   # F5: KTEST_BASE names the base the gate must have used
         rc, out = self.run_sh("ktest.sh", "k", "cand", "t", KTEST_CHANGED="cand.lint/bgate.json", KTEST_BASE="cand")

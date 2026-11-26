@@ -1,13 +1,18 @@
-"""kit/run_kernel_tests.sh on a stub venv (the real script and ktest_select.py; a stub loom-test; no compiler, no GPU). Recurrence:
+"""kit/run_kernel_tests.sh on a stub venv (the real script and ktest_select.py; a stub loom-test; no compiler, no GPU). Recurrences:
+  - generated inputs outliving their run (11-26, HRX-like E625 follow-up: 89 GB of .npy sat in five test dirs and held page cache
+    the flash2 runs needed): a failed run kept every input (ktest-stgmut7, ktest-q176), a compile failure or an interrupted run
+    (timeout, scope stop) kept them too; now only the failing cases' inputs stay, and only on a failure;
   - a subset run reading as a full one (C11 / E532): the run log states the scope the generator wrote, and says 'unknown' when no
-    scope record sits beside the cases (HRX-like scripts/ktest_verdict.sh refuses anything but 'full' unless told).
+    scope record sits beside the cases (scripts/ktest_verdict.sh refuses anything but 'full' unless told);
 usage: python3 -m unittest kit/test_run_kernel_tests.py"""
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,7 +55,6 @@ sys.exit(1 if bad else 0)
 
 class Runner(unittest.TestCase):
     def setUp(self):
-        # disk-backed (the kit dir), never /tmp: tmpfs pages are not page cache that DONTNEED can drop
         self.t = tempfile.mkdtemp(prefix=".test_run_kernel_tests.", dir=HERE)
         t = self.t
         self.venv = os.path.join(t, "venv")
@@ -94,6 +98,38 @@ class Runner(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.npy(), [], out)
 
+    def test_failure_keeps_only_the_failing_cases_inputs(self):   # ktest-stgmut7 / ktest-q176 kept every input on a failure
+        rc, out = self.run_tests(STUB_MODE="fail:b_one")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.npy(), ["b_x.npy", "shared_w.npy"], out)
+        self.assertIn("kept 2 input files of the failing cases", out)
+
+    def test_compile_failure_removes_inputs(self):   # no results: nothing names a failing case, the inputs are regenerable
+        rc, out = self.run_tests(STUB_MODE="nojson")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.npy(), [], out)
+
+    def test_keep_keeps_everything(self):
+        rc, out = self.run_tests(STUB_MODE="fail:b_one", KTEST_KEEP="1")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.npy(), sorted(FILES), out)
+
+    def test_interrupt_removes_inputs(self):   # a timeout or a scope stop is a transition: the same cleanup as a failure
+        p = subprocess.Popen(["bash", os.path.join(HERE, "run_kernel_tests.sh"), self.pkg, self.dir], env=dict(self.env, STUB_MODE="hang"),
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        for _ in range(300):
+            if os.path.exists(os.path.join(self.dir, "hanging")):
+                break
+            time.sleep(0.1)
+        else:
+            p.kill()
+            self.fail("the stub loom-test never started: " + p.communicate()[0])
+        os.killpg(p.pid, signal.SIGTERM)
+        out = p.communicate(timeout=60)[0]
+        self.assertEqual(p.returncode, 143, out)
+        self.assertIn("inputs removed (exit 143", out)
+        self.assertEqual(self.npy(), [], out)
+
     def test_scope_lines(self):   # C11: the log names what ran; no record is 'unknown', never 'full'
         rc, out = self.run_tests(STUB_MODE="pass")
         self.assertIn("ktest scope: unknown", out)
@@ -108,15 +144,31 @@ class Runner(unittest.TestCase):
 
 
 
-class Scope(unittest.TestCase):
+class Prune(unittest.TestCase):
+    def test_inputs_of(self):
+        self.assertEqual(ks.inputs_of(CASES, {"b_one"}), {"b_x.npy", "shared_w.npy"})
+        self.assertEqual(ks.inputs_of(CASES, {"a_one", "b_two"}), {"a_x.npy", "shared_w.npy", "b2_x.npy"})
+        self.assertEqual(ks.inputs_of(CASES, set()), set())
+
+    def test_prune_without_cases_refuses(self):   # cannot tell which inputs the failing cases read: the runner then removes all
+        t = tempfile.mkdtemp(prefix=".test_prune.", dir=HERE)
+        try:
+            open(os.path.join(t, "a_x.npy"), "w").close()
+            with self.assertRaises(ValueError):
+                ks.prune_inputs(t, ["a_one"])
+            self.assertEqual(os.listdir(t), ["a_x.npy"])
+        finally:
+            shutil.rmtree(t)
+
     def test_write_scope(self):
         t = tempfile.mkdtemp(prefix=".test_scope.", dir=HERE)
         try:
             ks.write_scope(t, None, 5, 5)
-            self.assertEqual(json.load(open(os.path.join(t, ks.SCOPE_FILE))), {"scope": "full", "cases": 5, "of": 5})
+            with open(os.path.join(t, ks.SCOPE_FILE)) as f:
+                self.assertEqual(json.load(f), {"scope": "full", "cases": 5, "of": 5})
             ks.write_scope(t, {"g_b", "g_a"}, 2, 5)
-            self.assertEqual(json.load(open(os.path.join(t, ks.SCOPE_FILE))),
-                             {"scope": "subset", "kernels": ["g_a", "g_b"], "cases": 2, "of": 5})
+            with open(os.path.join(t, ks.SCOPE_FILE)) as f:
+                self.assertEqual(json.load(f), {"scope": "subset", "kernels": ["g_a", "g_b"], "cases": 2, "of": 5})
         finally:
             shutil.rmtree(t)
 

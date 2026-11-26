@@ -16,6 +16,15 @@ P=${2:?package dir}; T=${3:?test dir}
 # run without KTEST_CHANGED (the full suite): the run log's 'ktest scope:' line (full / subset / unknown, from the generator's
 # ktest_scope.json) says which, and HRX-like scripts/ktest_verdict.sh passes only 'full' unless the step admits more (KTEST_SCOPE_OK).
 KS=""; FULL=1
+# A generation that stops (an error, INT / TERM / HUP) removes the inputs it wrote, as run_kernel_tests.sh does after a run (11-26,
+# HRX-like E625: generated .npy outlived their runs); KTEST_KEEP=1 keeps them.
+GEN_T=""
+gen_cleanup() {
+  [ -n "$GEN_T" ] && [ -d "$GEN_T" ] && [ "${KTEST_KEEP:-0}" != 1 ] || return 0
+  find "$GEN_T" -maxdepth 1 -name '*.npy' \( -type f -o -type l \) -delete
+  echo "ktest: the generation did not finish: removed its inputs in $GEN_T" >&2
+}
+trap gen_cleanup EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
 if [ -n "${KTEST_CHANGED:-}" ]; then
   idargs=(--cand "$P"); [ -n "${KTEST_BASE:-}" ] && idargs+=(--base "$KTEST_BASE")
   if KS=$(python3 "$KIT_SRC/ktest_select.py" changed "$KTEST_CHANGED" "${idargs[@]}"); then FULL=0; echo "ktest: selected (changed vs base: ${KS:-none})"
@@ -25,7 +34,7 @@ run_one() {   # PKG_DIR TESTDIR -> TESTDIR.run.log; the switches come from PKG_D
   local P=$1 T=$2 p SW rc; p=$(lsk_pkg "$P")
   [ -f "$P.cmd" ] || die "no $P.cmd (build with common/build.sh) - the test switches must be the package's"
   SW=$(sed -n 's/^env \(.*\) kit\/build\.py .*/\1/p' "$P.cmd"); [ -n "$SW" ] || die "cannot read the switches from $P.cmd"
-  rm -rf "$T"
+  rm -rf "$T"; GEN_T=$T
   if [ "$FULL" = 0 ]; then
     # shellcheck disable=SC2086
     env $SW KTEST_KERNELS="$KS" PATH="${VENV:+$VENV/bin:}$PATH" "$PYTHON" "$KIT_SRC/make_kernel_tests.py" "$p/llm_config.json" "$T" > "$T.gen.log" 2>&1
@@ -38,6 +47,7 @@ run_one() {   # PKG_DIR TESTDIR -> TESTDIR.run.log; the switches come from PKG_D
     env $SW PATH="${VENV:+$VENV/bin:}$PATH" "$PYTHON" "$KIT_SRC/make_kernel_tests.py" "$p/llm_config.json" "$T" > "$T.gen.log" 2>&1 \
       || die "test generation failed ($WORK/$T.gen.log)"
   fi
+  GEN_T=""
   VENV=${VENV:-} bash "$KIT_SRC/run_kernel_tests.sh" "$p" "$T" > "$T.run.log" 2>&1
 }
 run_one "$P" "$T"; rc=$?
