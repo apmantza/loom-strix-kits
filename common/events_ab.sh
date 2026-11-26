@@ -11,7 +11,8 @@
 # each run (<run>/env.txt); summary.md ends with an `environment:` section (the first run's block) and each run whose block
 # differs from it. UNTRUSTED (the script ends with 'EVENTS: UNTRUSTED ...' and exits 2 after the summary): the environment differs
 # between runs (profiles from two environments are not an A/B), or a run's CPU line is not 'clean' (other CPU work beside the
-# server, CONTAMINATED: HRX-like E415; or unknown). AB_CPU_MAX: other CPU in cores above which a sample counts (default 3, as agent_ab).
+# server, CONTAMINATED: HRX-like E415; or unknown), or its gpu line is not 'clean' (other GPU clients' engine time above 1 % of the
+# run's wall or another KFD process, GPU-CONTAMINATED: HRX-like E631; or unknown: no client record). AB_CPU_MAX: other CPU in cores above which a sample counts (default 3, as agent_ab).
 # Output: OUT/summary.md (lanes, then the environment section), OUT/env.md, OUT/starts.txt (each run's thermal start and memfrag),
 #   OUT/<n>-<package dir name without a 'pkg-' prefix>/: start.txt env.txt env.err env.diff mem.txt run.ireeprof run.req.json
 #   run.req.err tel.tsv tel.txt events.jsonl events.err
@@ -29,7 +30,7 @@ OUT=$(realpath -m "${2:?out dir}"); L=${3:?prompt length}; shift 3
 eb=(); for p in "$@"; do eb+=(--pkg "$(lsk_pkg "$p")") || exit 1; done   # every package, in the environment block
 TEL=
 trap '[ -n "$TEL" ] && kill $TEL 2>/dev/null; lsk_restore; echo "restored $(date +%T)"' EXIT
-mkdir -p "$OUT"; n=0; runs=(); unclean=()
+mkdir -p "$OUT"; n=0; runs=(); unclean=(); gpuunclean=()
 for p in "$@"; do
   n=$((n + 1)); b=$(basename "$p"); d=$OUT/$n-${b#pkg-}; tag=$(basename "$d"); rm -rf "$d"; mkdir -p "$d"; runs+=("$d")
   lsk_stop || exit 1
@@ -45,6 +46,7 @@ for p in "$@"; do
   kill $TEL 2>/dev/null; TEL=
   python3 "$H/gpu_telemetry.py" summary "$d/tel.tsv" "$tag" --cpu-max "${AB_CPU_MAX:-3}" | tee "$d/tel.txt"
   grep -qF -- "  cpu $tag: clean: " "$d/tel.txt" || unclean+=("$tag")   # fail closed: only a 'clean' CPU line is trusted
+  grep -qF -- "  gpu $tag: clean: " "$d/tel.txt" || gpuunclean+=("$tag")   # other GPU clients (E631): only 'clean' is trusted
   lab=$(python3 -I "$H/context_label_check.py" "$d/run.req.json" "${EXPECT_TOKENS:-$L}"); lc=$?   # not inside the echo: its status was discarded there
   echo "### $n $p $lab"
   [ $lc -eq 0 ] || die "events_ab STOP: run $n served another context than ${EXPECT_TOKENS:-$L} tokens (LENGTH $L is the request's size label: set EXPECT_TOKENS to what it serves)"
@@ -67,5 +69,6 @@ envok=0   # no pipe around the block: envok must survive it
 tee -a "$OUT/summary.md" < "$OUT/env.md"
 for d in "${runs[@]}"; do echo "$(cat "$d/start.txt" 2>/dev/null || echo "$(basename "$d") start: unknown"); $(cut -c1-60 "$d/mem.txt" 2>/dev/null)"; done | tee "$OUT/starts.txt"
 [ ${#unclean[@]} = 0 ] || echo "EVENTS: UNTRUSTED: CPU telemetry not 'clean' (other CPU work beside the server, or unknown) in run(s) ${unclean[*]} (HRX-like E415)" | tee -a "$OUT/summary.md"
+[ ${#gpuunclean[@]} = 0 ] || echo "EVENTS: UNTRUSTED: GPU clients not 'clean' (other GPU clients beside the server, GPU-CONTAMINATED, or unknown) in run(s) ${gpuunclean[*]} (HRX-like E631)" | tee -a "$OUT/summary.md"
 echo "EVENTS_AB_DONE $(date +%T)"
-[ $envok = 0 ] && [ ${#unclean[@]} = 0 ] || exit 2
+[ $envok = 0 ] && [ ${#unclean[@]} = 0 ] && [ ${#gpuunclean[@]} = 0 ] || exit 2

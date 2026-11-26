@@ -8,7 +8,8 @@
 # candidate. Before each half the bench server is stopped and the chip cools to T_START (edge, C; default 55) or for at most
 # COOL_MAX s (default 900); where each half started is logged (OUT/<tag>.start.txt), a HOT start is printed.
 # Telemetry (E353): common/gpu_telemetry.py records clock / power / temperature / busy % and CPU beside every half
-# (OUT/<tag>.tel.tsv, summary in .tel.txt); a half with other CPU work beside the server is CONTAMINATED (E415).
+# (OUT/<tag>.tel.tsv, summary in .tel.txt); a half with other CPU work beside the server is CONTAMINATED (E415), one with other
+# GPU clients' engine time above 1 % of its wall (or another KFD process) GPU-CONTAMINATED (HRX-like E631; OUT/<tag>.tel.clients.jsonl).
 # Environment (strix-llama.cpp #241: a Mesa update turned a measured speedup into a loss): common/env_block.py records kernel,
 # GPU boot parameters, firmware, Mesa, ROCm, Loom, kit commit, both packages, power settings, CPU governor before each half
 # (OUT/<tag>.env.txt; the first half's is the bench's, OUT/env.txt); a half whose block differs from it makes the bench UNTRUSTED.
@@ -22,7 +23,8 @@
 #   copy's prefill 1.061 [1.031, 1.089] and 1.004 (HRX-like E473 / E475: up to +-18 % on long late turns between starts), so a bench
 #   prefill verdict within 7 % (above the largest A/A, 6.1 %) is per-start noise; judge prefill kernels on served device time (events_ab) until a multi-start floor exists.
 #   SLOWER if any metric is slower; FASTER if one is faster and none slower; TIE otherwise. UNTRUSTED: a half CONTAMINATED by
-#   CPU work, or recorded without CPU columns, or the environment changed between halves (or could not be compared).
+#   CPU work, or recorded without CPU columns, or GPU-CONTAMINATED / GPU clients unknown (a tel.txt from before 11-26 has no gpu line:
+#   reported, not distrusted, so old benches re-analyse), or the environment changed between halves (or could not be compared).
 #   INVALID: fewer than 3 turns with equal output lengths, or a half missing.
 # Machine specifics come from the environment (machine env, kit.env, or the caller), never from this file:
 #   AB_SERVE   command prefix: AB_SERVE PKG serves PKG, AB_SERVE --restore hands the port back (default: bash common/serve_as.sh KIT)

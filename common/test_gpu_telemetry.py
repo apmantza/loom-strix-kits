@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests of gpu_telemetry.py on a fake sysfs tree (--root). Each case names the recurrence it prevents.
 usage: python3 test_gpu_telemetry.py (exit 1 on a failure)"""
+import json
 import os
 import subprocess
 import sys
@@ -160,6 +161,148 @@ with tempfile.TemporaryDirectory() as root:
     rows = [l.rstrip("\n").split("\t") for l in open(t)]
     case("record: first sample's CPU columns empty, a later one shows the /proc/stat delta (1 core = 100 %)",
          rows[0][10:] == ["", ""] and ["100", "100"] in [r[10:] for r in rows])
+
+# Other GPU clients beside the run (HRX-like E631: served flash2 dispatches ran 1.2-1.8x slow on some nights with memory-placement
+# leads refuted; desktop clients time-sharing the GPU are the next hypothesis, and busy % cannot say whose work it was). The
+# recorder snapshots every amdgpu DRM client's engine counters (/proc/PID/fdinfo, cumulative ns per client) and every KFD process
+# (/sys/class/kfd/kfd/proc: compute clients whose engine time no counter exposes) into OUT.clients.jsonl; the summary prints one
+# `gpu LABEL:` line, and only `clean` is trusted by agent_ab_summary / events_ab.
+FDINFO = "pos:\t0\nflags:\t02100002\ndrm-driver:\t{drv}\ndrm-client-id:\t{cid}\ndrm-pdev:\t0000:c6:00.0\n{eng}"
+
+
+def drm_fd(root, pid, fd, comm, cid, eng, drv="amdgpu", target="/dev/dri/renderD128"):
+    put(root, f"proc/{pid}/comm", comm + "\n")
+    put(root, f"proc/{pid}/fdinfo/{fd}", FDINFO.format(drv=drv, cid=cid, eng="".join(f"drm-engine-{k}:\t{v} ns\n" for k, v in eng.items())))
+    os.makedirs(os.path.join(root, f"proc/{pid}/fd"), exist_ok=True)
+    link = os.path.join(root, f"proc/{pid}/fd/{fd}")
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink(target, link)
+
+
+def fake_clients(root):
+    fake_sysfs(root)
+    ms = 1000000
+    drm_fd(root, 100, 5, "chrome", 7, {"gfx": 10 * ms, "compute": 0})        # one client, two fds (dup / fork): counted once
+    drm_fd(root, 100, 6, "chrome", 7, {"gfx": 10 * ms, "compute": 0})
+    drm_fd(root, 100, 3, "chrome", 7, {"gfx": 999 * ms}, target="/dev/null")   # not a DRM file: never read as one
+    drm_fd(root, 200, 4, "ptyxis", 9, {"gfx": 50 * ms})
+    drm_fd(root, 300, 6, "loom-serve", 11, {"dma": 1 * ms})                  # the measured server (--pid 300): excluded
+    drm_fd(root, 500, 4, "otherdrv", 13, {"render": 7 * ms}, drv="i915")      # another driver's GPU
+    os.makedirs(os.path.join(root, "proc/400/fd"))                            # another user's process: fd/ unreadable
+    put(root, "proc/400/comm", "Xorg\n")
+    os.chmod(os.path.join(root, "proc/400/fd"), 0)
+    os.makedirs(os.path.join(root, "sys/class/kfd/kfd/proc/300"))             # the server's own KFD entry
+
+
+def clients_run(root, change, kill=False):
+    """record with --pid 300 for ~1 s; change(root) half way; SIGTERM (how agent_ab / events_ab stop it) or SIGKILL"""
+    out = os.path.join(root, "c.tel.tsv")
+    p = subprocess.Popen([sys.executable, TOOL, "--root", root, "record", out, "--pid", "300"])
+    time.sleep(0.6)
+    change(root)
+    time.sleep(0.4)
+    p.kill() if kill else p.terminate()
+    p.wait()
+    return out
+
+
+def busy_desktop(root):
+    ms = 1000000
+    drm_fd(root, 100, 5, "chrome", 7, {"gfx": 610 * ms, "compute": 0})       # +600 ms, seen through both fds
+    drm_fd(root, 100, 6, "chrome", 7, {"gfx": 610 * ms, "compute": 0})
+    drm_fd(root, 200, 4, "ptyxis", 9, {"gfx": 51 * ms})                       # +1 ms
+    drm_fd(root, 300, 6, "loom-serve", 11, {"dma": 5001 * ms})                # the server: +5 s, not another client
+    drm_fd(root, 600, 8, "gnome-shell", 21, {"gfx": 49 * ms})                 # a client opened during the run: from 0
+
+
+uid0 = os.geteuid() == 0
+with tempfile.TemporaryDirectory() as root:
+    fake_clients(root)
+    tsv = clients_run(root, lambda r: drm_fd(r, 200, 4, "ptyxis", 9, {"gfx": 51 * 1000000}))
+    rc, out, _ = run("summary", tsv, "h1-a")
+    g = [l for l in out.splitlines() if l.startswith("  gpu h1-a: ")]
+    case("clients: a 1 ms terminal blip in ~1 s is clean (below 1 % of wall), one gpu line", rc == 0 and len(g) == 1
+         and g[0].startswith("  gpu h1-a: clean: ") and "ptyxis 200 1.0 ms" in g[0])
+    case("clients: unreadable processes counted, never skipped silently", uid0 or "unreadable 1 " in out)
+    case("clients: the gpu line comes before the cpu line (a summary that stops early leaves no cpu line: untrusted)",
+         -1 < out.find("  gpu h1-a:") < out.find("  cpu h1-a:"))
+    cj = tsv[:-4] + ".clients.jsonl"
+    snaps = [json.loads(l) for l in open(cj)] if os.path.exists(cj) else []
+    case("record: a snapshot at start and a final one on SIGTERM", len(snaps) == 2)
+
+with tempfile.TemporaryDirectory() as root:
+    fake_clients(root)
+    tsv = clients_run(root, busy_desktop)
+    rc, out, _ = run("summary", tsv, "h2-b")
+    g = ([l for l in out.splitlines() if l.startswith("  gpu h2-b: ")] or [""])[0]
+    case("clients: 650 ms of other engine time in ~1 s -> GPU-CONTAMINATED naming chrome first", rc == 0
+         and g.startswith("  gpu h2-b: GPU-CONTAMINATED (chrome 100 600.0 ms"))
+    case("clients: two fds of one drm-client-id counted once (600 ms, not 1200)", "chrome 100 600.0 ms" in g and "1200" not in g)
+    case("clients: the measured server (--pid) is not another client", "loom-serve" not in g and "5000" not in g)
+    case("clients: a client opened during the run counts from 0", "gnome-shell 600 49.0 ms" in g)
+    case("clients: other drivers and non-DRM fds are not read", "otherdrv" not in g and "999" not in g)
+    case("clients: total other engine time 650.0 ms", "other GPU clients 650.0 ms" in g)
+    rc, out, _ = run("summary", tsv, "h2-b", "--gpu-max", "90")
+    case("clients: --gpu-max sets the share of wall (650 ms in ~1 s is clean below 90 %)", "  gpu h2-b: clean: " in out
+         and "flag above 90 %" in out)
+
+with tempfile.TemporaryDirectory() as root:
+    # a second compute client (another loom-serve, a HIP probe) uses /dev/kfd: no engine counter shows its time, so its presence
+    # alone flags the run (a gate fails closed on what it cannot measure)
+    fake_clients(root)
+    tsv = clients_run(root, lambda r: os.makedirs(os.path.join(r, "sys/class/kfd/kfd/proc/700")) or put(r, "proc/700/comm", "llama-server\n"))
+    rc, out, _ = run("summary", tsv, "h1-k")
+    case("clients: another KFD process during the run -> GPU-CONTAMINATED (unmeasured)", "  gpu h1-k: GPU-CONTAMINATED (kfd llama-server 700" in out)
+
+with tempfile.TemporaryDirectory() as root:
+    fake_clients(root)
+    tsv = clients_run(root, busy_desktop, kill=True)
+    rc, out, _ = run("summary", tsv, "h1-x")
+    case("clients: killed before its final snapshot -> unknown, never clean", "  gpu h1-x: unknown" in out)
+    if os.path.exists(tsv[:-4] + ".clients.jsonl"):
+        os.remove(tsv[:-4] + ".clients.jsonl")
+    rc, out, _ = run("summary", tsv, "h1-x")
+    case("clients: a tel.tsv recorded before client snapshots (no .clients.jsonl) -> gpu unknown, the rest unchanged",
+         rc == 0 and "  gpu h1-x: unknown (no GPU client record" in out and "telemetry h1-x:" in out)
+
+with tempfile.TemporaryDirectory() as root:
+    # an engine counter in a unit or shape this parser does not know (a kernel that changes fdinfo) is not read as 0: unknown
+    fake_clients(root)
+    put(root, "proc/200/fdinfo/4", FDINFO.format(drv="amdgpu", cid=9, eng="drm-engine-gfx:\t51 us\n"))
+    tsv = clients_run(root, lambda r: None)
+    rc, out, _ = run("summary", tsv, "h1-u")
+    case("clients: an unparsed drm-engine line -> unknown (fail closed), naming the file", "  gpu h1-u: unknown (a client snapshot failed: "
+         "unparsed engine line" in out and "proc/200/fdinfo/4" in out)
+
+# agent_ab_summary: which tel.txt lines make a bench UNTRUSTED (HRX-like E415 for CPU; E631 for other GPU clients)
+def bench(root, tels):
+    """a finished 4-half bench in root with equal-length turns on both arms and the given tel.txt per tag"""
+    for h, turns in (("h1", (0, 4, 8, 12)), ("h2", (2, 6, 10, 14))):
+        for pkg, gen in (("a", 1.0), ("b", 1.0)):
+            rows = [{"turn": t, "out": 100, "gen_s": gen, "new": 1000, "ttft": 1.0} for t in turns]
+            open(os.path.join(root, f"{h}-{pkg}.jsonl"), "w").write(json.dumps({"summary": {"label": pkg}, "rows": rows}) + "\n")
+            open(os.path.join(root, f"{h}-{pkg}.env.diff"), "w").write("exit 0\n")   # the environment unchanged
+            open(os.path.join(root, f"{h}-{pkg}.tel.txt"), "w").write(tels.get(f"{h}-{pkg}", tels["*"]).replace("TAG", f"{h}-{pkg}"))
+    p = subprocess.run([sys.executable, os.path.join(HERE, "agent_ab_summary.py"), root, "a", "b", HERE, "0.01", "0.07"],
+                       capture_output=True, text=True)
+    return ([l for l in p.stdout.splitlines() if l.startswith("BENCH:")] or [p.stdout + p.stderr])[-1]
+
+
+CPU_OK = "  cpu TAG: clean: other CPU (beside the server) median 0.00 cores\n"
+GPU_OK = "  gpu TAG: clean: other GPU clients 1.0 ms in 600.0 s\n"
+with tempfile.TemporaryDirectory() as root:
+    case("agent_ab_summary: gpu and cpu clean -> a verdict", bench(root, {"*": GPU_OK + CPU_OK}).startswith("BENCH: TIE"))
+    v = bench(root, {"*": GPU_OK + CPU_OK, "h2-b": "  gpu TAG: GPU-CONTAMINATED (chrome 1 900.0 ms): x\n" + CPU_OK})
+    case("agent_ab_summary: a GPU-CONTAMINATED half -> UNTRUSTED naming GPU, not CPU", v.startswith("BENCH: UNTRUSTED")
+         and "h2-b GPU-CONTAMINATED by other GPU clients" in v and "by CPU" not in v)
+    v = bench(root, {"*": GPU_OK + CPU_OK, "h1-a": "  gpu TAG: unknown (no GPU client record)\n" + CPU_OK})
+    case("agent_ab_summary: gpu unknown in a summary that has the line -> UNTRUSTED", "h1-a GPU clients unknown" in v)
+    v = bench(root, {"*": GPU_OK + CPU_OK, "h1-a": GPU_OK + "  cpu TAG: unknown (no CPU columns)\n"})
+    case("agent_ab_summary: a gpu 'clean:' line does not stand in for an unknown cpu line", "h1-a CPU unknown" in v)
+    fix = open(os.path.join(HERE, "..", "kit", "fixtures", "tel_q205_1-e480.txt")).read().replace("1-e480", "TAG")
+    v = bench(root, {"*": fix})
+    case("agent_ab_summary: an old tel.txt (11-25, no gpu line) still re-analyses to a verdict", v.startswith("BENCH: TIE"))
 
 print(f"{len(fails)} failed" if fails else "all passed")
 sys.exit(1 if fails else 0)

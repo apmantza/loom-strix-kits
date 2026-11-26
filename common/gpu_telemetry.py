@@ -16,16 +16,30 @@ CPU (user 11-24, E415): CPU and GPU share one DRAM system and the power budget, 
 busy CPU of everything except --pid PID (the bench's own server), in % of one core (top's convention: 250 = 2.5 cores busy).
 A summary flags CONTAMINATED when that other CPU exceeds --cpu-max cores (default 2) in more than 10 % of the samples.
 
+Other GPU clients (HRX-like E631: served dispatches ran 1.2-1.8x slow on some nights with memory-placement leads refuted, and busy %
+cannot say whose work it was): the recorder snapshots, at start, every CLIENT_PERIOD s and on SIGTERM, every amdgpu DRM client's
+cumulative engine time (/proc/PID/fdinfo/N: drm-engine-<engine> ns, one record per drm-pdev + drm-client-id however many fds or
+processes hold it; only fds that link to /dev/dri/) and every KFD process (/sys/class/kfd/kfd/proc/PID), except --pid, into
+OUT.clients.jsonl. KFD compute (loom-serve, HIP) shows in no engine counter: loom-serve holds a render node for its memory, but its
+fdinfo shows DMA only. A process whose fd/ cannot be listed (another user's) is counted 'unreadable N', never skipped silently.
+The summary's `gpu LABEL:` line, printed before the cpu line: other clients' engine time between the first and last snapshot (a
+client new during the run from 0), as a share of that wall time; GPU-CONTAMINATED when the share exceeds --gpu-max % (default 1)
+or another KFD process existed (its time cannot be measured); unknown without two snapshots (no .clients.jsonl: recorded before
+11-26, or killed before its final snapshot). Engine time is time a client's jobs held a ring, an upper bound on interference.
+
 usage: gpu_telemetry.py [--root DIR] record OUT.tsv [--pid PID]   runs until killed; one line per sample:
            t busy power_w clock_ghz temp_c fclk_mhz mclk_mhz socclk_mhz cpu_tctl_c load1 cpu_pct other_cpu_pct
            (a column the machine does not expose is empty; the first sample's CPU columns are empty: they are deltas)
-       gpu_telemetry.py [--root DIR] summary OUT.tsv [LABEL] [--cpu-max CORES]   medians and p10 / p90 over the samples with
+       gpu_telemetry.py [--root DIR] summary OUT.tsv [LABEL] [--cpu-max CORES] [--gpu-max PCT]   medians and p10 / p90 over the samples with
            busy >= 50 %, the busy share, and the CPU line (`cpu: unknown` for a file recorded without CPU columns); the clock
            with 3 decimals (the recorded 1 MHz: 2 decimals stepped 0.46 %, HRX-like E624; summaries before 11-26 have 2)
        gpu_telemetry.py [--root DIR] temp                       the edge temperature now, in whole C (a bench's thermal start gate)
 --root: the directory that holds sys/ and proc/ (default /; a test points it at a fake tree). Exit 2 when no GPU card is found."""
 import glob
+import json
 import os
+import re
+import signal
 import statistics
 import sys
 import time
@@ -123,25 +137,96 @@ def sample(busy, power, freq, temp, clocks, tctl, cpu=("", "", "")):
             + "\t".join(cpu) + "\n")
 
 
+CLIENT_PERIOD = 5.0   # s between client snapshots: a scan of ~820 processes took 14 ms (0.3 % of one core at 5 s), and a client that
+                      # exits mid-run loses at most its last 5 s
+
+
+def clients_path(tsv):
+    return (tsv[:-4] if tsv.endswith(".tsv") else tsv) + ".clients.jsonl"
+
+
+ENGINE = re.compile(r"drm-engine-(?!capacity-)([\w-]+):\s*(\d+) ns")
+
+
+def gpu_clients(root="/", exclude=None):
+    """one snapshot: {"t", "clients": {pdev/client-id: {pid, comm, ns: {engine: ns}}}, "kfd": {pid: comm}, "unreadable": N}.
+    A client held by several processes belongs to the lowest pid; amdgpu fdinfo without a client id is keyed by its pid/fd
+    (counted, never merged); an engine line that does not parse makes the snapshot an error (the summary says unknown)."""
+    proc = os.path.join(root, "proc")
+    comm = lambda p: (opt(lambda q: open(q).read().strip(), f"{proc}/{p}/comm") or "?")
+    clients, unreadable = {}, 0
+    for p in sorted((x for x in os.listdir(proc) if x.isdigit()), key=int):
+        if p == str(exclude):
+            continue
+        try:
+            fds = os.listdir(f"{proc}/{p}/fd")
+        except PermissionError:
+            unreadable += 1
+            continue
+        except OSError:   # exited
+            continue
+        for fd in fds:
+            try:
+                if not os.readlink(f"{proc}/{p}/fd/{fd}").startswith("/dev/dri/"):
+                    continue
+                txt = open(f"{proc}/{p}/fdinfo/{fd}").read()
+            except PermissionError:
+                unreadable += 1
+                break
+            except OSError:
+                continue
+            kv = dict(l.split(":", 1) for l in txt.splitlines() if ":" in l)
+            if kv.get("drm-driver", "").strip() != "amdgpu":
+                continue
+            eng = [l for l in txt.splitlines() if l.startswith("drm-engine-") and not l.startswith("drm-engine-capacity-")]
+            ns = {m.group(1): int(m.group(2)) for m in map(ENGINE.fullmatch, (l.strip() for l in eng)) if m}
+            if len(ns) != len(eng):
+                raise ValueError(f"unparsed engine line in {proc}/{p}/fdinfo/{fd}: {eng}")
+            cid = kv.get("drm-client-id", "").strip()
+            key = f"{kv.get('drm-pdev', '').strip()}/{cid}" if cid else f"pid{p}/fd{fd}"
+            clients.setdefault(key, {"pid": int(p), "comm": comm(p), "ns": ns})
+    kd = os.path.join(root, "sys/class/kfd/kfd/proc")
+    kfd = {p: comm(p) for p in (sorted(os.listdir(kd)) if os.path.isdir(kd) else []) if p.isdigit() and p != str(exclude)}
+    return {"t": round(time.time(), 3), "clients": clients, "kfd": kfd, "unreadable": unreadable}
+
+
+def snapshot(f, root, pid):
+    """one JSON line; an error is recorded as such (the summary then says unknown), never dropped"""
+    try:
+        d = gpu_clients(root, pid)
+    except (OSError, ValueError) as e:
+        d = {"t": round(time.time(), 3), "error": str(e)[:300]}
+    f.write(json.dumps(d, sort_keys=True) + "\n")
+
+
 def record(out, root="/", period=0.1, pid=None):
     busy, power, freq, temp = paths(root)
     clocks, tctl = extra_paths(root)
     tck = os.sysconf("SC_CLK_TCK")
     prev = None
-    with open(out, "w", buffering=1) as f:
-        while True:
-            try:
-                cur = cpu_counters(root, pid)
-                load = open(os.path.join(root, "proc/loadavg")).read().split()[0]
-                cpu = (load,) + (cpu_columns(prev, cur, tck) if prev else ("", ""))
-                prev = cur
-            except (OSError, ValueError, IndexError):
-                cpu = ("", "", "")
-            try:
-                f.write(sample(busy, power, freq, temp, clocks, tctl, cpu))
-            except OSError:
-                pass
-            time.sleep(period)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # the callers' `kill $TEL`: leave through the final client snapshot
+    with open(out, "w", buffering=1) as f, open(clients_path(out), "w", buffering=1) as cf:
+        snapshot(cf, root, pid)
+        last = time.time()
+        try:
+            while True:
+                if time.time() - last >= CLIENT_PERIOD:
+                    snapshot(cf, root, pid)
+                    last = time.time()
+                try:
+                    cur = cpu_counters(root, pid)
+                    load = open(os.path.join(root, "proc/loadavg")).read().split()[0]
+                    cpu = (load,) + (cpu_columns(prev, cur, tck) if prev else ("", ""))
+                    prev = cur
+                except (OSError, ValueError, IndexError):
+                    cpu = ("", "", "")
+                try:
+                    f.write(sample(busy, power, freq, temp, clocks, tctl, cpu))
+                except OSError:
+                    pass
+                time.sleep(period)
+        finally:
+            snapshot(cf, root, pid)
 
 
 CONTAMINATED_SHARE = 0.10   # share of samples above --cpu-max that flags a run
@@ -168,7 +253,7 @@ def busy_clock(path):
     return statistics.median(busy_values(rows, busy, 3)) if rows else None
 
 
-def summary(path, label="", cpu_max=2.0):
+def summary(path, label="", cpu_max=2.0, gpu_max=1.0):
     rows, busy = samples(path)
     if not rows:
         print(f"  telemetry {label}: no samples")
@@ -185,8 +270,53 @@ def summary(path, label="", cpu_max=2.0):
             more += f", cpu {col(8)} C"
     print(f"  telemetry {label}: {len(rows)} samples, busy >= 50 % in {len(busy) / len(rows):.0%}; while busy: power {col(2)} W, "
           f"clock {col(3, 3)} GHz, temp {col(4)} C" + more)
+    print(gpu_line(clients_path(path), label, gpu_max))
     print(cpu_line(rows, label, cpu_max))
     return 0
+
+
+def gpu_line(cpath, label, gpu_max):
+    """the other-GPU-clients line: engine time of every client but the server between the first and last snapshot, per process,
+    and the flag (unknown without two good snapshots: no record, an error snapshot, or a recorder killed before its final one)"""
+    try:
+        snaps = [json.loads(l) for l in open(cpath)]
+    except FileNotFoundError:
+        return f"  gpu {label}: unknown (no GPU client record {os.path.basename(cpath)})"
+    except (OSError, ValueError) as e:
+        return f"  gpu {label}: unknown (unreadable GPU client record: {e})"
+    bad = [s.get("error", "no clients") for s in snaps if "clients" not in s]
+    if bad:
+        return f"  gpu {label}: unknown (a client snapshot failed: {bad[0]})"
+    wall = snaps[-1]["t"] - snaps[0]["t"] if len(snaps) >= 2 else 0
+    if wall <= 0:
+        return f"  gpu {label}: unknown ({len(snaps)} client snapshot(s): no start and end)"
+    first, seen = snaps[0]["clients"], {}
+    for s in snaps:
+        seen.update(s["clients"])   # a client's last-seen counters (one that exited counts up to its last snapshot)
+    per = {}
+    for key, c in seen.items():
+        base = first.get(key, {}).get("ns", {})
+        for eng, ns in c["ns"].items():
+            d = ns - base.get(eng, 0)
+            if d > 0:
+                who = per.setdefault((c["comm"], c["pid"]), {})
+                who[eng] = who.get(eng, 0) + d
+    tot = {w: sum(e.values()) for w, e in per.items()}
+    total = sum(tot.values())
+    kfd = {}
+    for s in snaps:
+        kfd.update(s["kfd"])
+    share = 100.0 * total / 1e9 / wall
+    top = sorted(tot, key=lambda w: -tot[w])
+    who = ", ".join(f"{c} {p} {tot[(c, p)] / 1e6:.1f} ms (" + ", ".join(f"{e} {v / 1e6:.1f}" for e, v in sorted(per[(c, p)].items()))
+                    + ")" for c, p in top[:5]) or "none"
+    unread = max(s["unreadable"] for s in snaps)
+    body = (f"other GPU clients {total / 1e6:.1f} ms engine time in {wall:.1f} s ({share:.2f} % of wall, flag above {gpu_max:g} %): "
+            f"{who}; other KFD processes {', '.join(f'{c} {p}' for p, c in sorted(kfd.items())) or 'none'}; {len(snaps)} snapshots; "
+            f"unreadable {unread} processes (another user's: not counted)")
+    over = [f"{c} {p} {tot[(c, p)] / 1e6:.1f} ms" for c, p in top[:3]] if share > gpu_max else []
+    over += [f"kfd {c} {p} unmeasured" for p, c in sorted(kfd.items())]
+    return f"  gpu {label}: " + (f"GPU-CONTAMINATED ({', '.join(over)}): " if over else "clean: ") + body
 
 
 def cpu_line(rows, label, cpu_max):
@@ -204,9 +334,9 @@ def cpu_line(rows, label, cpu_max):
 
 
 def main(argv):
-    root, pid, cpu_max = "/", None, 2.0
+    root, pid, cpu_max, gpu_max = "/", None, 2.0, 1.0
     argv = list(argv)
-    for flag in ("--root", "--pid", "--cpu-max"):
+    for flag in ("--root", "--pid", "--cpu-max", "--gpu-max"):
         if flag in argv:
             i = argv.index(flag)
             if i + 1 >= len(argv):
@@ -218,13 +348,15 @@ def main(argv):
                 root = v
             elif flag == "--pid":
                 pid = int(v) if v.isdigit() else None   # no server pid found: other CPU = all CPU (stricter)
-            else:
+            elif flag == "--cpu-max":
                 cpu_max = float(v)
+            else:
+                gpu_max = float(v)
     try:
         if len(argv) >= 2 and argv[0] == "record":
             record(argv[1], root, pid=pid)
         elif len(argv) >= 2 and argv[0] == "summary":
-            return summary(argv[1], argv[2] if len(argv) > 2 else "", cpu_max)
+            return summary(argv[1], argv[2] if len(argv) > 2 else "", cpu_max, gpu_max)
         elif argv[:1] == ["temp"]:
             print(round(read(paths(root)[3]) / 1e3))
             return 0
