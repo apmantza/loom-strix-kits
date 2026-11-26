@@ -15,7 +15,17 @@ verdict, or --cand / --base not the packages verdict.json beside the rows names)
 
        ktest_select.py combine LIB.loom CASES.loom-test OUT.loom             (run_kernel_tests.sh; any step that runs cases itself)
 writes LIB + CASES as one loom-test file, reordered by dual_target.encodings_first: the cases sit past the package's ~160k lines, so
-their encodings lie beyond hrx-loom's 16-bit SSA encoding ids (ENCODING/004; HRX-like E609, E616). Exit 1 when the reorder refuses."""
+their encodings lie beyond hrx-loom's 16-bit SSA encoding ids (ENCODING/004; HRX-like E609, E616). Exit 1 when the reorder refuses.
+
+       ktest_select.py scope [TESTDIR]                                       (run_kernel_tests.sh)
+prints 'ktest scope: full', 'ktest scope: subset (...)' or 'ktest scope: unknown (...)' from TESTDIR's ktest_scope.json (write_scope).
+
+       ktest_select.py prune TESTDIR FAILED.txt                              (run_kernel_tests.sh, after a failed run)
+removes TESTDIR's .npy inputs but those the cases named in FAILED.txt (one per line) read, and drops the kept ones from the page
+cache. Exit 1 when it cannot tell (no case text).
+
+       ktest_select.py drop TESTDIR                                          (run_kernel_tests.sh, KTEST_KEEP=1)
+drops TESTDIR's .npy inputs from the page cache (drop_cache: fsync, then POSIX_FADV_DONTNEED)."""
 import os
 import re
 import sys
@@ -244,6 +254,128 @@ def coverage(lib, selected):
     return sorted(launched), sorted(launched - tested)
 
 
+# The generation's scope, written beside the cases (make_kernel_tests.py) and printed by run_kernel_tests.sh as 'ktest scope: full |
+# subset (...) | unknown'; HRX-like scripts/ktest_verdict.sh refuses anything but full unless the step admits it (KTEST_SCOPE_OK), so a
+# go-live check cannot pass on a selected run (C11, E532).
+SCOPE_FILE = "ktest_scope.json"
+
+
+# The generator's environment reads that change which cases a run generates, with their defaults (None: unset or empty). A run is full
+# only when every one is at its default and nothing is selected (review r1 #1: SPLIT_VZERO_TESTS=0 / FLASH_TESTS=0 runs read 'full').
+# kit/test_run_kernel_tests.py checks this table against the generator's own os.environ reads.
+SECTION_SWITCHES = {"GEMM_TESTS": "1", "L17_TESTS": "1", "DRAFTER_TESTS": "1", "FLASH_TESTS": "1", "MOE_TESTS": "1",
+                    "MOE_GEMM_TESTS": "1", "SPLIT_VZERO_TESTS": "1", "WIDTH_EQ_TESTS": "1",
+                    "L17_VSPLIT_TESTS": None, "KTEST_GEMM_ALL": None, "KTEST_GEMM_ERR": None}
+# *_TESTS / KTEST_* names that are no section switch: the selection itself, a child run's suffix (children write no scope), and the
+# runner tooling's own variables (inherited from common/ktest.sh's caller). Any other such name in the environment forces subset.
+NOT_SECTION_SWITCHES = {"KTEST_KERNELS": "the selection (scope_record names it)", "KTEST_HEADS_SFX": "a child run's file suffix",
+                        "KTEST_KEEP": "runner cleanup", "KTEST_BASE": "common/ktest.sh base re-run",
+                        "KTEST_CHANGED": "common/ktest.sh selection input", "KTEST_SCOPE_OK": "HRX-like verdict admission",
+                        "KTEST_NEG_REWORK": "HRX-like verdict"}
+
+
+def scope_record(env, kept, generated):
+    """the generation's scope from its environment ENV: full only with no KTEST_KERNELS, every SECTION_SWITCHES at its default and no
+    unknown *_TESTS / KTEST_* name; else subset with the reasons (each 'NAME=value')"""
+    why = []
+    if "KTEST_KERNELS" in env:
+        why.append("KTEST_KERNELS=" + ",".join(sorted(k for k in env["KTEST_KERNELS"].split(",") if k)))
+    for k in sorted(env):
+        v = env[k]
+        if k in SECTION_SWITCHES:
+            d = SECTION_SWITCHES[k]
+            if (v != d) if d is not None else (v != ""):
+                why.append(f"{k}={v}")
+        elif (k.endswith("_TESTS") or k.startswith("KTEST_")) and k not in NOT_SECTION_SWITCHES:
+            why.append(f"{k}={v} (unknown section switch)")
+    rec = {"scope": "subset", "why": why} if why else {"scope": "full"}
+    rec.update(cases=kept, generated=generated)
+    return rec
+
+
+def write_scope(out, kept, generated, env=None):
+    """record OUT's generation (scope_record of ENV, default the process's environment) beside its cases"""
+    import json
+    rec = scope_record(os.environ if env is None else env, kept, generated)
+    with open(os.path.join(out, SCOPE_FILE), "w") as fh:
+        json.dump(rec, fh)
+
+
+def scope_line(testdir):
+    """the run log's scope line for TESTDIR: full and subset only from a record that says so; anything else is unknown"""
+    import json
+    try:
+        with open(os.path.join(testdir, SCOPE_FILE)) as fh:
+            r = json.load(fh)
+        if r.get("scope") == "full":
+            return "ktest scope: full"
+        if r.get("scope") == "subset" and r.get("why"):
+            return f"ktest scope: subset ({', '.join(r['why'])}; {r['cases']} cases kept of {r['generated']} generated)"
+        why = f"unrecognized record {json.dumps(r)[:200]}"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        why = f"no readable {SCOPE_FILE}: {e}"
+    return f"ktest scope: unknown ({why})"
+
+
+def inputs_of(cases, names):
+    """the input files (check.file.read.npy paths) the cases NAMES of a cases text read"""
+    got = set()
+    for b in re.split(r'(?m)^(?=check\.case |kernel\.def )', cases):
+        m = CASE.match(b)
+        if m and m.group(1) in names:
+            got |= set(re.findall(r'path\("([^"]+)"\)', b))
+    return got
+
+
+def drop_cache(path):
+    """write PATH's dirty pages back, then drop its pages from the page cache (POSIX_FADV_DONTNEED skips dirty pages). Generated
+    inputs are written once and read once by loom-test; 18-37 GB of them per suite stayed cached and crowded host memory (HRX-like
+    E625: deleting 89 GB of kept inputs took page cache 61 -> 44 GB and free order-10 blocks 324 -> 1,822)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
+def save_npy(path, a):
+    """np.save A to PATH, then drop it from the page cache (make_kernel_tests.save: every generated input)"""
+    import numpy as np
+    with open(path, "wb") as fh:
+        np.save(fh, a)
+    drop_cache(path)
+
+
+def drop_inputs(testdir):
+    """drop every .npy in TESTDIR from the page cache (run_kernel_tests.sh, inputs kept with KTEST_KEEP=1); the count"""
+    files = [f for f in os.listdir(testdir) if f.endswith(".npy")]
+    for f in files:
+        drop_cache(os.path.join(testdir, f))
+    return len(files)
+
+
+def prune_inputs(testdir, failed):
+    """run_kernel_tests.sh's cleanup after a failed run: keep the .npy inputs the FAILED cases (names) read in TESTDIR's
+    cases_used.loom-test (else cases.loom-test), remove the rest, drop the kept ones from the page cache; ValueError without a case
+    text. (kept, removed) file names."""
+    src = next((os.path.join(testdir, f) for f in ("cases_used.loom-test", "cases.loom-test") if os.path.exists(os.path.join(testdir, f))), None)
+    if src is None:
+        raise ValueError(f"no cases_used.loom-test / cases.loom-test in {testdir}")
+    with open(src) as fh:
+        keep = inputs_of(fh.read(), set(failed))
+    kept, removed = [], []
+    for f in sorted(os.listdir(testdir)):
+        if f.endswith(".npy"):
+            if f in keep:
+                drop_cache(os.path.join(testdir, f))   # loom-test read it into the page cache
+                kept.append(f)
+            else:
+                os.remove(os.path.join(testdir, f))
+                removed.append(f)
+    return kept, removed
+
+
 def combine(lib, cases):
     """LIB + CASES as one loom-test text, reordered so every encoding-typed line sits within hrx-loom's 16-bit value ids
     (dual_target.encodings_first; ValueError when it cannot)"""
@@ -259,6 +391,26 @@ if __name__ == "__main__":
         except ValueError as e:
             sys.exit(f"ktest_select: combine refused: {e}")
         open(sys.argv[4], "w", newline="\n").write(text)
+        sys.exit(0)
+    if sys.argv[1:2] == ["prune"]:
+        if len(sys.argv) != 4:
+            sys.exit(__doc__)
+        with open(sys.argv[3]) as fh:
+            failed = [x.strip() for x in fh if x.strip()]
+        try:
+            kept, removed = prune_inputs(sys.argv[2], failed)
+        except (ValueError, OSError) as e:
+            sys.exit(f"ktest_select: prune refused: {e}")
+        print(f"kept {len(kept)} input files of the failing cases ({len(failed)}) in {os.path.abspath(sys.argv[2])}; removed {len(removed)} "
+              "(KTEST_KEEP=1 keeps all)")
+        sys.exit(0)
+    if sys.argv[1:2] == ["drop"]:
+        if len(sys.argv) != 3:
+            sys.exit(__doc__)
+        print(f"inputs kept (KTEST_KEEP=1): {drop_inputs(sys.argv[2])} files in {os.path.abspath(sys.argv[2])}, dropped from the page cache")
+        sys.exit(0)
+    if sys.argv[1:2] == ["scope"]:
+        print(scope_line(sys.argv[2] if len(sys.argv) > 2 else "."))
         sys.exit(0)
     if sys.argv[1:2] == ["changed"]:
         import argparse
