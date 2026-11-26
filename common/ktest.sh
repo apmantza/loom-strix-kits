@@ -13,7 +13,8 @@ P=${2:?package dir}; T=${3:?test dir}
 # to the full suite: a changed set the file cannot give (unreadable, a kernel the gate could not judge, a verdict.json beside it that
 # names another candidate than PKG or another base than KTEST_BASE, or none), or a selection without a smoke case or with a changed
 # kernel no case tests (make_kernel_tests.py exit 3). With KTEST_BASE the base's run uses the same selection. Go-live candidates
-# run without KTEST_CHANGED (the full suite).
+# run without KTEST_CHANGED (the full suite): the run log's 'ktest scope:' line (full / subset / unknown, from the generator's
+# ktest_scope.json) says which, and HRX-like scripts/ktest_verdict.sh passes only 'full' unless the step admits more (KTEST_SCOPE_OK).
 KS=""; FULL=1
 if [ -n "${KTEST_CHANGED:-}" ]; then
   idargs=(--cand "$P"); [ -n "${KTEST_BASE:-}" ] && idargs+=(--base "$KTEST_BASE")

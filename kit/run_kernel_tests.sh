@@ -14,6 +14,7 @@ echo "device arch: ${arch:-unknown}"
 # One file (the cases' reference kernels sit past the package's ~160k lines: hrx-loom's 16-bit encoding ids, HRX-like E609 / E616).
 "$bin/python" "$here/ktest_select.py" combine "$pkg/program/llm.loom" cases_used.loom-test combined.loom \
   || { echo "FAIL encodings: ktest_select.py combine refused combined.loom, no cases run"; exit 1; }
+"$bin/python" "$here/ktest_select.py" scope .   # full / subset / unknown (C11): HRX-like ktest_verdict.sh passes only full by default
 "$bin/loom-test" combined.loom --device=${DEVICE:-amdgpu} > out.json 2> err.txt
 grep -v '^{"format' err.txt | head -20
 "$bin/python" - <<'PY'

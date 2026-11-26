@@ -5239,6 +5239,7 @@ KNOWN_DEFECTS = {"E444": ("" if os.environ.get("KV8", "0") == "1" or os.environ.
                           "stale_kv_flash_nan stale_kv_flash_inf stale_kv_split_listed_nan stale_kv_split_listed_inf "
                           "stale_kv_split_decode_nan stale_kv_split_decode_inf").split()}
 text = "\n".join(cases)
+_total = len(re.findall(r"(?m)^check\.case public @", text))
 if KT_ONLY is not None:
     print(f"selected generation: skipped {len(KT_SKIPPED)} sections (" + "; ".join(",".join(sorted(k)) for k in KT_SKIPPED[:3])
           + (" ..." if len(KT_SKIPPED) > 3 else "") + ")")
@@ -5252,6 +5253,8 @@ if not KS:
 # hrx-loom 0.1.0: float comparison is check.expect.approximate with the actual and expected types.
 text = re.sub(r"check\.expect\.close (actual\(.*\)) : (.*)$", r"check.expect.approximate \1 : \2, \2", "\n".join(cases), flags=re.M)
 open(os.path.join(out, f"cases{KS}.loom-test"), "w", newline="\n").write(text)
+if not KS:   # the scope run_kernel_tests.sh prints ('ktest scope: ...'; a go-live verdict needs full: HRX-like ktest_verdict.sh)
+    ktest_select.write_scope(out, KT_ONLY, len(re.findall(r"(?m)^check\.case public @", text)), _total)
 if KT_ONLY is not None and not KS:   # the inputs of the cases left out (the sections that ran anyway wrote them)
     _used = set(re.findall(r'path\("([^"]+)"\)', text))
     _drop = [f for f in os.listdir(out) if f.endswith(".npy") and f not in _used]

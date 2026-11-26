@@ -15,7 +15,10 @@ verdict, or --cand / --base not the packages verdict.json beside the rows names)
 
        ktest_select.py combine LIB.loom CASES.loom-test OUT.loom             (run_kernel_tests.sh; any step that runs cases itself)
 writes LIB + CASES as one loom-test file, reordered by dual_target.encodings_first: the cases sit past the package's ~160k lines, so
-their encodings lie beyond hrx-loom's 16-bit SSA encoding ids (ENCODING/004; HRX-like E609, E616). Exit 1 when the reorder refuses."""
+their encodings lie beyond hrx-loom's 16-bit SSA encoding ids (ENCODING/004; HRX-like E609, E616). Exit 1 when the reorder refuses.
+
+       ktest_select.py scope [TESTDIR]                                       (run_kernel_tests.sh)
+prints 'ktest scope: full', 'ktest scope: subset (...)' or 'ktest scope: unknown (...)' from TESTDIR's ktest_scope.json (write_scope)."""
 import os
 import re
 import sys
@@ -244,6 +247,37 @@ def coverage(lib, selected):
     return sorted(launched), sorted(launched - tested)
 
 
+# The generation's scope, written beside the cases (make_kernel_tests.py) and printed by run_kernel_tests.sh as 'ktest scope: full |
+# subset (...) | unknown'; HRX-like scripts/ktest_verdict.sh refuses anything but full unless the step admits it (KTEST_SCOPE_OK), so a
+# go-live check cannot pass on a selected run (C11, E532).
+SCOPE_FILE = "ktest_scope.json"
+
+
+def write_scope(out, kernels, kept, total):
+    """record OUT's generation: KERNELS None (every case: full) or the selected kernels (subset), with KEPT of TOTAL cases"""
+    import json
+    rec = {"scope": "full"} if kernels is None else {"scope": "subset", "kernels": sorted(kernels)}
+    rec.update(cases=kept, of=total)
+    with open(os.path.join(out, SCOPE_FILE), "w") as fh:
+        json.dump(rec, fh)
+
+
+def scope_line(testdir):
+    """the run log's scope line for TESTDIR: full and subset only from a record that says so; anything else is unknown"""
+    import json
+    try:
+        with open(os.path.join(testdir, SCOPE_FILE)) as fh:
+            r = json.load(fh)
+        if r.get("scope") == "full":
+            return "ktest scope: full"
+        if r.get("scope") == "subset":
+            return f"ktest scope: subset ({r['cases']} of {r['of']} cases; kernels {','.join(r['kernels']) or 'none (smoke only)'})"
+        why = f"unrecognized record {json.dumps(r)[:200]}"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        why = f"no readable {SCOPE_FILE}: {e}"
+    return f"ktest scope: unknown ({why})"
+
+
 def combine(lib, cases):
     """LIB + CASES as one loom-test text, reordered so every encoding-typed line sits within hrx-loom's 16-bit value ids
     (dual_target.encodings_first; ValueError when it cannot)"""
@@ -259,6 +293,9 @@ if __name__ == "__main__":
         except ValueError as e:
             sys.exit(f"ktest_select: combine refused: {e}")
         open(sys.argv[4], "w", newline="\n").write(text)
+        sys.exit(0)
+    if sys.argv[1:2] == ["scope"]:
+        print(scope_line(sys.argv[2] if len(sys.argv) > 2 else "."))
         sys.exit(0)
     if sys.argv[1:2] == ["changed"]:
         import argparse
