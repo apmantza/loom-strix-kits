@@ -25,7 +25,10 @@ served kernels hold there (ALLOW: index.constant, fragment.load<lhs> from %x_sta
 %wave_row* and those must be %wave_row + 0 / 16 / 32 / 48, the rows the predicate reads (row_origin + wave_row + lane, + 32), with
 the staged x rows pinned to the tile's rows (x_row = row_origin + x_stage_row, + 128); no value defined in the region may be used
 after it except the accumulators the loop yields. gfx12 twins (target(@rdna4), _rdna4) are skipped by name; any other
-g_gemm_f16_*m256* kernel stops the build. Every guard reds a case of test_gemm_wave_skip.py when neutered (HRX-like E690)."""
+g_gemm_f16_*m256* kernel stops the build. Every guard reds a case of test_gemm_wave_skip.py when neutered (HRX-like E690).
+Not pinned (residuals the E704 verify accepted): the wave geometry is held only by the %wave_row assume (0-192), not by the
+workgroup size, the subgroup count or wave32; the predicate's column constant (%c0, scale column 0) is not checked against the tile
+skip's. A generator change to those would pass this gate; the kernel test's wave_skip case is the check that remains."""
 import re
 
 KERNEL = re.compile(r'^kernel\.def (?:target\(@(\w+)\) )?export\("(g_gemm_f16_\w*m256\w*)"\).*?\n\} launch\(.*?\n\}\n', re.S | re.M)
