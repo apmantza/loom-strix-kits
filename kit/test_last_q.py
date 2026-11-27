@@ -6,10 +6,11 @@ work list (the flash tiles holding a selected span's last token) instead of the 
   leaves its tail blocks on the full list, a silent half-lever);
 - set: the program is exactly the unset program plus the crop launch, its list buffer and the kernel: an independent inverse gives
   the unset program back byte for byte (a rewrite that touched the verify program or another launch would not invert);
-- fail closed (rules section 4: a text pass that finds code by shape must stop on a shape it does not know): a launch after the
-  last attention layer's flash kernels that is not a known row-local kernel (a DFlash tap, a drafter feature write), a layer
-  after the last attention layer, and a third list reader stop the rewrite; so does a second application (its layer then has no
-  reader of the full list).
+- fail closed (rules section 4: a text pass that finds code by shape must stop on a shape it does not know): after the last
+  attention layer's flash kernels only known statement forms pass (keeps-review 11-27: a buffer.copy of the attention output into
+  %features and a func.call passed the old launch-name list); a launch of a kernel not known row-local (a DFlash tap, a drafter
+  feature write), a template.apply, a buffer.copy, a func.call, a layer after the last attention layer, a third list reader and a
+  second work-list prologue stop the rewrite; so does a second application (its layer then has no reader of the full list).
 usage: python3 test_last_q.py (exit 1 on a failure)."""
 import os, re, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -102,10 +103,22 @@ with tempfile.TemporaryDirectory() as d:
     check("unit: the pass applies to the generator-shaped served program, at layer 63", lay == 63 and "%flash_tiles_out" in t_ok)
     part = re.search(r"(?m)^ *kernel\.launch @g_attention_flash2_partial_f16o\[[^\n]*%layer_63,[^\n]*\n", gen).group(0)
     tap = part + "  kernel.launch @g_dfl_tap[%t](%t, %tap_slot_4, %x, %features) : [index](index, index, buffer, buffer)\n"
+    head = "\n  %head = command.parameter"
+    prologue = re.search(r"(?m)^ *kernel\.launch @g_attention_fallback_list\[[^\n]*\n", gen).group(0)
     for what, odd in (("a DFlash tap after the last flash launch", gen.replace(part, tap, 1)),
+                      # keeps-review 11-27 (mutant no_template_guard): a template.apply after the last flash launch
+                      ("a template.apply after the last flash launch", gen.replace(part, part + "  template.apply<@sel1_g_mv_x>(%t) : (index)\n", 1)),
+                      # keeps-review 11-27: statements that are not launches passed the launch-name list
+                      ("a buffer.copy of the attention output into %features", gen.replace(head, "\n  buffer.copy %o16, %features : buffer, buffer" + head, 1)),
+                      ("a func.call after the last flash launch", gen.replace(head, "\n  func.call @g_tap_fn(%o16, %features) : (buffer, buffer) -> ()" + head, 1)),
+                      # keeps-review 11-27 (mutant no_prologue_count): a second work-list launch before layer 0
+                      ("a second work-list prologue", gen.replace("  // ---- layer 0", prologue + "  // ---- layer 0", 1)),
                       ("a layer after the last attention layer", gen.replace("\n  %head = command.parameter", "\n  // ---- layer 64 (gated delta-net)\n  %head = command.parameter", 1)),
                       ("a third list reader", gen.replace(part, part + part.replace("g_attention_flash2_partial_f16o", "g_attention_flash2_deep_f16o"), 1)),
                       ("a second application", t_ok)):
+        if odd == gen:
+            check(f"unit: {what}: the case changes the program", False, "replace matched nothing")
+            continue
         try:
             last_q.apply(odd)
             check(f"unit: {what} stops the rewrite", False, "no exit")

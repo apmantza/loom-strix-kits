@@ -196,7 +196,7 @@ func.def inline @g_block_holds_output(%metadata: buffer, %spans: index, %info: b
 
 # Kernels that may run after the last attention layer's flash launches: each is row-local (a token's output row depends only on
 # that token's input rows, or on per-span head rows), so stale attention rows of the tiles left out reach no row the head reads.
-# Anything else (a DFlash tap, a drafter's feature write, a later layer) stops the build: fail closed (rules section 4).
+# Any other kernel (a DFlash tap, a drafter's feature write, a later layer) stops the build: fail closed (rules section 4).
 ROW_LOCAL = re.compile(r"g16_attention_split_listed|g16_attention_combine_listed(_f16o)?|g_attention_split|g_attention_vsplit"
                        r"|g_attention_combine|g_attention_flash2(_partial)?|g_row_scale_f16(_live_lv)?|g_quant_q8|g_deq16_\w+"
                        r"|g_gemm_\w+|g_mv_\w+|g_add_norm_rs_live(_noh)?_lv|g_post_add_norm(_rs_live(_noh)?_lv|_lv)?"
@@ -210,6 +210,14 @@ ALLOC = "  %flash_tiles = buffer.alloca<global> align(256) %list_size : buffer\n
 CROP = ("    kernel.launch @g_flash_tiles_out[%t](%t, %spans, %metadata, %info, %flash_tiles, %flash_tiles_out) : "
         "[index](index, index, buffer, buffer, buffer, buffer)\n")
 LAUNCH = re.compile(r"(?m)^ *kernel\.launch @(\w+)\[")
+# Every other statement after those launches must be one of these forms, each one the served program uses there (keeps-review
+# 11-27: the launch-name list let a buffer.copy into %features and a func.call through). None of them writes memory: values
+# (index), control (scf.if, its braces), a new buffer or a view of one (a write happens only through an admitted launch), the
+# head's weights, config reads and declarations, the return. Anything else (template.apply, buffer.copy, func.call, scf.for, ...)
+# stops the build.
+AFTER_OK = re.compile(r"|//[^\n]*|\}|\} else \{|scf\.if %\w+ \{|command\.return|config\.decl @[^\n]*"
+                      r"|%\w+ = (?:index\.(?:constant|cmp|scale)|buffer\.alloca<global>|buffer\.view|command\.parameter|config\.get) [^\n]*")
+LAUNCH_LINE = re.compile(r"kernel\.launch @(\w+)\[[^\n]*")
 MARK = re.compile(r"(?m)^  // ---- layer (\d+)[^\n]*$")
 
 
@@ -242,9 +250,14 @@ def apply(text):
     if len(names) != 2 or None in names or not all(r.fullmatch(n) for r, n in zip(LIST_READERS, names)):
         die(f"layer {layer}: the flash list readers are {names}, expected g_attention_flash2[_f16o] then its partial kernel")
     after = block[block.index(readers[-1]) + len(readers[-1]):] + seg[b1:]
-    other = sorted({k for k in LAUNCH.findall(after) if not ROW_LOCAL.fullmatch(k)})
-    if other or re.search(r"(?m)^ *template\.apply", after):
-        die(f"kernels after layer {layer}'s flash launches that are not known row-local: {other or 'template.apply'}")
+    other = []
+    for ln in after.splitlines():
+        s = ln.strip()
+        lm = LAUNCH_LINE.fullmatch(s)
+        if not (ROW_LOCAL.fullmatch(lm.group(1)) if lm else AFTER_OK.fullmatch(s)):
+            other.append(s[:100])
+    if other:
+        die(f"after layer {layer}'s flash launches: {len(other)} statements not known row-local or memory-free: {other[:4]}")
     if seg.count(PROLOGUE) != 1 or seg.count(ALLOC) != 1:
         die(f"@llm_advance has {seg.count(PROLOGUE)} work-list launches and {seg.count(ALLOC)} list allocations (expected 1, 1)")
     for ln in readers:
