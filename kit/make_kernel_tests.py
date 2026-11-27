@@ -2536,7 +2536,10 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_acc_m256")' 
 # with every row live (column 0 = 1, run B: no wave can skip). Padding rows are laid out so each wave case occurs: tile 0 with wave 0
 # and wave 3 all padding and waves 1-2 live (a skip in a non-last tile; a wave 0 that skips while later waves compute), tile 1 with
 # wave 0 live, wave 1 33 live rows then padding (the served shape: a live prefix), wave 2 padding in its first 40 rows and live in its
-# last 24 (live rows only in the lanes' second load), wave 3 all padding. Padding rows' x is zero.
+# last 24 (live rows only in the lanes' second load), wave 3 all padding; tile 2 with wave 0 one live row (its row 0), wave 1 a 31-row
+# prefix, wave 2 one live row at its row 63 (the last row of the lanes' second load), wave 3 padding; tile 3 all padding beside it
+# (the tile skip). Padding rows' x is zero. Faults each pattern exists for (HRX-like E690, DIAG.md round-4 table): a predicate that
+# reads rows 32-63 only (tile 2 waves 0-1), rows 0-47 / lanes 0-15 / rows 0-62 (tile 2 wave 2).
 # Expectations (HRX-like E675 / E678: their state table is static-1127/wsk-fail/DIAG.md):
 #   0: run A's y against a float64 numpy reference (3a's form and tolerance): the independent check; it reds every predicate fault
 #      that zeroes a live row in run A, including those that hit both runs alike (inverted, always-skip: q246's pkg-wskm2 passed a
@@ -2546,22 +2549,25 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_acc_m256")' 
 #      scales alone, so each run's flags are checked against their own expectation (A: wsk_fa from column 0; B: 1), never against
 #      each other (q236: that pairwise check failed at row 192 on every package).
 # Recurrences: a skip predicate that reads the wrong rows, only the first 32 rows of a wave, wave 0's rows for the whole tile, or is
-# inverted (mutants pkg-wskm1 / 3 / 2, HRX-like q246, each red at named expectations), or a region rewrite that drops an MMA.
+# inverted, or reads rows 32-63 only (mutants pkg-wskm1 / 3 / 2 / 4, HRX-like q246, each red at named expectations), or a region
+# rewrite that drops an MMA.
 # Without the switch the case is a control (every expectation holds: q246 ran it on pkg-e480).
 _WSK = [k for k in ("g_gemm_f16_store_m256", "g_gemm_f16_acc_m256", "g_gemm_f16_swiglu_m256_f16o") if f'export("{k}")' in (_pkg_llm_text() or "")]
 if os.environ.get("GEMM_TESTS", "1") == "1" and _WSK:
-    _rows, _K, _nu = 512, 1024, 256
+    _wrng = np.random.default_rng(653)   # own stream (E653): this case's shape changes no other case's inputs
+    _rows, _K, _nu = 1024, 1024, 256
     _KP, _NP = _K + _PFPAD, _nu + _PFPAD
     _live = np.ones(_rows, bool)
     _live[0:64] = False; _live[192:256] = False; _live[353:384] = False; _live[384:424] = False; _live[448:512] = False
-    _xw = (rng.standard_normal((_rows, _K)) * 0.5).astype(np.float16); _xw[~_live] = 0
-    _inv = rng.uniform(0.5, 2.0, _rows).astype(np.float32)
+    _live[512:] = False; _live[512] = True; _live[576:607] = True; _live[703] = True   # tile 2 (512-767); tile 3 all padding
+    _xw = (_wrng.standard_normal((_rows, _K)) * 0.5).astype(np.float16); _xw[~_live] = 0
+    _inv = _wrng.uniform(0.5, 2.0, _rows).astype(np.float32)
     save("wsk_x", pfpad(_xw)); save("wsk_sp", np.stack([_live.astype(np.float32), _inv], 1))   # padding rows: column 0 = 0
     save("wsk_sl", np.stack([np.ones(_rows, np.float32), _inv], 1))   # every row live
     save("wsk_fa", np.repeat(_live.astype(np.float32)[:, None], 2, 1))   # F16O11 flags of the padded run (both columns)
     _wb = lambda w: pfpad(w, np.float16(0)).reshape(-1).view(np.int8)   # the f16 weight scratch: rows at stride K + PAD
-    _ww = (rng.standard_normal((_nu, _K)) * 0.05).astype(np.float16); _wu = (rng.standard_normal((_nu, _K)) * 0.05).astype(np.float16)
-    _rr = rng.standard_normal((_rows, _nu)).astype(np.float32)
+    _ww = (_wrng.standard_normal((_nu, _K)) * 0.05).astype(np.float16); _wu = (_wrng.standard_normal((_nu, _K)) * 0.05).astype(np.float16)
+    _rr = _wrng.standard_normal((_rows, _nu)).astype(np.float32)
     save("wsk_w", _wb(_ww)); save("wsk_u", _wb(_wu)); save("wsk_r", _rr)
     # the independent reference of run A (padding rows: x = 0, so 0 / r there, as the kernel must leave them)
     _gw = (_xw.astype(np.float64) @ _ww.astype(np.float64).T) * _inv[:, None]

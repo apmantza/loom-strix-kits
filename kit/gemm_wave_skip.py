@@ -18,14 +18,52 @@ Exactness: a live wave runs the same ops on the same operands in the same order.
 init. Its rows are padding, and padding rows' outputs are never read: the same invariant the existing whole-tile skip already relies on
 (gen_llm live_row_skip). For acc, padding rows of y keep their old value; today they get y + acc x 0, which is y unless the stale
 activation rows held inf / NaN.
-Fails closed: each anchor must match as expected in every rewritten kernel, the region must hold no barrier, store, nested scf op or
-global view, and no value defined in it may be used after it except the accumulators the loop yields. gfx12 twins (target(@rdna4),
-_rdna4) are skipped by name; any other g_gemm_f16_*m256* kernel stops the build."""
+Fails closed (HRX-like E690 review: the region check was a deny-list and accepted an LDS fragment.store, a global atomic and lhs
+rows off the wave): each anchor must match once in every rewritten kernel; every region line must be one of the five op forms the
+served kernels hold there (ALLOW: index.constant, fragment.load<lhs> from %x_stage_view at %wave_row / %wave_row1-3, vector.load from
+%w_wave_view, fragment<rhs>, vector.mma), the two views pinned to their workgroup allocas; the lhs loads must use all four
+%wave_row* and those must be %wave_row + 0 / 16 / 32 / 48, the rows the predicate reads (row_origin + wave_row + lane, + 32), with
+the staged x rows pinned to the tile's rows (x_row = row_origin + x_stage_row, + 128); no value defined in the region may be used
+after it except the accumulators the loop yields. gfx12 twins (target(@rdna4), _rdna4) are skipped by name; any other
+g_gemm_f16_*m256* kernel stops the build. Every guard reds a case of test_gemm_wave_skip.py when neutered (HRX-like E690)."""
 import re
 
 KERNEL = re.compile(r'^kernel\.def (?:target\(@(\w+)\) )?export\("(g_gemm_f16_\w*m256\w*)"\).*?\n\} launch\(.*?\n\}\n', re.S | re.M)
 REWRITE = re.compile(r"g_gemm_f16_(acc|store|swiglu)_m256(_f16o)?")
-FORBID = ("kernel.barrier", "vector.store", "view.store", "scf.", "buffer.view", "kernel.workgroup")
+ALLOW = (re.compile(r"    %\w+ = index\.constant \d+ : index"),
+         re.compile(r"    %\w+ = vector\.fragment\.load<lhs> %x_stage_view\[(?P<row>%wave_row[123]?), %\w+\] shape \[%c16, %c16\] : "
+                    r"view<256x72xf16> -> vector<16xf16>"),
+         re.compile(r"    %\w+ = vector\.load %w_wave_view\[%\w+, %\w+\] : view<\d+x72xf16> -> vector<16xf16>"),
+         re.compile(r"    %\w+ = vector\.fragment<rhs> %\w+ shape \[%c16, %c16\] : vector<16xf16>"),
+         re.compile(r"    %\w+ = vector\.mma %\w+, %\w+, %\w+ : vector<16xf16>, vector<16xf16>, vector<8xf32>"))
+# the rows the region's lhs loads read are the rows the predicate reads: stage row r holds tile row row_origin + r (r < 128 from x_row,
+# r + 128 from x_row1), and a wave's four lhs fragments read stage rows wave_row + 0 / 16 / 32 / 48 (+ 0-15 each)
+ANCHORS = ("  %lane = kernel.subgroup.lane.id : index\n", "  %wave_row = index.assume %wave_row_value [range(%wave_row_value, 0, 192)] : index\n",
+           "  %wave_row1_c = index.constant 16 : index\n", "  %wave_row2_c = index.constant 32 : index\n", "  %wave_row3_c = index.constant 48 : index\n",
+           "  %wave_row1 = index.add %wave_row, %wave_row1_c : index\n", "  %wave_row2 = index.add %wave_row, %wave_row2_c : index\n",
+           "  %wave_row3 = index.add %wave_row, %wave_row3_c : index\n",
+           "  %s_view = buffer.view %scales[%origin] : buffer -> view<[%rows]x2xf32>\n",
+           "  %row_origin = index.mul %row_group, %c256 : index\n",
+           "  %x_stage = buffer.alloca<workgroup> align(16) %x_bytes : buffer\n",
+           "  %x_stage_view = buffer.view %x_stage[%origin] : buffer -> view<256x72xf16>\n",
+           "  %w_stage = buffer.alloca<workgroup> align(16) %w_bytes : buffer\n",
+           "  %x_stage_row = index.div %workitem, %c2 : index\n", "  %x_stage_row1 = index.add %x_stage_row, %c128 : index\n",
+           "  %x_row_value = index.add %row_origin, %x_stage_row : index\n", "  %x_row = index.assume %x_row_value [lt(%x_row_value, %rows)] : index\n",
+           "  %x_row1_value = index.add %x_row, %c128 : index\n", "  %x_row1 = index.assume %x_row1_value [lt(%x_row1_value, %rows)] : index\n",
+           "    %x_rawp = vector.load %x_view[%x_row, %x_colp] : view<[%rows]x[%kx]xf16> -> vector<32xf16>\n",
+           "    %x_rawp1 = vector.load %x_view[%x_row1, %x_colp] : view<[%rows]x[%kx]xf16> -> vector<32xf16>\n",
+           "    vector.store %cr_x, %x_stage_view[%x_stage_row, %x_stage_col] : vector<32xf16>, view<256x72xf16>\n",
+           "    vector.store %cr_x1, %x_stage_view[%x_stage_row1, %x_stage_col] : vector<32xf16>, view<256x72xf16>\n")
+# the in-loop x prefetch reads the same rows, in one of the two forms the generator emits (by row, or GEMM256_FLATADDR's flat lanes)
+PREFETCH = (("      %xv = vector.load %x_view[%x_row, %x_coln] : view<[%rows]x[%kx]xf16> -> vector<32xf16>\n",
+             "      %xv1 = vector.load %x_view[%x_row1, %x_coln] : view<[%rows]x[%kx]xf16> -> vector<32xf16>\n"),
+            ("  %x_lane0_v = index.madd %x_row, %kx, %x_stage_col : index\n", "  %x_lane1_v = index.madd %x_row1, %kx, %x_stage_col : index\n",
+             "  %x_lane0 = index.assume %x_lane0_v [range(%x_lane0_v, 0, 1073741823), lt(%x_lane0_v, %x_flat_n)] : index\n",
+             "  %x_lane1 = index.assume %x_lane1_v [range(%x_lane1_v, 0, 1073741823), lt(%x_lane1_v, %x_flat_n)] : index\n",
+             "      %x_sv = buffer.view %x[%x_kob] : buffer -> view<[%x_flat_np]xf16>\n",
+             "      %xv = vector.load %x_sv[%x_lane0] : view<[%x_flat_np]xf16> -> vector<32xf16>\n",
+             "      %xv1 = vector.load %x_sv[%x_lane1] : view<[%x_flat_np]xf16> -> vector<32xf16>\n"))
+W_VIEW = re.compile(r"^  %w_wave_view = buffer\.view %w_stage\[%wb_off\] : buffer -> view<\d+x72xf16>$", re.M)
 LIVE = """  %wsk_c32 = index.constant 32 : index
   %wsk_r0 = index.add %row_origin, %wave_row : index
   %wsk_ra_v = index.add %wsk_r0, %lane : index
@@ -49,11 +87,13 @@ def _fail(name, what):
 
 def wave_skip(text, name="kernel"):
     """rewrite one gfx11 g_gemm_f16_*_m256 kernel's text (served form: after f16o11 and GEMM256_FLATADDR)"""
-    for need in ("  %lane = kernel.subgroup.lane.id : index\n", "  %wave_row = index.assume %wave_row_value [range(%wave_row_value, 0, 192)] : index\n",
-                 "  %wave_row3_c = index.constant 48 : index\n", "  %s_view = buffer.view %scales[%origin] : buffer -> view<[%rows]x2xf32>\n",
-                 "  %row_origin = index.mul %row_group, %c256 : index\n"):
+    for need in ANCHORS:
         if text.count(need) != 1:
             _fail(name, f"anchor {need.strip()!r} matches {text.count(need)} times (want 1: 64-row waves of a 256-row tile)")
+    if sum(all(text.count(n) == 1 for n in form) for form in PREFETCH) != 1:
+        _fail(name, "the in-loop x prefetch is in neither known form (by row, or flat lanes from x_row / x_row1)")
+    if len(W_VIEW.findall(text)) != 1:
+        _fail(name, "anchor %w_wave_view = buffer.view %w_stage[%wb_off] not found once")
     if "%wsk_" in text:
         _fail(name, "already rewritten")
     lines = text.split("\n")
@@ -87,9 +127,14 @@ def wave_skip(text, name="kernel"):
     region = lines[first:last + 1]
     if not lines[last + 1].startswith("    kernel.barrier<workgroup>") or not any(lines[j].startswith("    kernel.barrier<workgroup>") for j in range(h + 1, first)):
         _fail(name, "the MMA region is not between the staging barrier and the closing barrier")
+    rows_read = set()
     for ln in region:
-        if any(f in ln for f in FORBID) or not ln.startswith("    "):
+        hit = next((m for m in (a.fullmatch(ln) for a in ALLOW) if m), None)
+        if not hit:
             _fail(name, f"region line not pure fragment / MMA work: {ln.strip()[:80]!r}")
+        rows_read |= {hit.group("row")} if "row" in hit.re.groupindex else set()
+    if rows_read != {"%wave_row", "%wave_row1", "%wave_row2", "%wave_row3"}:
+        _fail(name, f"the region's lhs loads read rows {sorted(rows_read)}, not the wave's 64 (%wave_row, %wave_row1-3)")
     if sum("= vector.mma " in ln for ln in region) != text.count("= vector.mma "):
         _fail(name, "an MMA outside the region")
     defined = set(re.findall(r"^\s*(%[\w]+(?:\s*,\s*%[\w]+)*) = ", "\n".join(region), re.M))
