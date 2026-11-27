@@ -2531,6 +2531,42 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_acc_m256")' 
 {_XE}{_SE}{_QE}{_eq("hb", "h7", _T(f"{H}xf32"))}  check.return
 }}
 """)
+# 3a-qgs. QG_SPLIT (HRX-like static-1127/upsw, kit qg_split.py): the q GEMM's _qgs epilogue must equal store + g_split_qgate bit for bit
+# (check.expect.equal): q and gate of every row, both starting as 7.0 fills. 512 rows (two m256 tiles), N = heads x 2 x D (the
+# served q / gate layout g_split_qgate reads), 5 dead rows (input scale 0, zero x16: written by both chains), padded strides.
+if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_store_m256_qgs")' in (_pkg_llm_text() or ""):
+    _rows, _K, _nq = 512, 1024, 2 * QH * D
+    _KP, _hq = _K + _PFPAD, QH * D
+    _xq = (rng.standard_normal((_rows, _K)) * 0.5).astype(np.float16)
+    _wq = (rng.standard_normal((_nq, _K)) * 0.05).astype(np.float16)
+    _sq = np.stack([np.ones(_rows, np.float32), rng.uniform(0.5, 2.0, _rows).astype(np.float32)], 1)
+    _dq = rng.choice(_rows, 5, replace=False)
+    _xq[_dq] = 0
+    _sq[_dq] = 0
+    save("qgs_x16", pfpad(_xq)); save("qgs_s", _sq); save("qgs_w", pfpad(_wq, np.float16(0)).reshape(-1).view(np.int8))
+    _WQ = _nq * _KP * 2
+    _QT = f"tensor<{_rows}x{_hq}xf32>"
+    _GT = f"[index, index](index, index, index, tensor<{_rows}x{_KP}xf16>, tensor<{_rows}x2xf32>, tensor<{_WQ}xi8>"
+    cases.append(f"""check.case public @qgs_split {{
+  %rows = check.literal value({_rows}) : index
+  %k = check.literal value({_K}) : index
+  %n = check.literal value({_nq}) : index
+  %x16 = check.file.read.npy path("qgs_x16.npy") : tensor<{_rows}x{_KP}xf16>
+  %s = check.file.read.npy path("qgs_s.npy") : tensor<{_rows}x2xf32>
+  %w = check.file.read.npy path("qgs_w.npy") : tensor<{_WQ}xi8>
+  %qg = check.generate.fill value(0.0) : tensor<{_rows}x{_nq}xf32>
+  %qa = check.generate.fill value(7.0) : {_QT}
+  %ga = check.generate.fill value(7.0) : {_QT}
+  %qb = check.generate.fill value(7.0) : {_QT}
+  %gb = check.generate.fill value(7.0) : {_QT}
+  kernel.launch @g_gemm_f16_store_m256[%rows, %n](%rows, %k, %n, %x16, %s, %w, %qg) : {_GT}, tensor<{_rows}x{_nq}xf32>)
+  kernel.launch @g_split_qgate[%rows](%rows, %qg, %qa, %ga) : [index](index, tensor<{_rows}x{_nq}xf32>, {_QT}, {_QT})
+  kernel.launch @g_gemm_f16_store_m256_qgs[%rows, %n](%rows, %k, %n, %x16, %s, %w, %qb, %gb) : {_GT}, {_QT}, {_QT})
+  check.expect.equal actual(%qb) expected(%qa) : {_QT}
+  check.expect.equal actual(%gb) expected(%ga) : {_QT}
+  check.return
+}}
+""")
 # 3b'. the producers' fp8 twins (gen_mxfp4s.fuse_mxfp4s_f8; choice prefill.gemm.mxfp4s_f8, gfx12 only) against numpy's e4m3 rounding. The fp8 GEMM itself is tested by the
 # gemm_mxfp4s kbench suite (loom-test cases on synthetic split planes).
 def e4m3_round(x):

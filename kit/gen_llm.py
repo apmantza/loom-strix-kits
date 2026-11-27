@@ -6470,6 +6470,8 @@ if __name__ == "__main__":
         return subprocess.run([sys.executable, os.path.join(here, "gen_gemm.py")], capture_output=True, text=True, check=True, env=_env).stdout
     assert not (epi_fuse.ON and (POST_NORM or MOE)), "EPI_FUSE: the x-only norm assumes no post-norm and no MoE"
     text = epi_fuse.apply(text, _acc_m256)
+    import qg_split   # QG_SPLIT=1 (HRX-like static-1127/upsw): q / gate stored from the q GEMM's f16 m256 epilogue; unset: unchanged
+    text = qg_split.apply(text, D)
     text = pf16_pad.apply(text)   # PF16_PAD (HRX-like E167); unset: unchanged
     if KV8:
         text = kv8_readers(text)
