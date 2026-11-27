@@ -29,6 +29,11 @@ def arity_ok(out):
         m = re.search(r"\]\((.*)\) : \[[^\]]*\]\((.*)\)$", line)
         if not m or len(m.group(1).split(", ")) != len(m.group(2).split(", ")):
             return False
+        # %qg is replaced by %q, %gate: the _qgs kernel's launch ABI is the store's with %y2 added (11-27 pkg-qgs r2: 9 values passed
+        # to its 8 ABI arguments, STRUCTURE/013, while the static case expected '%qg, %q, %gate')
+        ops = m.group(1).split(", ")
+        if "%qg" in ops or ops[-2:] != ["%q", "%gate"] or len(ops) != 8:
+            return False
     return True
 F16 = "kernel.launch @g_gemm_f16_store_m256[%tp, %nQ2](%tp, %nH, %nQ2, %h16, %s_h, %w16, %qg) : [index, index](index, index, index, buffer, buffer, buffer, buffer)"
 Q256 = "kernel.launch @g_gemm_q5_k_store_m256[%tp, %nQ2](%tp, %nH, %nQ2, %h16, %s_h, %wq, %qg) : [index, index](index, index, index, buffer, buffer, buffer, buffer)"
@@ -99,7 +104,7 @@ def main():
         ok = n == want and refused == want_ref
         if want:
             ok = ok and out.count("@g_gemm_f16_store_m256_qgs[") == want and out.count("%qgs_run = ") == 1 \
-                and out.count("  scf.if %qgs_run {") == want and "%h16, %s_h, %w16, %qg, %q, %gate)" in out \
+                and out.count("  scf.if %qgs_run {") == want and "%h16, %s_h, %w16, %q, %gate)" in out \
                 and "@g_gemm_q5_k_store_m256[" in out and out.count("@g_split_qgate_lv[") == want and arity_ok(out)
         else:
             ok = ok and out == text
