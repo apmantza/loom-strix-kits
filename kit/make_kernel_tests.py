@@ -2537,7 +2537,10 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_acc_m256")' 
 # a non-last tile), tile 1 with wave 0 live, wave 1 33 live rows then padding (the served shape: a live prefix), wave 2 padding in its
 # first 40 rows and live in its last 24 (live rows only in the lanes' second load), wave 3 all padding. Padding rows' x is zero, so
 # both runs give the same bits on every row (padding rows 0 either way, acc: y + 0); a wave skipped while it holds a live row zeroes
-# that row. Equal at atol 0 (check.expect.equal). Recurrences: a skip predicate that reads the wrong rows or only the first 32 rows
+# that row. Equal at atol 0 (check.expect.equal). swiglu _f16o's second output (F16O11, kit/f16o11.py: each row's flag, 1 live / 0
+# padding, in both columns) is a function of the scales alone, so the two runs differ there by design: each run's flags are checked
+# against their own expectation (padded: wsk_fa, from column 0; all-live: 1), never against each other (HRX-like q236: the pairwise
+# check failed at row 192, a padding row, on every package). Recurrences: a skip predicate that reads the wrong rows or only the first 32 rows
 # of a wave (mutants in HRX-like q236), or a region rewrite that drops an MMA. Without the switch the case is a control (equal too).
 _WSK = [k for k in ("g_gemm_f16_store_m256", "g_gemm_f16_acc_m256", "g_gemm_f16_swiglu_m256_f16o") if f'export("{k}")' in (_pkg_llm_text() or "")]
 if os.environ.get("GEMM_TESTS", "1") == "1" and _WSK:
@@ -2549,6 +2552,7 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and _WSK:
     _inv = rng.uniform(0.5, 2.0, _rows).astype(np.float32)
     save("wsk_x", pfpad(_xw)); save("wsk_sp", np.stack([_live.astype(np.float32), _inv], 1))   # padding rows: column 0 = 0
     save("wsk_sl", np.stack([np.ones(_rows, np.float32), _inv], 1))   # every row live
+    save("wsk_fa", np.repeat(_live.astype(np.float32)[:, None], 2, 1))   # F16O11 flags of the padded run (both columns)
     _wb = lambda w: pfpad(w, np.float16(0)).reshape(-1).view(np.int8)   # the f16 weight scratch: rows at stride K + PAD
     save("wsk_w", _wb((rng.standard_normal((_nu, _K)) * 0.05).astype(np.float16)))
     save("wsk_u", _wb((rng.standard_normal((_nu, _K)) * 0.05).astype(np.float16)))
@@ -2560,11 +2564,13 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and _WSK:
             _YT = f"tensor<{_rows}x{_NP}xf16>"
             _outs = (f"  %u = check.file.read.npy path(\"wsk_u.npy\") : {_WT}\n"
                      f"  %ya = check.generate.fill value(0.0) : {_YT}\n  %yb = check.generate.fill value(0.0) : {_YT}\n"
-                     f"  %oa = check.generate.fill value(7.0) : {_ST}\n  %ob = check.generate.fill value(7.0) : {_ST}\n")
+                     f"  %oa = check.generate.fill value(7.0) : {_ST}\n  %ob = check.generate.fill value(7.0) : {_ST}\n"
+                     f"  %fa = check.file.read.npy path(\"wsk_fa.npy\") : {_ST}\n  %fb = check.generate.fill value(1.0) : {_ST}\n")
             _ta = f"[index, index](index, index, index, {_XT}, {_ST}, {_WT}, {_WT}, {_YT}, {_ST})"
             _la = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sp, %w, %u, %ya, %oa) : {_ta}\n"
             _lb = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sl, %w, %u, %yb, %ob) : {_ta}\n"
-            _eq = f"  check.expect.equal actual(%ya) expected(%yb) : {_YT}\n  check.expect.equal actual(%oa) expected(%ob) : {_ST}\n"
+            _eq = (f"  check.expect.equal actual(%ya) expected(%yb) : {_YT}\n  check.expect.equal actual(%oa) expected(%fa) : {_ST}\n"
+                   f"  check.expect.equal actual(%ob) expected(%fb) : {_ST}\n")
         else:   # store writes y; acc adds into y, which starts as residual rows
             _YT = f"tensor<{_rows}x{_nu}xf32>"
             _src = 'check.file.read.npy path("wsk_r.npy")' if "_acc_" in _k else "check.generate.fill value(0.0)"
