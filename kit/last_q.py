@@ -218,6 +218,37 @@ LAUNCH = re.compile(r"(?m)^ *kernel\.launch @(\w+)\[")
 AFTER_OK = re.compile(r"|//[^\n]*|\}|\} else \{|scf\.if %\w+ \{|command\.return|config\.decl @[^\n]*"
                       r"|%\w+ = (?:index\.(?:constant|cmp|scale)|buffer\.alloca<global>|buffer\.view|command\.parameter|config\.get) [^\n]*")
 LAUNCH_LINE = re.compile(r"kernel\.launch @(\w+)\[[^\n]*")
+LAUNCH_SIG = re.compile(r"kernel\.launch @(\w+)\[[^\]]*\]\((.*)\) : (?:\[[^\]]*\])?\((.*)\)")
+SCALAR = re.compile(r"index|[if]\d+")
+DEF = re.compile(r"(?m)^ *(%\w+) = ([\w.]+)(?:<[^>\n]*>)?(?: (%\w+))?")
+# The command arguments of @llm_advance a launch after those flash launches may take, per kernel (keeps-review r1 arg_census.txt,
+# E722: the served program's only uses). Any other use of a command argument there stops the build: a row-local kernel writing
+# %features, %arena or %outputs would carry the cropped tiles' stale rows out of the program. Every other buffer operand must be
+# an allocation of the program, a weight (command.parameter of %weights) or a view of an allocation.
+ARGS_OK = ((re.compile(r"g16_attention_split_listed|g_attention_split|g_attention_vsplit"), {"%arena", "%origins"}),
+           (re.compile(r"g_head_mv(_t\d+)?(_q8)?"), {"%metadata"}),
+           (re.compile(r"g_head_select|g_logits_export"), {"%metadata", "%outputs"}))
+
+
+def _launch_ok(s, cargs, defs):
+    """a ROW_LOCAL launch whose command arguments are its ARGS_OK entry and whose other buffers are local (see ARGS_OK)"""
+    m = LAUNCH_SIG.fullmatch(s)
+    if not m or not ROW_LOCAL.fullmatch(m.group(1)):
+        return False
+    ops, tys = [x.strip() for x in m.group(2).split(",")], [x.strip() for x in m.group(3).split(",")]
+    if len(ops) != len(tys):
+        return False
+    allowed = set().union(*[a for r, a in ARGS_OK if r.fullmatch(m.group(1))])
+    for o, t in zip(ops, tys):
+        if o in cargs:
+            if o not in allowed:
+                return False
+        elif not SCALAR.fullmatch(t):
+            op, src = defs.get(o, (None, None))
+            if not (op == "buffer.alloca" or (op == "command.parameter" and src == "%weights")
+                    or (op == "buffer.view" and defs.get(src, (None,))[0] == "buffer.alloca")):
+                return False
+    return True
 MARK = re.compile(r"(?m)^  // ---- layer (\d+)[^\n]*$")
 
 
@@ -250,11 +281,19 @@ def apply(text):
     if len(names) != 2 or None in names or not all(r.fullmatch(n) for r, n in zip(LIST_READERS, names)):
         die(f"layer {layer}: the flash list readers are {names}, expected g_attention_flash2[_f16o] then its partial kernel")
     after = block[block.index(readers[-1]) + len(readers[-1]):] + seg[b1:]
+    cargs = set(re.findall(r"(%\w+): buffer", seg.split("\n", 1)[0]))
+    defs = {}
+    for d in DEF.finditer(seg):
+        defs.setdefault(d.group(1), (d.group(2), d.group(3)))
     other = []
     for ln in after.splitlines():
         s = ln.strip()
-        lm = LAUNCH_LINE.fullmatch(s)
-        if not (ROW_LOCAL.fullmatch(lm.group(1)) if lm else AFTER_OK.fullmatch(s)):
+        if LAUNCH_LINE.fullmatch(s):
+            ok = _launch_ok(s, cargs, defs)
+        else:
+            used = set(re.findall(r"%\w+", s)) & cargs if not s.startswith("//") else set()
+            ok = AFTER_OK.fullmatch(s) and (not used or (used == {"%weights"} and s.split(" = ", 1)[-1].startswith("command.parameter %weights,")))
+        if not ok:
             other.append(s[:100])
     if other:
         die(f"after layer {layer}'s flash launches: {len(other)} statements not known row-local or memory-free: {other[:4]}")
