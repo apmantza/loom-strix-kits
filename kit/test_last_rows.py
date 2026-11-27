@@ -64,7 +64,7 @@ def inverse(text):
     g_qk_rope_store (the q region) back before the K block's `  scf.if %mm {` (the statement that reads %wk_<L>)"""
     t = re.sub(r'(?ms)\n\n^// LAST_ROWS \(HRX-like static-1127 SWEEP shape A\).*?^\}\n', "", text, count=1)
     m = re.search(r"(?m)^command\.def [^\n]*@llm_advance\(", t)
-    L = list(re.finditer(r"(?m)^  // ---- layer (\d+)", t[m.start():]))[-1]
+    L = list(re.finditer(r"(?m)^  // ---- layer (\d+)", t[m.start():t.index("\ncommand.def ", m.end())]))[-1]
     b0 = m.start() + L.start()
     b1 = t.index("\n  %head = command.parameter", b0) + 1
     blk = t[b0:b1]

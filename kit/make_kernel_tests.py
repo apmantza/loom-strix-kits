@@ -4325,6 +4325,153 @@ kernel.def export("test_keep_rows_f16") @test_keep_rows_f16(%rows: index) {
         kt_section(["g_flash_tiles_out", "g_token_info", "g_attention_fallback_list", "g_attention_flash2_f16o",
                     "g_attention_flash2_partial_f16o"], _lastq_cases)
 
+
+# 5''. LAST_ROWS (HRX-like static-1127 SWEEP A1, kit/last_rows.py): the last layer's q, o, gate/up and down GEMMs read row scales
+# masked by g_scale_head_rows to the rows the head reads (the last token of a selected span). @lastrows_chain_<x> runs the served
+# f16 chain twice on the same operands (512 rows, two m256 tiles): reference = LAST_Q alone (store / acc / swiglu_f16o / store on
+# the producers' scales), candidate = the same launches after the masks (on copies of the scales, as the program does: s_h before
+# the q and the gate/up GEMM, s_o before the o GEMM, s_f before the down GEMM; candidate outputs start at the 7.0 sentinel).
+# Checks: the masked scales equal the numpy mask (head rows kept bit for bit, every other row and the rows past the tokens zero);
+# the f16o swiglu's output flags follow the mask; every output's head rows equal the reference bit for bit (check.expect.equal on
+# copies of the head rows into sentinel buffers). (a) a final chunk: row 0 at 100-299 selected (head row 199, tile 0), row 1 at
+# 2000-2279 not selected, row 2 at 5000 a 1-token selected span (head row 480, tile 1), padding after; (b) an intermediate chunk,
+# nothing selected: every candidate output is still its sentinel (the residual unchanged): every tile skipped, the lever's mechanism.
+# Recurrence: a mask that drops a head row (an off-by-one on the span's last token, a 1-token span) changes served logits, which
+# EXACT sees only on a request whose span ends there; a mask that keeps every row passes EXACT and saves nothing (b catches it);
+# a GEMM whose head row depends on another row's scale or stale rows (a tile- or wave-wide reduction over values) breaks (a).
+# @lastrows_chain_a_negcontrol: the expected mask also drops head row 480 (must FAIL).
+def _lastrows_cases():
+    cases.append("""
+// Test helper: dst[r][c] = src[r][c] for c < width on the rows with mask[r] != 0 (f32 rows of `stride`); other rows untouched.
+kernel.def export("test_keep_rows_f32") @test_keep_rows_f32(%rows: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%rows_arg: index, %width_arg: index, %stride_arg: index, %mask: buffer, %src: buffer, %dst: buffer) {
+  %rows = index.assume %rows_arg [range(%rows_arg, 1, 8192)] : index
+  %width = index.assume %width_arg [range(%width_arg, 1, 1048576)] : index
+  %stride = index.assume %stride_arg [range(%stride_arg, 1, 1048576)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [lt(%row_id, %rows)] : index
+  %lane = kernel.workitem.id<x> : index
+  %zero = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %mask_view = buffer.view %mask[%zero] : buffer -> view<[%rows]xi32>
+  %m = view.load %mask_view[%row] : view<[%rows]xi32> -> i32
+  %keep = scalar.cmpi ne, %m, %c0_i32 : i32
+  %src_view = buffer.view %src[%zero] : buffer -> view<[%rows]x[%stride]xf32>
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%rows]x[%stride]xf32>
+  scf.if %keep {
+    scf.for %c = [%lane to %width step %c256] {
+      %col = index.assume %c [lt(%c, %width), lt(%c, %stride)] : index
+      %v = view.load %src_view[%row, %col] : view<[%rows]x[%stride]xf32> -> f32
+      view.store %v, %dst_view[%row, %col] : f32, view<[%rows]x[%stride]xf32>
+    }
+  }
+  kernel.return
+}
+""")
+    lr = np.random.default_rng(1127)
+    R, K, N, F = 512, 1024, 256, 256            # rows (two m256 tiles), K, q / o / down output width, swiglu width
+    KP, FP, OP = K + _PFPAD, F + _PFPAD, N + _PFPAD
+    wb = lambda w: pfpad(w, np.float16(0)).reshape(-1).view(np.int8)   # the f16 weight scratch: rows at stride K + PAD
+    wq, wo, wg, wu = ((lr.standard_normal((n, K)) * 0.05).astype(np.float16) for n in (N, N, F, F))
+    wd = (lr.standard_normal((N, F)) * 0.05).astype(np.float16)
+    for n_, w_ in (("q", wq), ("o", wo), ("g", wg), ("u", wu), ("d", wd)):
+        save(f"lr_w{n_}", wb(w_))
+    x16 = (lr.standard_normal((R, K)) * 0.5).astype(np.float16); o16 = (lr.standard_normal((R, K)) * 0.5).astype(np.float16)
+    save("lr_x16", pfpad(x16)); save("lr_o16", pfpad(o16))
+    save("lr_resid", (lr.standard_normal((R, N)) * 3).astype(np.float32))
+    WQ, WD = N * KP * 2, N * FP * 2
+    for tag, spans in (("a", [(0, 100, 200, 1), (1, 2000, 280, 0), (2, 5000, 1, 1)]), ("b", [(0, 4096, 500, 0)])):
+        n_live = sum(s[2] for s in spans)
+        meta = np.zeros(4 + 9 * len(spans), np.int32); meta[0] = len(spans)
+        head = np.zeros(R, np.int32); at = 0
+        for s, (row, p0, n, sel) in enumerate(spans):
+            meta[4 + 9 * s:4 + 9 * s + 9] = [n, p0, 0, row, at, 0, sel, 0, 0]
+            if sel:
+                head[at + n - 1] = 1
+            at += n
+        live = np.arange(R) < n_live
+        sc = np.stack([np.ones(R, np.float32), lr.uniform(0.5, 2.0, R).astype(np.float32)], 1); sc[~live] = 0
+        so = np.stack([np.ones(R, np.float32), lr.uniform(0.5, 2.0, R).astype(np.float32)], 1); so[~live] = 0
+        save(f"lr_meta_{tag}", meta); save(f"lr_s_{tag}", sc); save(f"lr_so_{tag}", so); save(f"lr_head_{tag}", head)
+        save(f"lr_sm_{tag}", np.where(head[:, None] != 0, sc, 0).astype(np.float32))
+        save(f"lr_som_{tag}", np.where(head[:, None] != 0, so, 0).astype(np.float32))
+        save(f"lr_sfm_{tag}", np.where(head[:, None] != 0, 1.0, 0.0).astype(np.float32).repeat(2, 1))
+        if tag == "a":
+            hn = head.copy(); hn[480] = 0
+            assert head[199] == 1 and head[480] == 1 and head.sum() == 2
+            save("lr_sm_neg_a", np.where(hn[:, None] != 0, sc, 0).astype(np.float32))
+        else:
+            assert head.sum() == 0
+        MT = f"tensor<{meta.size}xi32>"
+        T2, TX, TF, TN, TI = f"tensor<{R}x2xf32>", f"tensor<{R}x{KP}xf16>", f"tensor<{R}x{FP}xf16>", f"tensor<{R}x{N}xf32>", f"tensor<{R}x4xi32>"
+
+        def chain(sfx, sh, so_, sf, f16):
+            return (f"  kernel.launch @g_gemm_f16_store_m256[%rows, %n](%rows, %k, %n, %x16, {sh}, %wq, %q{sfx}) : [index, index](index, index, index, {TX}, {T2}, tensor<{WQ}xi8>, {TN})\n"
+                    f"  kernel.launch @g_gemm_f16_acc_m256[%rows, %n](%rows, %k, %n, %o16, {so_}, %wo, %x{sfx}) : [index, index](index, index, index, {TX}, {T2}, tensor<{WQ}xi8>, {TN})\n"
+                    f"  kernel.launch @g_gemm_f16_swiglu_m256_f16o[%rows, %nf](%rows, %k, %nf, %x16, {sh}, %wg, %wu, {f16}, {sf}) : [index, index](index, index, index, {TX}, {T2}, tensor<{WQ}xi8>, tensor<{WQ}xi8>, {TF}, {T2})\n")
+
+        def down(sfx, sf, f16):
+            return f"  kernel.launch @g_gemm_f16_store_m256[%rows, %n](%rows, %nf, %n, {f16}, {sf}, %wd, %y{sfx}) : [index, index](index, index, index, {TF}, {T2}, tensor<{WD}xi8>, {TN})\n"
+        mask = lambda s: f"  kernel.launch @g_scale_head_rows[%rows](%rows, %t, %spans, %meta, %info, {s}) : [index](index, index, index, {MT}, {TI}, {T2})\n"
+        keep = lambda src, dst: f"  kernel.launch @test_keep_rows_f32[%rows](%rows, %n, %n, %head, {src}, {dst}) : [index](index, index, index, tensor<{R}xi32>, {TN}, {TN})\n"
+        if tag == "a":
+            tail = "".join(keep(f"%{o}a", f"%e{o}") + keep(f"%{o}b", f"%c{o}") + f"  check.expect.equal actual(%c{o}) expected(%e{o}) : {TN}\n" for o in "qxy")
+        else:
+            tail = (f"  check.expect.equal actual(%qb) expected(%sent) : {TN}\n  check.expect.equal actual(%yb) expected(%sent) : {TN}\n"
+                    f"  check.expect.equal actual(%xb) expected(%resid) : {TN}\n")
+        sents = "".join(f"  %{v} = check.generate.fill value(7.0) : {TN}\n" for v in ("qb", "yb", "sent", "eq", "cq", "ex", "cx", "ey", "cy"))
+        cases.append(f"""check.case public @lastrows_chain_{tag} {{
+  %rows = check.literal value({R}) : index
+  %t = check.literal value({R}) : index
+  %spans = check.literal value({len(spans)}) : index
+  %k = check.literal value({K}) : index
+  %n = check.literal value({N}) : index
+  %nf = check.literal value({F}) : index
+  %meta = check.file.read.npy path("lr_meta_{tag}.npy") : {MT}
+  %head = check.file.read.npy path("lr_head_{tag}.npy") : tensor<{R}xi32>
+  %x16 = check.file.read.npy path("lr_x16.npy") : {TX}
+  %o16 = check.file.read.npy path("lr_o16.npy") : {TX}
+  %wq = check.file.read.npy path("lr_wq.npy") : tensor<{WQ}xi8>
+  %wo = check.file.read.npy path("lr_wo.npy") : tensor<{WQ}xi8>
+  %wg = check.file.read.npy path("lr_wg.npy") : tensor<{WQ}xi8>
+  %wu = check.file.read.npy path("lr_wu.npy") : tensor<{WQ}xi8>
+  %wd = check.file.read.npy path("lr_wd.npy") : tensor<{WD}xi8>
+  %sa = check.file.read.npy path("lr_s_{tag}.npy") : {T2}
+  %sb = check.file.read.npy path("lr_s_{tag}.npy") : {T2}
+  %soa = check.file.read.npy path("lr_so_{tag}.npy") : {T2}
+  %sob = check.file.read.npy path("lr_so_{tag}.npy") : {T2}
+  %esb = check.file.read.npy path("lr_sm_{tag}.npy") : {T2}
+  %esob = check.file.read.npy path("lr_som_{tag}.npy") : {T2}
+  %esfb = check.file.read.npy path("lr_sfm_{tag}.npy") : {T2}
+  %resid = check.file.read.npy path("lr_resid.npy") : {TN}
+  %xa = check.file.read.npy path("lr_resid.npy") : {TN}
+  %xb = check.file.read.npy path("lr_resid.npy") : {TN}
+  %info = check.generate.fill value(0) : {TI}
+  %qa = check.generate.fill value(0.0) : {TN}
+  %ya = check.generate.fill value(0.0) : {TN}
+{sents}  %fa = check.generate.fill value(0.0) : {TF}
+  %fb = check.generate.fill value(7.0) : {TF}
+  %sfa = check.generate.fill value(7.0) : {T2}
+  %sfb = check.generate.fill value(7.0) : {T2}
+  kernel.launch @g_token_info[%t](%t, %spans, %meta, %info) : [index](index, index, {MT}, {TI})
+{chain("a", "%sa", "%soa", "%sfa", "%fa")}{down("a", "%sfa", "%fa")}{mask("%sb")}{mask("%sob")}{chain("b", "%sb", "%sob", "%sfb", "%fb")}{mask("%sfb")}{down("b", "%sfb", "%fb")}  check.expect.equal actual(%sb) expected(%esb) : {T2}
+  check.expect.equal actual(%sob) expected(%esob) : {T2}
+  check.expect.equal actual(%sfb) expected(%esfb) : {T2}
+{tail}  check.return
+}}
+""")
+        if tag == "a":
+            cases.append(negtwin(cases[-1], ('path("lr_sm_a.npy")', 'path("lr_sm_neg_a.npy")')))
+
+
+if not KS and 'export("g_scale_head_rows")' in (_pkg_llm_text() or ""):
+    kt_section(["g_scale_head_rows", "g_token_info", "g_gemm_f16_store_m256", "g_gemm_f16_acc_m256", "g_gemm_f16_swiglu_m256_f16o"],
+               _lastrows_cases)
+
 # 6. MoE (gen_moe.py) on real tensors, one layer per expert-down format: the decode chain (router -> top-k ->
 # gate/up -> down -> combine, plus the prefill router with padding tokens) and the prefill chain (prefill router ->
 # bucket by expert -> grouped WMMA gate/up GEMM -> tile row scale -> grouped down GEMM -> combine of the sorted rows),
