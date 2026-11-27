@@ -52,7 +52,7 @@ lsk_stop() {   # stop our servers (pid files), then any managed server (LSK_STOP
   # stop.sh makes); a stale file's reused pid is reported and left (11-27 review G: a stale state/*.pid killed an unrelated process)
   want=$(basename "${LOOM_SERVE:-loom-serve}")
   for f in "$STATE"/*.pid; do
-    [ -f "$f" ] || continue; p=$(cat "$f"); c=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+    [ -f "$f" ] || continue; p=$(cat "$f"); { c=$(tr '\0' ' ' < "/proc/$p/cmdline"); } 2>/dev/null
     if [ -n "$c" ] && [[ "$c" == *"$want"* ]]; then kill "$p" 2>/dev/null
     elif [ -n "$c" ]; then echo "lsk_stop: $f names pid $p ($(cat /proc/$p/comm 2>/dev/null)), not a $want: stale, left running" >&2; fi
     rm -f "$f"
