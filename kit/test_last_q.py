@@ -104,6 +104,7 @@ with tempfile.TemporaryDirectory() as d:
     part = re.search(r"(?m)^ *kernel\.launch @g_attention_flash2_partial_f16o\[[^\n]*%layer_63,[^\n]*\n", gen).group(0)
     tap = part + "  kernel.launch @g_dfl_tap[%t](%t, %tap_slot_4, %x, %features) : [index](index, index, buffer, buffer)\n"
     head = "\n  %head = command.parameter"
+    Q = "  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, {}) : [index, index](index, index, buffer, buffer)\n"
     prologue = re.search(r"(?m)^ *kernel\.launch @g_attention_fallback_list\[[^\n]*\n", gen).group(0)
     for what, odd in (("a DFlash tap after the last flash launch", gen.replace(part, tap, 1)),
                       # keeps-review 11-27 (mutant no_template_guard): a template.apply after the last flash launch
@@ -111,6 +112,21 @@ with tempfile.TemporaryDirectory() as d:
                       # keeps-review 11-27: statements that are not launches passed the launch-name list
                       ("a buffer.copy of the attention output into %features", gen.replace(head, "\n  buffer.copy %o16, %features : buffer, buffer" + head, 1)),
                       ("a func.call after the last flash launch", gen.replace(head, "\n  func.call @g_tap_fn(%o16, %features) : (buffer, buffer) -> ()" + head, 1)),
+                      # keeps-review r1 (lq_forms.txt, E722): an admitted row-local kernel writing a command argument carries the
+                      # cropped tiles' stale rows out of the program. A: through a view of %features; B: %features directly;
+                      # B2: a GEMM into %arena (its %w is undefined in the program); B2b: the same with defined operands only
+                      ("A: a view of %features written by g_quant_q8", gen.replace(head, "\n  %fv = buffer.view %features[%pf_zero] : buffer -> view<16xi8>\n" + Q.format("%fv") + head[1:], 1)),
+                      ("B: g_quant_q8 writes %features", gen.replace(head, "\n" + Q.format("%features") + head[1:], 1)),
+                      ("B2: a GEMM writes %arena", gen.replace(head, "\n  kernel.launch @g_gemm_f16_store_m256[%tp, %nH](%tp, %nQ, %nH, %o16, %s_o, %w, %arena) : [index, index](index, index, index, buffer, buffer, buffer, buffer)\n" + head[1:], 1)),
+                      ("B2b: a GEMM with defined operands writes %arena", gen.replace(head, "\n  kernel.launch @g_gemm_f16_store_m256[%tp, %nH](%tp, %nQ, %nH, %o16, %s_o, %h16, %arena) : [index, index](index, index, index, buffer, buffer, buffer, buffer)\n" + head[1:], 1)),
+                      # a view of %features made before layer 63 and written after it (only the operand's definition shows it)
+                      ("A2: a view of %features from before layer 63 written after it", gen.replace("  // ---- layer 63", "  %fv = buffer.view %features[%pf_zero] : buffer -> view<16xi8>\n  // ---- layer 63", 1).replace(head, "\n" + Q.format("%fv") + head[1:], 1)),
+                      # a buffer operand of no known origin (not an allocation, a weight or a view of an allocation)
+                      ("an operand of unknown origin", gen.replace("  // ---- layer 63", "  %zz = scf.select %mm, %o16, %h : buffer\n  // ---- layer 63", 1).replace(head, "\n" + Q.format("%zz") + head[1:], 1)),
+                      # a parameter of a command argument other than %weights from before layer 63, written after it
+                      ("a command.parameter of %features written after layer 63", gen.replace("  // ---- layer 63", '  %fp = command.parameter %features, "x" : view<16xi8>\n  // ---- layer 63', 1).replace(head, "\n" + Q.format("%fp") + head[1:], 1)),
+                      # a view of a command argument after the flash launches, even unused
+                      ("an unused view of %features", gen.replace(head, "\n  %fv = buffer.view %features[%pf_zero] : buffer -> view<16xi8>" + head, 1)),
                       # keeps-review 11-27 (mutant no_prologue_count): a second work-list launch before layer 0
                       ("a second work-list prologue", gen.replace("  // ---- layer 0", prologue + "  // ---- layer 0", 1)),
                       ("a layer after the last attention layer", gen.replace("\n  %head = command.parameter", "\n  // ---- layer 64 (gated delta-net)\n  %head = command.parameter", 1)),
