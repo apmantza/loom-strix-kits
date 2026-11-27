@@ -145,7 +145,9 @@ for a fraction of the next one's cost.
 Before designing a fix (not after a refuted try), ask how other engines met the same bottleneck. Sources,
 all of them every time: llama.cpp HIP and Vulkan, Strata (github.com/Niko1221/Strata), DwarfStar, strix-halo-engine-lab
 (github.com/hyukudan/strix-halo-engine-lab, Strix-specific), strix-llama.cpp (github.com/halo-box/strix-llama.cpp, MIT,
-Strix-specific llama.cpp fork with measured gfx1151 findings), TensorFold (github.com/ashhart/TensorFold, Apache-2.0: CUDA, Metal
+Strix-specific llama.cpp fork with measured gfx1151 findings), Gufo (github.com/gufo-org/gufo, MIT, Strix-only engine: ROCm
+kernels for Qwen3.8-27B, Flash Next and DeepSeek-V4 Flash, serves Loom packages too; its prefill figures differ across harnesses, so
+compare it on equal work and power), TensorFold (github.com/ashhart/TensorFold, Apache-2.0: CUDA, Metal
 and a HIP backend with kernel cost tables measured on gfx1151 (zig/src/hip/tuning/gfx1151.zon); GDN, attention and drafter paths for a
 Qwen3.8 hybrid), Unsloth (github.com/unslothai/unsloth: the library is Apache-2.0, its Studio is AGPL-3.0, so ideas only from studio/;
 Studio serves GGUFs through llama.cpp with per-model launch tuning, e.g. micro-batch and MoE expert placement for Inkling 2), vLLM and
