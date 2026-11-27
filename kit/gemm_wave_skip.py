@@ -8,7 +8,8 @@ static-1127/shortpf/DESIGN.md O4). In the m256 kernels each wave owns 64 rows (w
 (g_row_scale_f16_live writes 0 for a padding row) that it has no live row and leave its WMMA work to the other waves: 1,152 rows of
 MMA work for 1,141 tokens, in the same launch, with no host-side change.
 
-What changes, per kernel (gfx11 g_gemm_f16_{store,acc,swiglu}_m256 and _m256_f16o, the kernels GEMM256_FLATADDR rewrites):
+What changes, per kernel (gfx11 g_gemm_f16_{store,acc,swiglu}_m256 and _m256_f16o, the kernels GEMM256_FLATADDR rewrites, and
+QG_SPLIT's g_gemm_f16_store_m256_qgs):
 - before the K loop, each wave reduces |scale| over its 64 rows (two loads per lane, kernel.subgroup.reduce<maxnumf>: the result
   is uniform across the wave) into %wsk_live, with the tile skip's predicate (scalar.cmpf one: a NaN scale counts as padding there too);
 - in the K loop, the LDS fragment reads and the MMAs (a contiguous region after the staging barrier, before the closing barrier) run
@@ -25,11 +26,16 @@ served kernels hold there (ALLOW: index.constant, fragment.load<lhs> from %x_sta
 %wave_row* and those must be %wave_row + 0 / 16 / 32 / 48, the rows the predicate reads (row_origin + wave_row + lane, + 32), with
 the staged x rows pinned to the tile's rows (x_row = row_origin + x_stage_row, + 128); no value defined in the region may be used
 after it except the accumulators the loop yields. gfx12 twins (target(@rdna4), _rdna4) are skipped by name; any other
-g_gemm_f16_*m256* kernel stops the build. Every guard reds a case of test_gemm_wave_skip.py when neutered (HRX-like E690)."""
+g_gemm_f16_*m256* kernel stops the build. Every guard reds a case of test_gemm_wave_skip.py when neutered (HRX-like E690).
+Not pinned (residuals the E704 verify accepted): the wave geometry is held only by the %wave_row assume (0-192), not by the
+workgroup size, the subgroup count or wave32; the predicate's column constant (%c0, scale column 0) is not checked against the tile
+skip's. A generator change to those would pass this gate; the kernel test's wave_skip case is the check that remains."""
 import re
 
 KERNEL = re.compile(r'^kernel\.def (?:target\(@(\w+)\) )?export\("(g_gemm_f16_\w*m256\w*)"\).*?\n\} launch\(.*?\n\}\n', re.S | re.M)
-REWRITE = re.compile(r"g_gemm_f16_(acc|store|swiglu)_m256(_f16o)?")
+# _qgs: QG_SPLIT's q GEMM (kit qg_split.py), store_m256 with an epilogue that writes q and gate itself; its K loop and region are
+# store_m256's (test_gemm_wave_skip.py checks the rewrite inserts the same lines in both, on QG_SPLIT=1's generated text)
+REWRITE = re.compile(r"g_gemm_f16_(acc|store|swiglu)_m256(_f16o)?|g_gemm_f16_store_m256_qgs")
 ALLOW = (re.compile(r"    %\w+ = index\.constant \d+ : index"),
          re.compile(r"    %\w+ = vector\.fragment\.load<lhs> %x_stage_view\[(?P<row>%wave_row[123]?), %\w+\] shape \[%c16, %c16\] : "
                     r"view<256x72xf16> -> vector<16xf16>"),
