@@ -6488,6 +6488,12 @@ if __name__ == "__main__":
         _n = sum(1 for _b in re.split(r"(?m)^(?=kernel\.def )", text) if _b.startswith("kernel.def") and MV_SCHED_POL + " {" in _b)
         print(f"MV_SCHED={MV_SCHED_D}:{MV_SCHED_U}: pipeline({MV_SCHED_D}) unroll({MV_SCHED_U}) schedule(recurrence) on {_n} kernels "
               f"(single-weight matvec row loops, R > {MV_SCHED_D * MV_SCHED_U})", file=sys.stderr)
+    if os.environ.get("LAST_Q", "0") not in ("", "0", "false", "no", "off"):   # HRX-like E661 (kit/last_q.py): A/B open (q244); unset: unchanged
+        # the last attention layer's flash kernels read only the tiles holding a selected span's last token (exact); on the
+        # final text, so its fail-closed check sees every kernel the served program launches after them
+        import last_q
+        text, _lq = last_q.apply(text)
+        print(f"LAST_Q: layer {_lq}'s flash kernels read g_flash_tiles_out's list (the tiles holding a selected span's last token)", file=sys.stderr)
     out = os.path.join(out_dir, "model.loom")
     open(out, "w", newline="\n").write(text)
     print("wrote", out)
