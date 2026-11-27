@@ -87,8 +87,11 @@ def unit(base_gen):
     import last_rows  # noqa: E402
     t_ok, lay = last_rows.apply(base_gen)
     check("unit: the pass applies to the generator-shaped served program, at layer 63", lay == 63 and t_ok.count("@g_scale_head_rows[") == 4)
-    t2, _ = last_rows.apply(t_ok)
-    check("unit: a second application returns the text unchanged", t2 == t_ok)
+    try:
+        t2, _ = last_rows.apply(t_ok)
+    except SystemExit as e:
+        t2 = str(e)
+    check("unit: a second application returns the text unchanged", t2 == t_ok, t2[:200])
     after63 = base_gen.index("// ---- layer 63", base_gen.index("@llm_advance("))
     l63 = base_gen[after63:]
     down = re.search(r"(?m)^ *kernel\.launch @g_gemm_f16_store_m256\[[^\n]*%f16, %s_f, [^\n]*%y\)[^\n]*\n", l63).group(0)
@@ -117,6 +120,34 @@ def unit(base_gen):
             check(f"unit: {what} stops the rewrite", str(e).startswith("LAST_ROWS: "), str(e))
 
 
+def set_checks(base, cand, err1):
+    """the set-path checks on a built pair (also run by the guard mutants on the pass's output)"""
+    adv0, adv1 = segment(base, "llm_advance"), segment(cand, "llm_advance")
+    check("unset: no mask", "g_scale_head_rows" not in base)
+    L, blk = last_layer(adv1)
+    masks = MASK_RE.findall(blk)
+    check("set: four masks in the last layer (63) on %s_h, %s_o, %s_h, %s_f, none elsewhere", L == 63 and masks == ["%s_h", "%s_o", "%s_h", "%s_f"]
+          and cand.count("@g_scale_head_rows[") == 4, (L, masks, cand.count("@g_scale_head_rows[")))
+    fm = first(blk, MASK_RE.pattern)
+    kpos = [first(blk, rf"(?m)^ *(?:kernel\.launch @|template\.apply<@sel\d+_)g_gemm_\w+[\[>][^\n]*%{w}\)") for w in ("k", "v")]
+    qpos = first(blk, r"(?m)^ *(?:kernel\.launch @|template\.apply<@sel\d+_)g_gemm_\w+[\[>][^\n]*%qg\)")
+    check("set: K and V GEMMs launch before the first mask, the q GEMM after it", fm > 0 and all(0 < k < fm for k in kpos) and qpos > fm, (kpos, fm, qpos))
+    def stmt_after(i):   # the top-level statement right after offset i (it starts at two spaces, not a closing brace)
+        e = re.compile(r"(?m)^  (?![ }])").search(blk, i + 1)
+        return blk[i:e.start() if e else len(blk)]
+    reads = [re.search(r"%(?:h16|o16|f16), (%s_[hof])\b", stmt_after(m.end())) for m in re.finditer(MASK_RE.pattern, blk)]
+    check("set: each mask is followed by a GEMM block reading the masked buffer", [r.group(1) if r else None for r in reads] == masks, [r.group(1) if r else None for r in reads])
+    check("set: g_scale_head_rows defined once", cand.count('kernel.def export("g_scale_head_rows")') == 1)
+    check("set: the verify program is unchanged", segment(cand, "llm_verify") == segment(base, "llm_verify"))
+    try:
+        inv = inverse(cand)
+    except (ValueError, AttributeError, IndexError) as e:   # a layer the inverse cannot read (no mask, no K block after the move)
+        inv = f"inverse failed: {e!r}"
+    check("set: the inverse gives the unset program back byte for byte", inv == base,
+          next((f"line {i}: {x!r} vs {y!r}" for i, (x, y) in enumerate(zip(inv.splitlines(), base.splitlines())) if x != y), "length"))
+    check("set: the build log names the switch and its layer", "LAST_ROWS: layer 63's q, o, gate/up and down GEMMs" in err1, err1[-300:])
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         a, b = (os.path.join(d, x) for x in "ab")
@@ -124,25 +155,7 @@ if __name__ == "__main__":
         check("unset: the generator runs (LAST_Q=1)", rc0 == 0, err0[-400:])
         rc1, cand, err1 = program(b, LAST_Q="1", LAST_ROWS="1")
         check("set: the generator runs (LAST_Q=1 LAST_ROWS=1)", rc1 == 0, err1[-400:])
-        adv0, adv1 = segment(base, "llm_advance"), segment(cand, "llm_advance")
-        check("unset: no mask", "g_scale_head_rows" not in base)
-        L, blk = last_layer(adv1)
-        masks = MASK_RE.findall(blk)
-        check("set: four masks in the last layer (63) on %s_h, %s_o, %s_h, %s_f, none elsewhere", L == 63 and masks == ["%s_h", "%s_o", "%s_h", "%s_f"]
-              and cand.count("@g_scale_head_rows[") == 4, (L, masks, cand.count("@g_scale_head_rows[")))
-        fm = first(blk, MASK_RE.pattern)
-        kpos = [first(blk, rf"(?m)^ *(?:kernel\.launch @|template\.apply<@sel\d+_)g_gemm_\w+[\[>][^\n]*%{w}\)") for w in ("k", "v")]
-        qpos = first(blk, r"(?m)^ *(?:kernel\.launch @|template\.apply<@sel\d+_)g_gemm_\w+[\[>][^\n]*%qg\)")
-        check("set: K and V GEMMs launch before the first mask, the q GEMM after it", fm > 0 and all(0 < k < fm for k in kpos) and qpos > fm, (kpos, fm, qpos))
-        nxt = [blk[m.end():].lstrip().split("\n", 3) for m in re.finditer(MASK_RE.pattern, blk)]
-        reads = [re.search(r"%(?:h16|o16|f16), (%s_[hof])\b", "\n".join(x)) for x in nxt]
-        check("set: each mask is followed by a GEMM block reading the masked buffer", [r.group(1) if r else None for r in reads] == masks, [r.group(1) if r else None for r in reads])
-        check("set: g_scale_head_rows defined once", cand.count('kernel.def export("g_scale_head_rows")') == 1)
-        check("set: the verify program is unchanged", segment(cand, "llm_verify") == segment(base, "llm_verify"))
-        inv = inverse(cand)
-        check("set: the inverse gives the unset program back byte for byte", inv == base,
-              next((f"line {i}: {x!r} vs {y!r}" for i, (x, y) in enumerate(zip(inv.splitlines(), base.splitlines())) if x != y), "length"))
-        check("set: the build log names the switch and its layer", "LAST_ROWS: layer 63's q, o, gate/up and down GEMMs" in err1, err1[-300:])
+        set_checks(base, cand, err1)
         unit(to_gen(base))
     print("FAILED: " + ", ".join(FAILS) if FAILS else "all passed")
     sys.exit(1 if FAILS else 0)
