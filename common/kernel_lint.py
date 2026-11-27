@@ -80,6 +80,18 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
             bound against a served profile. An unmodelled op, a name defined twice, an arity mismatch, two size keys, an empty or a
             shrinking grid: one summary line names the kernel ('not resolved'). Lines 11-25 on pkg-e480: 18 (g_gdn_recurrence_pf: spans <= 1;
             g_gdn_conv_commit: spans <= 4; matvecs, norms, dflash helpers: tokens <= 3-80), 38 not resolved; llama.cpp: no Loom text.
+  [gridlim] a NOTE, never a flag (11-27, SWEEP L4: a flag needs a blind-confirmed sample, E251): some grid the kernel is launched
+            at supplies fewer waves per SIMD than its residency tier (column 'gw', grid_waves(): whole workgroups on the busiest WGP,
+            ceil(workgroups / 20), capped at the tier's resident workgroups, then ceil(n x waves per workgroup / 4) on its busiest
+            SIMD, tier_state's own count; 'bound' tiers make it a bound). Grids: with --profile the served ones (each dispatch's
+            workgroup_count; the line gives each limited grid's served ms and the served-time-weighted gw); without, the program
+            text's constant launch grids only ('?' in the column: sites sized by tokens / spans, never evaluated at a guessed size).
+            The column is one value or min-max over the grids. Meaning: grid-limited, registers above the tier are free; latency
+            levers that cost registers apply (E417 / E469 / E614 lost a tier on bulk matvecs; the [1,64] decode matvecs and the
+            combine are not tier-limited). Retrospective (q213 MV_SCHED, cand/ref per kernel and grid): noted grids 0.944 / 0.971 /
+            0.972 / 1.008 / 1.014 (3 of 5 faster), quiet ones median 1.004 (2 of 32 faster: q3_k 0.929, q8_0_k6144 0.977). Fire 11-27
+            on pkg-e480 with q244 1-sfa: 51 kernels / 85 grids (5.2 ms/step of decode, 5.9 s of prefill; most are tiny 8-WG kernels
+            and 1-token tails), text only: 1 (g_attention_fallback_list). Another engine's objects: no grid source, no gw.
   [guardwait] a NOTE (C18): a vmcnt wait inside a conditional block of a loop (loop_census.guarded's regions behind a forward
             s_cbranch, minus an exit test that leaves or enters a loop) that drains loads issued before the branch, untouched by the
             block and younger than every load the block needs (issued in the block, or read / written by it): vmcnt(#those) would
@@ -114,7 +126,7 @@ Flags (the recurrence each one names); shares are of the hot loop's common path 
   regress:  (with --baseline) worse than the same kernel in another build: a new spill, the prefetch now drained, fewer
             waves per SIMD, or the hot loop / its longest move run >= 10 % longer (E226: Loom 0.3.0's vmcnt(0) + 32-move shift;
             E230: a rewrite's spill; E236: a variant's residency drop).
-Reported, not flagged: non-MMA instructions per MMA, moves, VGPRs, w/S (waves per SIMD) and 'next': the tier reached once the
+Reported, not flagged: non-MMA instructions per MMA, moves, VGPRs, w/S (waves per SIMD), gw (grid waves per SIMD: gridlim) and 'next': the tier reached once the
 VGPRs (v) and LDS bytes (l) shown are freed together, 'best' at the wave cap, 'blocked' by the slot limit; both counted in whole
 workgroups from the summary report beside the code object, KERNEL.json (tier_state(); E533: Loom 0.2.0's own tier rounds VGPRs per
 wave and named flash2's next tier 7, unreachable); 'bound' marks a workgroup whose waves are not a multiple of the SIMDs (Loom's
@@ -419,7 +431,8 @@ def tier_state(occ, simds):
     if cur not in (tier, raw):   # raw: the report's own unrounded minimum (E533: flash2_partial, VGPR tier 5 at 3 waves per SIMD is 3)
         return {"why": f"tier unverified: computes to {tier} in whole workgroups ({raw} unrounded), the report says {cur}"}
     out = {"tier": tier, "bound": w % simds != 0, "q": w // simds if w % simds == 0 else round(w / simds, 2), "report_tier": cur,
-           "next": None, "needs": [], "blocked": None, "wgs": n, "target": occ.get("target")}   # wgs: resident workgroups per domain
+           "next": None, "needs": [], "blocked": None, "wgs": n, "target": occ.get("target"),   # wgs: resident workgroups per domain
+           "w": w, "simds": simds}                                                       # w: waves per workgroup (grid_waves)
     m = n + 1
     while busiest(m) <= tier:     # 1-3-wave workgroups: n + 1 can leave the busiest SIMD's ceil unchanged (verify r2 V-F1); Loom
         m += 1                    # inverts from tier + 1 the same way (occupancy.c local_memory_budget)
@@ -1092,6 +1105,80 @@ def rounds_summary(rows):
     return f"rounds: not resolved ({len(unk)}): {' '.join(unk) or '-'}"
 
 
+def grid_waves(wgs, o, domains):
+    """waves per SIMD that a grid of WGS workgroups supplies at tier_state() O, counted as tier_state counts the tier: whole
+    workgroups on the busiest domain (WGP), ceil(WGS / DOMAINS), capped at the tier's resident workgroups o['wgs'], then
+    ceil(n w / SIMDS) on its busiest SIMD. A grid of >= one round gives the tier itself; a 'bound' tier (w % SIMDS != 0) makes
+    this a bound too (placement of a workgroup's waves over the SIMDs is undocumented)"""
+    n = min(-(-wgs // domains), o["wgs"])
+    return -(-n * o["w"] // o["simds"])
+
+
+def grid_limits(rows, texts, served=None):
+    """r['gw'] = {"src": "served" | "text", "grids": [(grid, workgroups, gw, ms, calls)], "unresolved": n} for every kernel with a
+    verified tier and a grid, and the `gridlim` note when some grid's gw is below the tier (SWEEP 11-27 L4: E417 / E469's prefetch
+    lost a residency tier on bulk matvecs, but where the grid cannot fill the tier the registers are free: MV_SCHED on the [1,64]
+    decode matvecs 0.944-0.972 vs 0.98-1.06 on bulk grids, q213). Grids from SERVED (served_stats' per-grid events: the launches the
+    request made) when a profile is given, else from the program text's constant launch grids (launch_grids); a site whose grid
+    depends on a run-time size (tokens, spans) is counted unresolved, never evaluated at a guessed size (rounds' review r2)."""
+    text = None if served is not None else launch_grids(texts)
+    for r in rows:
+        o = r.get("occ")
+        if not o or "why" in o or not o.get("w"):
+            continue
+        dom = device_domains(o.get("target"))
+        if not dom:
+            continue
+        got, unres = {}, 0
+        if served is not None:
+            for g, (ms, calls) in served.get(r["kernel"], {}).items():
+                got[tuple(g)] = (ms, calls)
+        else:
+            for s in text.get(r["kernel"], []):
+                if not s or not all(isinstance(x, int) for x in s):
+                    unres += 1
+                    continue
+                c = got.get(tuple(s), (None, 0))[1]
+                got[tuple(s)] = (None, c + 1)
+        grids = [(g, math.prod(g), grid_waves(math.prod(g), o, dom), ms, calls) for g, (ms, calls) in sorted(got.items())
+                 if math.prod(g) > 0]
+        if not grids and not unres:
+            continue
+        r["gw"] = {"src": "served" if served is not None else "text", "grids": grids, "unresolved": unres}
+        if any(x[2] < o["tier"] for x in grids):
+            r.setdefault("notes", []).append("gridlim")
+
+
+def gw_text(r):
+    """the 'gw' column: grid waves per SIMD, one value or min-max over the kernel's grids; '?' after it when text sites with a
+    run-time size were not evaluated, '-' with no grid"""
+    g = r.get("gw")
+    if not g:
+        return "-"
+    v = sorted({x[2] for x in g["grids"]})
+    s = "-" if not v else str(v[0]) if len(v) == 1 else f"{v[0]}-{v[-1]}"
+    return s + ("?" if g["unresolved"] else "")
+
+
+def gridlim_line(r):
+    """the `gridlim` note's line: each grid below the tier, its workgroups and gw (with a profile, its served ms and the served-time
+    weighted gw of the kernel)"""
+    g, o = r["gw"], r["occ"]
+    lim = [x for x in g["grids"] if x[2] < o["tier"]]
+    def one(x):
+        return (f"[{','.join(map(str, x[0]))}] {x[1]} WGs gw {x[2]}"
+                + (f" ({x[3]:.2f} ms, {x[4]} calls)" if x[3] is not None else f" ({x[4]} site(s))"))
+    tail = ""
+    if g["src"] == "served":
+        tot = sum(x[3] for x in g["grids"]) or 1e-12
+        tail = (f"; served-weighted gw {sum(x[2] * x[3] for x in g['grids']) / tot:.1f}, grid-limited "
+                f"{100 * sum(x[3] for x in lim) / tot:.0f} % of the kernel's served time")
+    return (f"gridlim {r['kernel']} ({g['src']} grids): {len(lim)} of {len(g['grids'])} grid(s) below the tier "
+            f"{tier_text(o)} waves/SIMD ({o['wgs']} WGs per WGP): " + ", ".join(one(x) for x in lim) + tail
+            + f"; grid-limited: registers above the tier are free; latency levers that cost registers apply (cov "
+            f"{r.get('cover_min', '-')}, fly {r.get('in_flight', '-')}; a note, not a verdict)")
+
+
 def lesson_lines(rows):
     """the lines of the C18 notes (guardwait, vopd) and rounds' information lines, by kernel, and the rounds summary"""
     out = []
@@ -1100,6 +1187,8 @@ def lesson_lines(rows):
         line = rounds_info(r)
         if line:
             out.append(line)
+        if "gridlim" in n:
+            out.append(gridlim_line(r))
         if "guardwait" in n:
             i, b, v = r["guard_waits"][0]
             out.append(f"guardwait {r['kernel']}: {len(r['guard_waits'])} vmcnt wait(s) inside a conditional block drain loads issued "
@@ -2002,18 +2091,24 @@ def compile_programs(progs, out, jobs, lc=None, roots=None):
 
 def served_stats(run):
     """kernel -> (served ms, calls, median us per call) in a profiled run (common/events_summary.py's loader: iree-profile dispatch
-    events of one served request), and the run's prompt size"""
+    events of one served request), the run's prompt size, and kernel -> {served grid (workgroups per axis): [ms, calls]} (gw); an
+    event without a workgroup_count adds to no grid"""
     import events_summary
     ev, prompt = events_summary.load(run)
-    per = collections.defaultdict(list)
+    per, grids = collections.defaultdict(list), collections.defaultdict(dict)
     for e in ev:
         per[e["key"]].append(e["duration_ns"] / 1e3)
-    return {k: (sum(v) / 1e3, len(v), statistics.median(v)) for k, v in per.items()}, prompt
+        g = tuple(e.get("workgroup_count") or ())
+        if g:
+            x = grids[e["key"]].setdefault(g, [0.0, 0])
+            x[0] += e["duration_ns"] / 1e6
+            x[1] += 1
+    return {k: (sum(v) / 1e3, len(v), statistics.median(v)) for k, v in per.items()}, prompt, dict(grids)
 
 
 def served_ms(run):
     """kernel -> served milliseconds in a profiled run, and the run's prompt size"""
-    st, prompt = served_stats(run)
+    st, prompt, _ = served_stats(run)
     return collections.Counter({k: v[0] for k, v in st.items()}), prompt
 
 
@@ -2101,7 +2196,7 @@ def main():
     rga = None
     if a.livereg:
         rga = rga_tool(a.rga) or ""                       # "" : every kernel reports unknown (rga: not found), never a number
-    stats, prompt = served_stats(a.profile) if a.profile else ({}, None)
+    stats, prompt, sgrids = served_stats(a.profile) if a.profile else ({}, None, None)
     ms = collections.Counter({k: v[0] for k, v in stats.items()})
     files = []
     for p in a.paths:
@@ -2115,6 +2210,7 @@ def main():
     outl = outliers(rows)
     tiny(rows, stats)
     rounds(rows, texts)
+    grid_limits(rows, texts, sgrids)
     barriers(rows, kernel_texts(texts), func_texts(texts), a.roots, a.barriers)
     mv = {k: c for k, t in kernel_texts(texts).items() if (a.roots is None or re.search(a.roots, k)) for c in [masked_v(t)] if c}
     for r in rows:
@@ -2165,14 +2261,14 @@ def main():
             loom_lines += [f"loom {r['kernel']}: {ln}" for ln in x["lines"] if ln != "no findings"]
     rows.sort(key=lambda r: (-bool(r["flags"]), -ms.get(r["kernel"], 0), -len(r["flags"]), -(sites or {}).get(r["kernel"], 0), r["kernel"]))
     print(f"{'kernel':42s} {'where':>6s} {'loop':>5s} {'comm':>5s} {'mm':>4s} {'other/op':>8s} {'sel':>4s} {'pk':>3s} {'bfe':>4s} {'scr':>4s} {'mov':>4s} "
-          f"{'run':>4s} {'vgpr':>4s} {'w/S':>8s} {'next':>16s} {'live':>11s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
+          f"{'run':>4s} {'vgpr':>4s} {'w/S':>8s} {'gw':>7s} {'next':>16s} {'live':>11s} {'pf':>5s} {'sites':>5s} {'ldsW':>5s} {'cov':>4s} {'fly':>3s} {'bank':>5s} {'ms':>8s}  flags")
     for r in rows:
         if a.flagged and not r["flags"]:
             continue
         f = lambda v: "-" if v is None else str(v)
         s = "-" if sites is None else str(sites.get(r["kernel"], 0))
         print(f"{r['kernel']:42s} {r['where']:>6s} {r['loop']:5d} {r['common']:5d} {r['wmma'] or r['dot']:4d} {f(r['other_per_op']):>8s} {r['select']:4d} {r['pk']:3d} "
-              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {tier_text(r['occ'] if r.get('waves') is not None else None):>8s} {next_text(r):>16s} {live_text(r):>11s} {r['pf']:>5s} {s:>5s} "
+              f"{r['bfe']:4d} {r['scratch']:4d} {r['moves']:4d} {r['run']:4d} {f(r['vgpr']):>4s} {tier_text(r['occ'] if r.get('waves') is not None else None):>8s} {gw_text(r):>7s} {next_text(r):>16s} {live_text(r):>11s} {r['pf']:>5s} {s:>5s} "
               f"{f(r['lds_waits_per_op']):>5s} {f(r['cover_min']):>4s} {r['in_flight']:3d} {f(r.get('bank_extra')):>5s} "
               f"{('%.1f' % ms[r['kernel']]) if r['kernel'] in ms else '-':>8s}  "
               f"{' '.join(r['flags'])}{('  [' + ' '.join(r['notes']) + ']') if r.get('notes') else ''}")

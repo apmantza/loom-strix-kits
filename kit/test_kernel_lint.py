@@ -59,6 +59,10 @@
     build (E520: STAGE_LIVE x FLATADDR), VOPD pairs left unformed not counted (E551: flash2's back-edge 65 moves -> 31 pairs);
     each with near misses (two rounds, a runtime grid, an unmodelled op; loads kept in flight or issued early; loads issued after
     the join, read inside the block or issued inside it, an exit test; one-parity destinations, dependent moves, modifiers).
+  - a register-costing lever priced as a lost tier where the grid, not the registers, sets occupancy (E417 / E469 / E614 vs q213's
+    [1,64] matvecs; SWEEP 11-27 L4): grid_waves() must give gw 3 for g_attention_combine at [8,24,1] and note gridlim, gw 5 for the
+    [1,64,1] matvec grid, and no note for a bulk 17-wave matvec at its served [1,320,1] (gw 9 = its tier); text sites sized by tokens
+    are unresolved, never guessed;
   - C19 Loom candidates (loom_cands(), HANDOFF failure list): a report's phantom next tier (E533), allocation-emitted back-edge
     copies VOPD could pair (E592) and a shape moved by the compiler alone (E177 / E227) found only by hand; each with near misses
     (agreeing tier, wave cap, unverified tier; short, distant, ordered or paired copies; programs, roots, target or compiler not
@@ -221,6 +225,66 @@ def livereg():
         got = kl.rga_live("x.hsaco", os.path.join(t, "two"))
         ok(isinstance(got, dict) and "2 .live files" in got.get("error", ""), f"livereg: two .live files (a multi-kernel object) give "
            f"no figure, never the first one's ({got if isinstance(got, dict) else len(got)})")
+
+
+def grid_waves():
+    """gw / gridlim (SWEEP 11-27 L4). Recurrence: E417 / E469 / E614 priced a register-costing prefetch on decode matvecs as a lost
+    residency tier everywhere, while on the [1,64,1] k / v matvecs and g_attention_combine the grid, not the registers, sets the
+    occupancy (MV_SCHED 0.944-0.972 there vs 0.98-1.06 on bulk grids, q213): the lint must say which kernels are grid-limited.
+    Tier rows are live pkg-e480 reports; grids are the served ones (1-sfa events)."""
+    comb = kl.tier_state(occ(32, 24, 16, 0, 16, 16, 16), 4)          # g_attention_combine: 1-wave WGs, 64 per WGP at tier 16
+    mv = kl.tier_state(occ(160, 114, 12, 2560, 16, 15, 12), 4)       # g_mv_q5_k_k5120_t8_q8: 5-wave WGs, 9 per WGP at tier 12
+    big = kl.tier_state(occ(544, 114, 12, 8704, 16, 13, 12), 4)      # g_mv_q5_k_k17408_t8_q8: 17-wave WGs, 2 per WGP at tier 9
+    gw = getattr(kl, "grid_waves", None)
+    vals = [gw(192, comb, 20), gw(64, mv, 20), gw(1088, mv, 20), gw(320, big, 20)] if gw else None
+    ok(vals == [3, 5, 12, 9], f"gw: combine 192 WGs -> 10 per WGP -> 3 waves/SIMD; [1,64] matvec 4 x 5 waves -> 5; [1,1088] capped at "
+       f"the tier 12; the 17-wave [1,320] at its tier 9 ({vals})")
+    with tempfile.TemporaryDirectory() as t:
+        run = os.path.join(t, "run"); os.makedirs(run)
+        with open(os.path.join(run, "events.jsonl"), "w") as f:
+            for k, g, ns, n in (("g_attention_combine", [8, 24, 1], 59_000, 3), ("g_mv_q5_k_k5120_t8_q8", [1, 64, 1], 20_000, 2),
+                                ("g_mv_q5_k_k5120_t8_q8", [1, 1088, 1], 284_000, 2), ("g_mv_q5_k_k17408_t8_q8", [1, 320, 1], 286_000, 4)):
+                for _ in range(n):
+                    f.write(json.dumps({"type": "dispatch_event", "valid": True, "key": k, "duration_ns": ns, "workgroup_count": g}) + "\n")
+        open(os.path.join(run, "x.req.json"), "w").write(json.dumps({"requests": [{"prompt_tokens": 81430}]}))
+        got = kl.served_stats(run)
+        grids = got[2] if len(got) > 2 else {}
+        ok(grids.get("g_mv_q5_k_k5120_t8_q8") == {(1, 64, 1): [0.04, 2], (1, 1088, 1): [0.568, 2]},
+           f"gw: served grids per kernel from the events' workgroup_count ({grids.get('g_mv_q5_k_k5120_t8_q8')})")
+        rows = [{"kernel": "g_attention_combine", "occ": comb, "cover_min": 4, "in_flight": 0},
+                {"kernel": "g_mv_q5_k_k5120_t8_q8", "occ": mv, "cover_min": 2, "in_flight": 0},
+                {"kernel": "g_mv_q5_k_k17408_t8_q8", "occ": big, "cover_min": 2, "in_flight": 0}]
+        getattr(kl, "grid_limits", lambda *a: None)(rows, [], grids)
+    notes = lambda r: r.get("notes", [])
+    text = getattr(kl, "gw_text", lambda r: None)
+    lines = [ln for ln in kl.lesson_lines(rows) if ln.startswith("gridlim")]
+    ok("gridlim" in notes(rows[0]) and text(rows[0]) == "3" and any("gridlim g_attention_combine" in ln and "[8,24,1] 192 WGs gw 3" in ln
+       and "registers above the tier are free" in ln for ln in lines),
+       f"gw: g_attention_combine at [8,24,1] (24 VGPRs, tier 16) gets gridlim, gw 3 ({notes(rows[0])}, {text(rows[0])}, {lines})")
+    ok("gridlim" in notes(rows[1]) and text(rows[1]) == "5-12" and any("gridlim g_mv_q5_k_k5120_t8_q8" in ln and "1 of 2 grid(s)" in ln
+       and "[1,64,1] 64 WGs gw 5" in ln and "1088" not in ln and "served-weighted gw 11.5" in ln for ln in lines),
+       f"gw: one kernel at a [1,64,1] and a [1,1088,1] grid: min-max 5-12, the [1,64,1] grid named, served-weighted 11.5 ({text(rows[1])}, "
+       f"{lines})")
+    ok("gridlim" not in notes(rows[2]) and text(rows[2]) == "9", f"gw: near miss, a bulk 17-wave matvec at its served [1,320,1] fills "
+       f"its tier 9: no note ({notes(rows[2])}, {text(rows[2])})")
+    ok(not any(ln.startswith("gridlim") for ln in kl.lesson_lines(rows[2:])), "gw: no line for the near miss")
+    # program text, no profile: a constant grid is evaluated; a run-time size (tokens) is counted unresolved, never guessed
+    prog = ('kernel.def export("g_c") @g_c(%n: index) {\n  %c1 = index.constant 1 : index\n'
+            '  kernel.launch.config workgroups(%c1, %n, %c1) workgroup_size(%c1, %c1, %c1) : index\n} launch(%x: index) {\n}\n'
+            'kernel.def export("g_s") @g_s(%n: index) {\n  %c1 = index.constant 1 : index\n'
+            '  kernel.launch.config workgroups(%n, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index\n} launch(%x: index) {\n}\n'
+            'command.def public target(@device) @llm_advance() launch(%x: buffer) {\n  %r = index.constant 64 : index\n'
+            '  %t = config.get @llm.tokens : index\n  kernel.launch @g_c[%r](%r) : [index](index)\n'
+            '  kernel.launch @g_s[%t](%t) : [index](index)\n}\n')
+    rows = [{"kernel": "g_c", "occ": mv}, {"kernel": "g_s", "occ": comb}]
+    getattr(kl, "grid_limits", lambda *a: None)(rows, [prog], None)
+    ok("gridlim" in notes(rows[0]) and text(rows[0]) == "5" and rows[0].get("gw", {}).get("src") == "text",
+       f"gw: a constant [1,64,1] text grid at tier 12 gets gridlim from the program alone ({rows[0].get('gw')})")
+    ok("gridlim" not in notes(rows[1]) and text(rows[1]) == "-?", f"gw: a tokens-sized grid without a profile is unresolved, no note "
+       f"({rows[1].get('gw')}, {text(rows[1])})")
+    rows = [{"kernel": "g_c", "occ": kl.tier_state(occ(160, 114, 12, 2560, 16, 15, 11), 4)}]   # unverified tier: no figure
+    getattr(kl, "grid_limits", lambda *a: None)(rows, [prog], None)
+    ok("gw" not in rows[0] and "gridlim" not in notes(rows[0]), f"gw: an unverified tier gives no gw ({rows[0].get('gw')})")
 
 
 def lesson_notes():
@@ -944,6 +1008,7 @@ def main():
     occupancy_seam()
     livereg()
     lesson_notes()
+    grid_waves()
     loom_cands()
     prog = ("template.def<@sel1_g_k1> target(@rdna3) @sel1_g_k1_rdna3(%g0: index) {\n  kernel.launch @g_k1[%g0](%g0) : [index](index)\n}\n"
             "command.def public @c() {\n  template.apply<@sel1_g_k1>(%t) : (index)\n  template.apply<@sel1_g_k1>(%u) : (index)\n"
