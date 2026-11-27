@@ -2531,6 +2531,141 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_acc_m256")' 
 {_XE}{_SE}{_QE}{_eq("hb", "h7", _T(f"{H}xf32"))}  check.return
 }}
 """)
+# 3a-qgs. QG_SPLIT (HRX-like static-1127/upsw, kit qg_split.py): the q GEMM's _qgs epilogue must equal store + g_split_qgate bit for bit
+# (check.expect.equal): q and gate of every row, both starting as 7.0 fills. 512 rows (two m256 tiles), N = heads x 2 x D (the
+# served q / gate layout g_split_qgate reads), 5 dead rows (input scale 0, zero x16: written by both chains), padded strides.
+if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_store_m256_qgs")' in (_pkg_llm_text() or ""):
+    _rows, _K, _nq = 512, 1024, 2 * QH * D
+    _KP, _hq = _K + _PFPAD, QH * D
+    _xq = (rng.standard_normal((_rows, _K)) * 0.5).astype(np.float16)
+    _wq = (rng.standard_normal((_nq, _K)) * 0.05).astype(np.float16)
+    _sq = np.stack([np.ones(_rows, np.float32), rng.uniform(0.5, 2.0, _rows).astype(np.float32)], 1)
+    _dq = rng.choice(_rows, 5, replace=False)
+    _xq[_dq] = 0
+    _sq[_dq] = 0
+    save("qgs_x16", pfpad(_xq)); save("qgs_s", _sq); save("qgs_w", pfpad(_wq, np.float16(0)).reshape(-1).view(np.int8))
+    _WQ = _nq * _KP * 2
+    _QT = f"tensor<{_rows}x{_hq}xf32>"
+    _GT = f"[index, index](index, index, index, tensor<{_rows}x{_KP}xf16>, tensor<{_rows}x2xf32>, tensor<{_WQ}xi8>"
+    cases.append(f"""check.case public @qgs_split {{
+  %rows = check.literal value({_rows}) : index
+  %k = check.literal value({_K}) : index
+  %n = check.literal value({_nq}) : index
+  %x16 = check.file.read.npy path("qgs_x16.npy") : tensor<{_rows}x{_KP}xf16>
+  %s = check.file.read.npy path("qgs_s.npy") : tensor<{_rows}x2xf32>
+  %w = check.file.read.npy path("qgs_w.npy") : tensor<{_WQ}xi8>
+  %qg = check.generate.fill value(0.0) : tensor<{_rows}x{_nq}xf32>
+  %qa = check.generate.fill value(7.0) : {_QT}
+  %ga = check.generate.fill value(7.0) : {_QT}
+  %qb = check.generate.fill value(7.0) : {_QT}
+  %gb = check.generate.fill value(7.0) : {_QT}
+  kernel.launch @g_gemm_f16_store_m256[%rows, %n](%rows, %k, %n, %x16, %s, %w, %qg) : {_GT}, tensor<{_rows}x{_nq}xf32>)
+  kernel.launch @g_split_qgate[%rows](%rows, %qg, %qa, %ga) : [index](index, tensor<{_rows}x{_nq}xf32>, {_QT}, {_QT})
+  kernel.launch @g_gemm_f16_store_m256_qgs[%rows, %n](%rows, %k, %n, %x16, %s, %w, %qb, %gb) : {_GT}, {_QT}, {_QT})
+  check.expect.equal actual(%qb) expected(%qa) : {_QT}
+  check.expect.equal actual(%gb) expected(%ga) : {_QT}
+  check.return
+}}
+""")
+# 3a''''. 64-row wave skip in the 256-row f16 GEMMs (GEMM_WAVE_SKIP, kit/gemm_wave_skip.py; HRX-like E635 / shortpf O4): every served
+# gfx11 f16 m256 GEMM run twice on the same x / weights / inverse scales, once with padding rows (scale column 0 = 0, run A) and once
+# with every row live (column 0 = 1, run B: no wave can skip). Padding rows are laid out so each wave case occurs: tile 0 with wave 0
+# and wave 3 all padding and waves 1-2 live (a skip in a non-last tile; a wave 0 that skips while later waves compute), tile 1 with
+# wave 0 live, wave 1 33 live rows then padding (the served shape: a live prefix), wave 2 padding in its first 40 rows and live in its
+# last 24 (live rows only in the lanes' second load), wave 3 all padding; tile 2 with wave 0 one live row (its row 0), wave 1 a 31-row
+# prefix, wave 2 one live row at its row 63 (the last row of the lanes' second load), wave 3 one live row at its row 0 with padding after
+# it to the tile's end (served: an epoch of N = 1 mod 64 rows); tile 3 all padding beside it (the tile skip). Padding rows' x is zero. Faults each pattern exists for (HRX-like E690, DIAG.md round-4 table): a predicate that
+# reads rows 32-63 only (tile 2 waves 0-1), rows 0-47 / lanes 0-15 / rows 0-62 (tile 2 wave 2), rows 1-64 (tile 2 wave 3: E704;
+# in wave 0 the shifted read reached wave 1's live row). Residuals, not red here: a predicate that drops only row 31 or only row 32
+# (one lane of one load; no wave has that row as its only live row).
+# Expectations (HRX-like E675 / E678: their state table is static-1127/wsk-fail/DIAG.md):
+#   0: run A's y against a float64 numpy reference (3a's form and tolerance): the independent check; it reds every predicate fault
+#      that zeroes a live row in run A, including those that hit both runs alike (inverted, always-skip: q246's pkg-wskm2 passed a
+#      pairwise-only case, both runs zero);
+#   1: run A == run B bit for bit: the pass's exactness claim (live waves run the same ops in the same order), below 0's tolerance;
+#   swiglu _f16o 2 / 3: its second output (F16O11, kit/f16o11.py: each row's flag, 1 live / 0 padding, both columns) depends on the
+#      scales alone, so each run's flags are checked against their own expectation (A: wsk_fa from column 0; B: 1), never against
+#      each other (q236: that pairwise check failed at row 192 on every package).
+# Recurrences: a skip predicate that reads the wrong rows, only the first 32 rows of a wave, wave 0's rows for the whole tile, or is
+# inverted, or reads rows 32-63 only, or rows 1-64 (mutants pkg-wskm1 / 3 / 2 / 4 / 5, HRX-like q246, each red at named expectations), or a region
+# rewrite that drops an MMA.
+# QG_SPLIT's g_gemm_f16_store_m256_qgs (when the program has it): N = 512, q (expectations 0 / 1, store's reference) and gate
+# (2: its own reference, 3: A == B) from the same rows and padding layout.
+# Without the switch the case is a control (every expectation holds: q246 ran it on pkg-e480).
+_WSK = [k for k in ("g_gemm_f16_store_m256", "g_gemm_f16_acc_m256", "g_gemm_f16_swiglu_m256_f16o", "g_gemm_f16_store_m256_qgs") if f'export("{k}")' in (_pkg_llm_text() or "")]
+if os.environ.get("GEMM_TESTS", "1") == "1" and _WSK:
+    _wrng = np.random.default_rng(653)   # own stream (E653): this case's shape changes no other case's inputs
+    _rows, _K, _nu = 1024, 1024, 256
+    _KP, _NP = _K + _PFPAD, _nu + _PFPAD
+    _live = np.ones(_rows, bool)
+    _live[0:64] = False; _live[192:256] = False; _live[353:384] = False; _live[384:424] = False; _live[448:512] = False
+    _live[512:] = False; _live[512] = True; _live[576:607] = True; _live[703] = True; _live[704] = True   # tile 2 (512-767); tile 3 all padding
+    _xw = (_wrng.standard_normal((_rows, _K)) * 0.5).astype(np.float16); _xw[~_live] = 0
+    _inv = _wrng.uniform(0.5, 2.0, _rows).astype(np.float32)
+    save("wsk_x", pfpad(_xw)); save("wsk_sp", np.stack([_live.astype(np.float32), _inv], 1))   # padding rows: column 0 = 0
+    save("wsk_sl", np.stack([np.ones(_rows, np.float32), _inv], 1))   # every row live
+    save("wsk_fa", np.repeat(_live.astype(np.float32)[:, None], 2, 1))   # F16O11 flags of the padded run (both columns)
+    _wb = lambda w: pfpad(w, np.float16(0)).reshape(-1).view(np.int8)   # the f16 weight scratch: rows at stride K + PAD
+    _ww = (_wrng.standard_normal((_nu, _K)) * 0.05).astype(np.float16); _wu = (_wrng.standard_normal((_nu, _K)) * 0.05).astype(np.float16)
+    _rr = _wrng.standard_normal((_rows, _nu)).astype(np.float32)
+    save("wsk_w", _wb(_ww)); save("wsk_u", _wb(_wu)); save("wsk_r", _rr)
+    # the independent reference of run A (padding rows: x = 0, so 0 / r there, as the kernel must leave them)
+    _gw = (_xw.astype(np.float64) @ _ww.astype(np.float64).T) * _inv[:, None]
+    _sw = ffn_act(_gw) * ((_xw.astype(np.float64) @ _wu.astype(np.float64).T) * _inv[:, None])
+    save("wsk_e_store", _gw.astype(np.float32)); save("wsk_e_acc", (_rr.astype(np.float64) + _gw).astype(np.float32))
+    save("wsk_e_swiglu", np.pad(_sw, ((0, 0), (0, _NP - _nu))).astype(np.float16))   # the padded stride's columns stay 0
+    _wtol = {"store": 3.0e-2 * float(np.abs(_gw[_live]).std() + 1e-6), "acc": 3.0e-2 * float(np.abs(_gw[_live]).std() + 1e-6),
+             "swiglu": 3.0e-2 * float(np.abs(_sw[_live]).std() + 1e-6)}
+    _WB = _nu * _KP * 2
+    if "g_gemm_f16_store_m256_qgs" in _WSK:   # QG_SPLIT's q GEMM: N = 512 (one head: q = weight rows 0-255, gate = 256-511)
+        save("wsk_wq", _wb(np.concatenate([_ww, _wu])))
+        save("wsk_e_qgs_g", ((_xw.astype(np.float64) @ _wu.astype(np.float64).T) * _inv[:, None]).astype(np.float32))
+    _XT, _ST, _WT = f"tensor<{_rows}x{_KP}xf16>", f"tensor<{_rows}x2xf32>", f"tensor<{_WB}xi8>"
+    for _k in _WSK:
+        _m = _k.split("_")[3]   # store / acc / swiglu (_qgs: store, its q reference)
+        if "swiglu" in _k:   # F16O11: f16 rows + row scales out
+            _YT = f"tensor<{_rows}x{_NP}xf16>"
+            _outs = (f"  %u = check.file.read.npy path(\"wsk_u.npy\") : {_WT}\n"
+                     f"  %ya = check.generate.fill value(0.0) : {_YT}\n  %yb = check.generate.fill value(0.0) : {_YT}\n"
+                     f"  %oa = check.generate.fill value(7.0) : {_ST}\n  %ob = check.generate.fill value(7.0) : {_ST}\n"
+                     f"  %fa = check.file.read.npy path(\"wsk_fa.npy\") : {_ST}\n  %fb = check.generate.fill value(1.0) : {_ST}\n")
+            _ta = f"[index, index](index, index, index, {_XT}, {_ST}, {_WT}, {_WT}, {_YT}, {_ST})"
+            _la = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sp, %w, %u, %ya, %oa) : {_ta}\n"
+            _lb = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sl, %w, %u, %yb, %ob) : {_ta}\n"
+            _eq = (f"  check.expect.equal actual(%oa) expected(%fa) : {_ST}\n  check.expect.equal actual(%ob) expected(%fb) : {_ST}\n")
+        elif _k.endswith("_qgs"):   # q and gate written by the epilogue (qg_split.py); q's reference is store's, gate's its own
+            _YT, _WQT = f"tensor<{_rows}x{_nu}xf32>", f"tensor<{2 * _WB}xi8>"
+            _outs = (f"  %wq = check.file.read.npy path(\"wsk_wq.npy\") : {_WQT}\n  %n2 = check.literal value({2 * _nu}) : index\n"
+                     f"  %eg = check.file.read.npy path(\"wsk_e_qgs_g.npy\") : {_YT}\n"
+                     + "".join(f"  %{v} = check.generate.fill value(0.0) : {_YT}\n" for v in ("ya", "yb", "ga", "gb")))
+            _ta = f"[index, index](index, index, index, {_XT}, {_ST}, {_WQT}, {_YT}, {_YT})"
+            _la = f"  kernel.launch @{_k}[%rows, %n2](%rows, %k, %n2, %x, %sp, %wq, %ya, %ga) : {_ta}\n"
+            _lb = f"  kernel.launch @{_k}[%rows, %n2](%rows, %k, %n2, %x, %sl, %wq, %yb, %gb) : {_ta}\n"
+            _eq = (f"  check.expect.close actual(%ga) expected(%eg) atol({_wtol['store']:.3e}) rtol(1.0e-2) nan(different) : {_YT}\n"
+                   f"  check.expect.equal actual(%ga) expected(%gb) : {_YT}\n")
+            _m = "store"
+        else:   # store writes y; acc adds into y, which starts as residual rows
+            _YT = f"tensor<{_rows}x{_nu}xf32>"
+            _src = 'check.file.read.npy path("wsk_r.npy")' if "_acc_" in _k else "check.generate.fill value(0.0)"
+            _outs = f"  %ya = {_src} : {_YT}\n  %yb = {_src} : {_YT}\n"
+            _ta = f"[index, index](index, index, index, {_XT}, {_ST}, {_WT}, {_YT})"
+            _la = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sp, %w, %ya) : {_ta}\n"
+            _lb = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sl, %w, %yb) : {_ta}\n"
+            _eq = ""
+        cases.append(f"""check.case public @wave_skip_{_k} {{
+  %rows = check.literal value({_rows}) : index
+  %k = check.literal value({_K}) : index
+  %n = check.literal value({_nu}) : index
+  %x = check.file.read.npy path("wsk_x.npy") : {_XT}
+  %sp = check.file.read.npy path("wsk_sp.npy") : {_ST}
+  %sl = check.file.read.npy path("wsk_sl.npy") : {_ST}
+  %w = check.file.read.npy path("wsk_w.npy") : {_WT}
+  %e = check.file.read.npy path("wsk_e_{_m}.npy") : {_YT}
+{_outs}{_la}{_lb}  check.expect.close actual(%ya) expected(%e) atol({_wtol[_m]:.3e}) rtol(1.0e-2) nan(different) : {_YT}
+  check.expect.equal actual(%ya) expected(%yb) : {_YT}
+{_eq}  check.return
+}}
+""")
 # 3b'. the producers' fp8 twins (gen_mxfp4s.fuse_mxfp4s_f8; choice prefill.gemm.mxfp4s_f8, gfx12 only) against numpy's e4m3 rounding. The fp8 GEMM itself is tested by the
 # gemm_mxfp4s kbench suite (loom-test cases on synthetic split planes).
 def e4m3_round(x):
@@ -4216,6 +4351,114 @@ kernel.def export("test_copy_rows") @test_copy_rows(%rows: index) {
             if _fill == "nan":
                 _skv_hnan = cases[-1]
         cases.append(negtwin(_skv_hnan, ('path("skv_f_arena_nan.npy")', 'path("skv_f_arena_neg.npy")')))
+
+    def _lastq_cases():
+        """LAST_Q (HRX-like E661, kit/last_q.py): the served prefill chain from the epoch metadata (g_token_info, the work lists,
+        g_flash_tiles_out, the f16-output flash kernels on its list) against the same chain on the full list. @lastq_crop_<x>:
+        the cropped output equals the full one on every row of a tile / block that holds a selected span's last token (the head's
+        rows), and every other row is left untouched (the sentinel): check.expect.equal on the whole f16 output. Recurrence: a
+        crop that drops the tile of a row the head reads (an off-by-one on the span's last token, a 1-token tail block, a whole
+        tile ending the span) changes served logits, which EXACT sees only on a request whose span ends there; a crop that keeps
+        everything passes EXACT and saves nothing. (a) row 1 at 301-400 selected (its last token is a 1-token partial tail
+        block), row 0 at 1013-1021 not selected (an intermediate chunk: all partial, none kept), row 2 at 64-111 selected (its
+        last token ends a whole tile); (b) row 1 at 301-390 selected (a 7-token tail block), row 2 at 77-84 selected (8 tokens:
+        the split-K fallback's, in no flash list), row 0 at 1000-1023 not selected (a partial head block and a whole tile).
+        @lastq_crop_a_negcontrol: the expected keeps row 1's tail block out (must FAIL)."""
+        cases.append("""
+// Test helper: dst[r][c] = src[r][c] for c < width on the rows with mask[r] != 0 (f16 rows of `stride`); other rows untouched.
+kernel.def export("test_keep_rows_f16") @test_keep_rows_f16(%rows: index) {
+  %c1 = index.constant 1 : index
+  %c256 = index.constant 256 : index
+  kernel.launch.config workgroups(%rows, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
+} launch(%rows_arg: index, %width_arg: index, %stride_arg: index, %mask: buffer, %src: buffer, %dst: buffer) {
+  %rows = index.assume %rows_arg [range(%rows_arg, 1, 8192)] : index
+  %width = index.assume %width_arg [range(%width_arg, 1, 1048576)] : index
+  %stride = index.assume %stride_arg [range(%stride_arg, 1, 1048576)] : index
+  %row_id = kernel.workgroup.id<x> : index
+  %row = index.assume %row_id [lt(%row_id, %rows)] : index
+  %lane = kernel.workitem.id<x> : index
+  %zero = index.constant 0 : offset
+  %c256 = index.constant 256 : index
+  %c0_i32 = scalar.constant 0 : i32
+  %mask_view = buffer.view %mask[%zero] : buffer -> view<[%rows]xi32>
+  %m = view.load %mask_view[%row] : view<[%rows]xi32> -> i32
+  %keep = scalar.cmpi ne, %m, %c0_i32 : i32
+  %src_view = buffer.view %src[%zero] : buffer -> view<[%rows]x[%stride]xf16>
+  %dst_view = buffer.view %dst[%zero] : buffer -> view<[%rows]x[%stride]xf16>
+  scf.if %keep {
+    scf.for %c = [%lane to %width step %c256] {
+      %col = index.assume %c [lt(%c, %width), lt(%c, %stride)] : index
+      %v = view.load %src_view[%row, %col] : view<[%rows]x[%stride]xf16> -> f16
+      view.store %v, %dst_view[%row, %col] : f16, view<[%rows]x[%stride]xf16>
+    }
+  }
+  kernel.return
+}
+""")
+        QD = QH * D; lrng = np.random.default_rng(661)
+        for tag, spans in (("a", [(1, 301, 100, 1), (0, 1013, 9, 0), (2, 64, 48, 1)]),
+                           ("b", [(1, 301, 90, 1), (2, 77, 8, 1), (0, 1000, 24, 0)])):
+            n_live = sum(s[2] for s in spans); t = n_live + (-n_live % 16) + 16   # dead padding after the spans
+            meta = np.zeros(4 + 9 * len(spans), np.int32); meta[0] = len(spans)
+            info = np.zeros((t, 4), np.int32); info[:, 0] = -1; info[:, 3] = -1   # g_token_info's dead rows
+            mask = np.zeros(t, np.int32); mask_neg = None; at = 0
+            for s, (row, p0, n, sel) in enumerate(spans):
+                meta[4 + 9 * s:4 + 9 * s + 9] = [n, p0, 0, row, at, 0, sel, 0, 0]
+                info[at:at + n] = [(row, p0 + i, 1, s) for i in range(n)]
+                at += n
+            cov = covered_tokens(info[:, :3]); part = partial_tokens(info[:, :3])
+            at = 0
+            for s, (row, p0, n, sel) in enumerate(spans):
+                r = at + n - 1; pr = p0 + n - 1   # the head's row of the span
+                if sel and n >= 9:
+                    assert cov[r] or part[r], f"lastq_crop_{tag}: row {r} in no flash work item"
+                    lo = r - pr % 16 if cov[r] else max(at, r - pr % 16)   # its whole tile, or its tail block
+                    mask[lo:lo + 16 if cov[r] else r + 1] = 1
+                    if mask_neg is None and not cov[r]:
+                        mask_neg = mask.copy(); mask_neg[lo:r + 1] = 0
+                at += n
+            assert 0 < mask.sum() < (cov | part).sum(), f"lastq_crop_{tag}: the crop keeps {mask.sum()} of {(cov | part).sum()} rows"
+            q = (lrng.standard_normal((t, QD)) * 2.5).astype(np.float32); g = lrng.standard_normal((t, QD)).astype(np.float32)
+            for n_, a_ in (("meta", meta), ("q", q), ("g", g), ("mask", mask)) + ((("mask_neg", mask_neg),) if tag == "a" else ()):
+                save(f"lq_{n_}_{tag}", a_)
+            MT, IT, OT, HT = f"tensor<{meta.size}xi32>", f"tensor<{t}x4xi32>", f"tensor<{t}x{QD}xf32>", f"tensor<{t}x{QD + _PFPAD}xf16>"
+
+            def fl(k, lst, out):
+                return (f"  kernel.launch @{k}[%t](%t, %layer, %sliding, %ctx, %pool, %q, %g, %info, {lst}, %orig, %arena, {out}) : "
+                        f"[index](index, index, i32, index, index, {OT}, {OT}, {IT}, tensor<{t}xi32>, {OA}, {AA}, {HT})\n")
+            cases.append(f"""check.case public @lastq_crop_{tag} {{
+  %t = check.literal value({t}) : index
+  %spans = check.literal value({len(spans)}) : index
+  %wd = check.literal value({QD}) : index
+  %stride = check.literal value({QD + _PFPAD}) : index
+  %layer = check.literal value(0) : index
+  %sliding = check.literal value(0) : i32
+  %ctx = check.literal value({ctx_a}) : index
+  %pool = check.literal value({pool_a}) : index
+  %meta = check.file.read.npy path("lq_meta_{tag}.npy") : {MT}
+  %q = check.file.read.npy path("lq_q_{tag}.npy") : {OT}
+  %g = check.file.read.npy path("lq_g_{tag}.npy") : {OT}
+  %mask = check.file.read.npy path("lq_mask_{tag}.npy") : tensor<{t}xi32>
+  %orig = check.file.read.npy path("f_orig_a.npy") : {OA}
+  %arena = check.file.read.npy path("f_arena_a.npy") : {AA}
+  %info = check.generate.fill value(0) : {IT}
+  %tout = check.generate.fill value(1073741823) : tensor<{t}xi32>
+  %ha = check.generate.fill value(0.0) : {HT}
+  %hb = check.generate.fill value({SENT}) : {HT}
+  %he = check.generate.fill value({SENT}) : {HT}
+  kernel.launch @g_token_info[%t](%t, %spans, %meta, %info) : [index](index, index, {MT}, {IT})
+{list_launch("%t", t, "%info", "a")}  kernel.launch @g_flash_tiles_out[%t](%t, %spans, %meta, %info, %tilesa, %tout) : [index](index, index, {MT}, {IT}, tensor<{t}xi32>, tensor<{t}xi32>)
+{fl("g_attention_flash2_f16o", "%tilesa", "%ha")}{fl("g_attention_flash2_partial_f16o", "%tilesa", "%ha")}{fl("g_attention_flash2_f16o", "%tout", "%hb")}{fl("g_attention_flash2_partial_f16o", "%tout", "%hb")}  kernel.launch @test_keep_rows_f16[%t](%t, %wd, %stride, %mask, %ha, %he) : [index](index, index, index, tensor<{t}xi32>, {HT}, {HT})
+  check.expect.equal actual(%hb) expected(%he) : {HT}
+  check.return
+}}
+""")
+            if tag == "a":
+                cases.append(negtwin(cases[-1], ('path("lq_mask_a.npy")', 'path("lq_mask_neg_a.npy")')))
+
+    if not KS and 'export("g_flash_tiles_out")' in (_pkg_llm_text() or ""):
+        kt_section(["g_flash_tiles_out", "g_token_info", "g_attention_fallback_list", "g_attention_flash2_f16o",
+                    "g_attention_flash2_partial_f16o"], _lastq_cases)
 
 # 6. MoE (gen_moe.py) on real tensors, one layer per expert-down format: the decode chain (router -> top-k ->
 # gate/up -> down -> combine, plus the prefill router with padding tokens) and the prefill chain (prefill router ->
