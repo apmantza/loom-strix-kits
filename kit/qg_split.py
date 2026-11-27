@@ -8,10 +8,11 @@ The q GEMM writes %qg as [rows][heads][q | gate][D] f32; g_split_qgate(_lv) copi
 f32 values land at the same places: exact by construction (the kernel test compares it with store + split bit for bit).
 
 Our projection launches m256 kernels in both the f16-scratch branch (`scf.if %pf_big`) and the quantized branch, so the split is
-skipped only under %qgs_ok = %pf_big and %huge, where the one converted f16 m256 store is the only %qg writer that can run. A
-layer is converted only when, on that path, every %qg writer is one f16 m256 store run exactly under %mm / %pf_big / %big /
-%huge, and the only %qg readers in @llm_advance are the split launches; anything else leaves the layer unchanged and is counted
-(fail closed). Off (unset): the text is unchanged."""
+skipped only under %qgs_ok = the AND of PATH's conditions (%mm, %pf_big, %big, %huge), where the one converted f16 m256 store is the
+only %qg writer that can run. A layer is converted only when, on that path, every %qg writer is one f16 m256 store run exactly under
+%mm / %pf_big / %big / %huge, and the only %qg readers in @llm_advance are the split launches; anything else leaves the layer
+unchanged and is counted (fail closed); a split launch outside a block SPLIT matches (a layer whose split is not in the expected
+form) stops the build. Off (unset): the text is unchanged."""
 import os
 import re
 
@@ -29,6 +30,9 @@ def program(text):
     body = text[a:b]
     splits = list(SPLIT.finditer(body))
     lines_all = body.split("\n")
+    nsplit = sum(1 for l in lines_all if LAUNCH.match(l) and LAUNCH.match(l).group("k") in ("g_split_qgate", "g_split_qgate_lv"))
+    if nsplit != 2 * len(splits):   # its layer's store would share the next layer's segment while its split reads %qg
+        raise SystemExit(f"QG_SPLIT: {nsplit} split launches, {len(splits)} split blocks in the expected form (2 launches each)")
     readers = [l for l in lines_all if LAUNCH.match(l) and "%qg" in _operands(LAUNCH.match(l).group("args"))[:-1]]
     if any("g_split_qgate" not in l for l in readers):
         return text, 0, len(splits)   # another %qg reader: leave every layer as it is
@@ -67,10 +71,19 @@ def program(text):
         pos = m.end()
     body = "".join(out) + body[pos:]
     if n:
-        anchor = re.search(r"(?m)^  %huge = scalar\.andi [^\n]*\n", body)
-        assert anchor and re.search(r"(?m)^  %pf_big = ", body[:anchor.start()]), "QG_SPLIT: %pf_big / %huge not defined before use"
-        body = (body[:anchor.end()] + "  %qgs_ok = scalar.andi %pf_big, %huge : i1\n  %qgs_t = index.cmp eq, %c0, %c0 : index\n"
-                "  %qgs_f = index.cmp ne, %c0, %c0 : index\n  %qgs_run = scf.select %qgs_ok, %qgs_f, %qgs_t : i1\n" + body[anchor.end():])
+        # %qgs_ok: every PATH condition true (PATH's branches are all 'then'), defined after the last of them
+        conds = list(PATH)
+        defs = [re.search(rf"(?m)^  {c} = [^\n]*\n", body) for c in conds]
+        if not all(defs):
+            raise SystemExit(f"QG_SPLIT: {[c for c, d in zip(conds, defs) if not d]} not defined in @llm_advance")
+        at = max(d.end() for d in defs)
+        chain, acc = [], conds[0]
+        for i, c in enumerate(conds[1:], 1):
+            name = "%qgs_ok" if i == len(conds) - 1 else f"%qgs_ok{i}"
+            chain.append(f"  {name} = scalar.andi {acc}, {c} : i1\n")
+            acc = name
+        body = (body[:at] + "".join(chain) + "  %qgs_t = index.cmp eq, %c0, %c0 : index\n"
+                "  %qgs_f = index.cmp ne, %c0, %c0 : index\n  %qgs_run = scf.select %qgs_ok, %qgs_f, %qgs_t : i1\n" + body[at:])
     return text[:a] + body + text[b:], n, refused
 
 
