@@ -15,6 +15,7 @@ unchanged and is counted (fail closed); a split launch outside a block SPLIT mat
 form) stops the build. Off (unset): the text is unchanged."""
 import os
 import re
+import sys
 
 ON = os.environ.get("QG_SPLIT", "0").strip().lower() not in ("", "0", "false", "no", "off")
 PATH = {"%mm": "then", "%pf_big": "then", "%big": "then", "%huge": "then"}   # the epoch the split is skipped in
@@ -122,7 +123,7 @@ def apply(text, D):
         return text
     assert D % 128 == 0, "QG_SPLIT: a 128-column output tile must not straddle a head's query / gate halves"
     text, n, refused = program(text)
-    print(f"qg_split: layers {n} (refused {refused})")
+    print(f"qg_split: layers {n} (refused {refused})", file=sys.stderr)   # build.py discards gen_llm's stdout
     assert n, "QG_SPLIT: no layer converted"
     names = KDEF.findall(text)
     assert "g_gemm_f16_store_m256" in names, "QG_SPLIT: no g_gemm_f16_store_m256 kernel to copy"
