@@ -135,6 +135,13 @@ for a fraction of the next one's cost.
   distance) and list the kernels where that condition does not hold; a lever refuted on a latency-bound kernel can pay on an
   issue- or bandwidth-bound one (HRX-like E708: a fusion lost because it moved warm code into a cold kernel; E75: halving KV
   bytes did nothing on latency-bound attention).
+- **Look for a natural control in the served data before building a harness.** The server often already runs the
+  comparison you want: the same kernels at two token counts, two adjacent launches of one kernel, one kernel at two grids.
+  HRX-like E710: the single-token decode step reads the same 16.57 GB through the same 456 dispatches at 229 GB/s, so the
+  matvec lane's 6.7 ms/step gap over the floor is the 8-token cost, not bytes, grid or clock. E723: alpha and beta are the same
+  kernel back to back, so beta's 1.5 us discount bounds what warm code is worth there. A sweep candidate also states its bound
+  check (bytes / time against the ceiling) before its price: E724's combine read at 91 % of DRAM bandwidth, which cut a 0.4-0.55
+  ms/step price to 0.09-0.55.
 
 **Serving vs isolated gaps (E128-E141: fourteen experiments to find a cause the bench hid by construction).**
 - **Judge the gap against the binary serving runs, on serving-shaped inputs.** loom-serve compiles launch-site
@@ -167,6 +174,11 @@ Read a closed-licence engine for technique notes only, never derived code. Give 
 (ablation numbers, register/LDS budget) and ask for file:line evidence plus any measured numbers; spot-check the key
 claims yourself before relying on them. Record the table in the design note. Surveys have repeatedly found the decisive
 detail: exactness rules (E38), layout choices (8-bit KV), and what nobody has solved (E53).
+**Survey for consensus gaps, not only for the kernel at hand.** Once per model, list the structural choices every surveyed
+engine makes the same way and ours does not (how a matvec splits rows over waves, which projections share a launch, how a
+split-K combine batches its loads); each one is a lever candidate, priced and probed like any other (HRX-like E710: every
+engine with small-batch gains on gfx1151 gives a wave whole rows, ours splits K across waves; E723: vLLM, llama.cpp, Gufo and
+TensorFold all merge GDN's alpha and beta projections). Agreement is a reason to look, not a verdict.
 A comparative claim (theirs vs ours) is checked on both sides before it reaches the user: E188 relayed 'our GEMM moves ~40 %
 more bytes than Strata's' after checking only Strata's file; our generator's docstring had the same per-wave tile (E190).
 
