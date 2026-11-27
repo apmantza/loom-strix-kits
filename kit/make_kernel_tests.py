@@ -2531,6 +2531,59 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_acc_m256")' 
 {_XE}{_SE}{_QE}{_eq("hb", "h7", _T(f"{H}xf32"))}  check.return
 }}
 """)
+# 3a''''. 64-row wave skip in the 256-row f16 GEMMs (GEMM_WAVE_SKIP, kit/gemm_wave_skip.py; HRX-like E635 / shortpf O4): every served
+# gfx11 f16 m256 GEMM run twice on the same x / weights / inverse scales, once with every row live (scale column 0 = 1: no wave can
+# skip) and once with padding rows (column 0 = 0) laid out so each wave case occurs: tile 0 with its last wave all padding (a skip in
+# a non-last tile), tile 1 with wave 0 live, wave 1 33 live rows then padding (the served shape: a live prefix), wave 2 padding in its
+# first 40 rows and live in its last 24 (live rows only in the lanes' second load), wave 3 all padding. Padding rows' x is zero, so
+# both runs give the same bits on every row (padding rows 0 either way, acc: y + 0); a wave skipped while it holds a live row zeroes
+# that row. Equal at atol 0 (check.expect.equal). Recurrences: a skip predicate that reads the wrong rows or only the first 32 rows
+# of a wave (mutants in HRX-like q236), or a region rewrite that drops an MMA. Without the switch the case is a control (equal too).
+_WSK = [k for k in ("g_gemm_f16_store_m256", "g_gemm_f16_acc_m256", "g_gemm_f16_swiglu_m256_f16o") if f'export("{k}")' in (_pkg_llm_text() or "")]
+if os.environ.get("GEMM_TESTS", "1") == "1" and _WSK:
+    _rows, _K, _nu = 512, 1024, 256
+    _KP, _NP = _K + _PFPAD, _nu + _PFPAD
+    _live = np.ones(_rows, bool)
+    _live[192:256] = False; _live[353:384] = False; _live[384:424] = False; _live[448:512] = False
+    _xw = (rng.standard_normal((_rows, _K)) * 0.5).astype(np.float16); _xw[~_live] = 0
+    _inv = rng.uniform(0.5, 2.0, _rows).astype(np.float32)
+    save("wsk_x", pfpad(_xw)); save("wsk_sp", np.stack([_live.astype(np.float32), _inv], 1))   # padding rows: column 0 = 0
+    save("wsk_sl", np.stack([np.ones(_rows, np.float32), _inv], 1))   # every row live
+    _wb = lambda w: pfpad(w, np.float16(0)).reshape(-1).view(np.int8)   # the f16 weight scratch: rows at stride K + PAD
+    save("wsk_w", _wb((rng.standard_normal((_nu, _K)) * 0.05).astype(np.float16)))
+    save("wsk_u", _wb((rng.standard_normal((_nu, _K)) * 0.05).astype(np.float16)))
+    save("wsk_r", rng.standard_normal((_rows, _nu)).astype(np.float32))
+    _WB = _nu * _KP * 2
+    _XT, _ST, _WT = f"tensor<{_rows}x{_KP}xf16>", f"tensor<{_rows}x2xf32>", f"tensor<{_WB}xi8>"
+    for _k in _WSK:
+        if "swiglu" in _k:   # F16O11: f16 rows + row scales out
+            _YT = f"tensor<{_rows}x{_NP}xf16>"
+            _outs = (f"  %u = check.file.read.npy path(\"wsk_u.npy\") : {_WT}\n"
+                     f"  %ya = check.generate.fill value(0.0) : {_YT}\n  %yb = check.generate.fill value(0.0) : {_YT}\n"
+                     f"  %oa = check.generate.fill value(7.0) : {_ST}\n  %ob = check.generate.fill value(7.0) : {_ST}\n")
+            _ta = f"[index, index](index, index, index, {_XT}, {_ST}, {_WT}, {_WT}, {_YT}, {_ST})"
+            _la = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sp, %w, %u, %ya, %oa) : {_ta}\n"
+            _lb = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sl, %w, %u, %yb, %ob) : {_ta}\n"
+            _eq = f"  check.expect.equal actual(%ya) expected(%yb) : {_YT}\n  check.expect.equal actual(%oa) expected(%ob) : {_ST}\n"
+        else:   # store writes y; acc adds into y, which starts as residual rows
+            _YT = f"tensor<{_rows}x{_nu}xf32>"
+            _src = 'check.file.read.npy path("wsk_r.npy")' if "_acc_" in _k else "check.generate.fill value(0.0)"
+            _outs = f"  %ya = {_src} : {_YT}\n  %yb = {_src} : {_YT}\n"
+            _ta = f"[index, index](index, index, index, {_XT}, {_ST}, {_WT}, {_YT})"
+            _la = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sp, %w, %ya) : {_ta}\n"
+            _lb = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sl, %w, %yb) : {_ta}\n"
+            _eq = f"  check.expect.equal actual(%ya) expected(%yb) : {_YT}\n"
+        cases.append(f"""check.case public @wave_skip_{_k} {{
+  %rows = check.literal value({_rows}) : index
+  %k = check.literal value({_K}) : index
+  %n = check.literal value({_nu}) : index
+  %x = check.file.read.npy path("wsk_x.npy") : {_XT}
+  %sp = check.file.read.npy path("wsk_sp.npy") : {_ST}
+  %sl = check.file.read.npy path("wsk_sl.npy") : {_ST}
+  %w = check.file.read.npy path("wsk_w.npy") : {_WT}
+{_outs}{_la}{_lb}{_eq}  check.return
+}}
+""")
 # 3b'. the producers' fp8 twins (gen_mxfp4s.fuse_mxfp4s_f8; choice prefill.gemm.mxfp4s_f8, gfx12 only) against numpy's e4m3 rounding. The fp8 GEMM itself is tested by the
 # gemm_mxfp4s kbench suite (loom-test cases on synthetic split planes).
 def e4m3_round(x):
