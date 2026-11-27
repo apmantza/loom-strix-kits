@@ -124,6 +124,13 @@ for a fraction of the next one's cost.
   verdict: dig until the mechanism is shown (a counter, an ablation, the disassembly line that waits), then decide. An
   experiment may wait for GPU time, but its log entry names the open question and the next probe, and it is
   investigated before the lane moves on.
+- **A win is a pattern: sweep for its siblings before the next lever.** When a change is kept (or a diagnosis names what bounds
+  a kernel), name its shape in one line and list every other served kernel or site it could apply to, each priced from the served
+  profile (ms per step or per request) with the precondition it needs, before picking the next lever. Shapes seen: compute only
+  the rows a consumer reads (HRX-like E697: the last attention layer on the head's rows, -3.9 s per 81k; the rest of that layer is
+  the next sibling); skip work on padding rows (E684); fold a layout-only kernel into its producer's store (E695); cut issue in an
+  issue-bound kernel (E689). The sweep records what was searched and what was found clean; a sibling inherits the original's
+  exactness and grid conditions as hypotheses to re-check, not as facts (HRX-like E691: a fusion that shrank the grid lost 23 %).
 
 **Serving vs isolated gaps (E128-E141: fourteen experiments to find a cause the bench hid by construction).**
 - **Judge the gap against the binary serving runs, on serving-shaped inputs.** loom-serve compiles launch-site
