@@ -10,7 +10,10 @@ work list (the flash tiles holding a selected span's last token) instead of the 
   attention layer's flash kernels only known statement forms pass (keeps-review 11-27: a buffer.copy of the attention output into
   %features and a func.call passed the old launch-name list); a launch of a kernel not known row-local (a DFlash tap, a drafter
   feature write), a template.apply, a buffer.copy, a func.call, a layer after the last attention layer, a third list reader and a
-  second work-list prologue stop the rewrite; so does a second application (its layer then has no reader of the full list).
+  second work-list prologue stop the rewrite; so does a second application (its layer then has no reader of the full list);
+- LAST_ROWS's masks (kit/last_rows.py runs this gate on its output): g_scale_head_rows on a row scale passes; the same launch on
+  %features (its only command argument is %metadata), a g_scale_ kernel of another name and another row-local kernel writing
+  %metadata stop (an admission widened for a new kernel admits a writer of a command argument, or the new kernel's siblings).
 usage: python3 test_last_q.py (exit 1 on a failure)."""
 import os, re, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -104,6 +107,14 @@ with tempfile.TemporaryDirectory() as d:
     part = re.search(r"(?m)^ *kernel\.launch @g_attention_flash2_partial_f16o\[[^\n]*%layer_63,[^\n]*\n", gen).group(0)
     tap = part + "  kernel.launch @g_dfl_tap[%t](%t, %tap_slot_4, %x, %features) : [index](index, index, buffer, buffer)\n"
     head = "\n  %head = command.parameter"
+    MASK = ("  scf.if %mm {{\n    kernel.launch @{}[%tp](%tp, %t, %spans, %metadata, %info, {}) : [index](index, index, index, buffer, "
+            "buffer, buffer)\n  }}\n")   # last_rows.MASK's form
+    try:
+        last_q.apply(gen.replace(head, "\n" + MASK.format("g_scale_head_rows", "%s_f") + head[1:], 1))
+        mask_ok = ""
+    except SystemExit as e:
+        mask_ok = str(e)
+    check("unit: LAST_ROWS's mask (g_scale_head_rows on a row scale, %metadata) after the last flash launch passes", not mask_ok, mask_ok)
     fl = re.search(r"(?m)^( *)kernel\.launch @g_attention_flash2_f16o\[[^\n]*%layer_63,[^\n]*\n", gen)
     part_m = re.search(r"(?m)^( *)kernel\.launch @g_attention_flash2_partial_f16o\[[^\n]*%layer_63,[^\n]*\n", gen)
     Q = "  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, {}) : [index, index](index, index, buffer, buffer)\n"
@@ -142,6 +153,10 @@ with tempfile.TemporaryDirectory() as d:
                       ("a second work-list prologue", gen.replace("  // ---- layer 0", prologue + "  // ---- layer 0", 1)),
                       ("a layer after the last attention layer", gen.replace("\n  %head = command.parameter", "\n  // ---- layer 64 (gated delta-net)\n  %head = command.parameter", 1)),
                       ("a third list reader", gen.replace(part, part + part.replace("g_attention_flash2_partial_f16o", "g_attention_flash2_deep_f16o"), 1)),
+                      # LAST_ROWS rebase (static-1127/lastrows/rebase): the masks' admission is the exact name with %metadata only
+                      ("LAST_ROWS's mask written to %features", gen.replace(head, "\n" + MASK.format("g_scale_head_rows", "%features") + head[1:], 1)),
+                      ("a g_scale_ kernel other than LAST_ROWS's mask", gen.replace(head, "\n  kernel.launch @g_scale_rows_all[%tp](%tp, %t, %spans, %info, %s_f) : [index](index, index, index, buffer, buffer)" + head, 1)),
+                      ("a row-local kernel other than the mask writing %metadata", gen.replace(head, "\n" + Q.format("%metadata") + head[1:], 1)),
                       ("a second application", t_ok)):
         if odd == gen:
             check(f"unit: {what}: the case changes the program", False, "replace matched nothing")

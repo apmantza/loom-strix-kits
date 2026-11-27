@@ -12,7 +12,10 @@ case prevents:
   the unset program back byte for byte (a rewrite that touched the verify program or another launch would not invert);
 - fail closed (rules section 4): an unknown launch after g_qk_rope_store (a DFlash tap), a K block reading the q projection, a
   statement between V and g_qk_rope_store, a %s_h reader between the attention and the FFN norm, a q GEMM on another scale buffer,
-  and a half-converted layer stop the rewrite; a second application returns the text unchanged (idempotent).
+  and a half-converted layer stop the rewrite; a second application returns the text unchanged (idempotent);
+- the pass runs LAST_Q's post-flash gate on its own output (gen_llm applies LAST_Q first, so LAST_Q's gate never sees the masks,
+  and without LAST_Q no gate runs; this pass's own check reads launch names only): LAST_ROWS alone stops on a GEMM writing
+  %features after the flash (keeps-review 11-27 / E722: an admitted kernel name writing a command argument passed a name list).
 usage: python3 test_last_rows.py (exit 1 on a failure)."""
 import os, re, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -109,6 +112,7 @@ def unit(base_gen):
             ("a DFlash tap after the down GEMM", sub(base_gen, down, down + "  kernel.launch @g_dfl_tap[%t](%t, %tap_slot_4, %x, %features) : [index](index, index, buffer, buffer)\n")),
             ("a K GEMM reading the q projection", sub(base_gen, kline, kline.replace("%h16, %s_h,", "%q, %s_h,"))),
             ("a statement between V and g_qk_rope_store", sub(base_gen, rope, "  %lr_probe = index.constant 0 : index\n" + rope)),
+            ("LAST_ROWS alone: a GEMM writing %features after the flash", sub(base_gen, down, down + "  kernel.launch @g_gemm_f16_store_m256[%tp, %nH](%tp, %nQ, %nH, %o16, %s_o, %h16, %features) : [index, index](index, index, index, buffer, buffer, buffer, buffer)\n")),
             ("a %s_h reader between the attention and the FFN norm", sub(base_gen, rope, rope + "  kernel.launch @g_row_scale_f16_live_lv[%t](%t, %info, %nH, %h, %s_h, %h16) : [index](index, buffer, index, buffer, buffer, buffer)\n")),
             ("the q GEMM on another scale buffer", q_on_o),
             ("a half-converted layer (one mask removed)", t_ok.replace(one_mask, "", 1)),

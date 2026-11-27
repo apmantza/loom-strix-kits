@@ -228,4 +228,11 @@ def apply(text):
     nb = block[:st[0][0]] + "".join(out)
     if len(nb) != len(block) + 4 * len(MASK.format(s="%s_h")):
         die("internal: the rewritten layer is not the old one plus four masks")
-    return text[:b0] + nb + text[b1:] + "\n" + KERNEL, L
+    # LAST_Q's post-flash gate on this pass's output (it runs before the masks exist when LAST_Q is set, and not at all when it is
+    # unset): statement forms, row-local launches with their command arguments (the masks: ROW_LOCAL + ARGS_OK), names defined once
+    flash = [m for m in re.finditer(r"(?m)^ *kernel\.launch @(\w+)\[[^\n]*\n", nb) if last_q.LIST_READERS[1].fullmatch(m.group(1))]
+    if len(flash) != 1:
+        die(f"layer {L}: {len(flash)} partial flash launches (expected 1)")
+    out = text[:b0] + nb + text[b1:]
+    last_q.gate(out[s0:s1 + len(nb) - len(block)], nb[flash[0].end():] + tail, L, "LAST_ROWS")
+    return out + "\n" + KERNEL, L
