@@ -2567,6 +2567,87 @@ if os.environ.get("GEMM_TESTS", "1") == "1" and 'export("g_gemm_f16_store_m256_q
   check.return
 }}
 """)
+# 3a''''. 64-row wave skip in the 256-row f16 GEMMs (GEMM_WAVE_SKIP, kit/gemm_wave_skip.py; HRX-like E635 / shortpf O4): every served
+# gfx11 f16 m256 GEMM run twice on the same x / weights / inverse scales, once with padding rows (scale column 0 = 0, run A) and once
+# with every row live (column 0 = 1, run B: no wave can skip). Padding rows are laid out so each wave case occurs: tile 0 with wave 0
+# and wave 3 all padding and waves 1-2 live (a skip in a non-last tile; a wave 0 that skips while later waves compute), tile 1 with
+# wave 0 live, wave 1 33 live rows then padding (the served shape: a live prefix), wave 2 padding in its first 40 rows and live in its
+# last 24 (live rows only in the lanes' second load), wave 3 all padding; tile 2 with wave 0 one live row (its row 0), wave 1 a 31-row
+# prefix, wave 2 one live row at its row 63 (the last row of the lanes' second load), wave 3 padding; tile 3 all padding beside it
+# (the tile skip). Padding rows' x is zero. Faults each pattern exists for (HRX-like E690, DIAG.md round-4 table): a predicate that
+# reads rows 32-63 only (tile 2 waves 0-1), rows 0-47 / lanes 0-15 / rows 0-62 (tile 2 wave 2).
+# Expectations (HRX-like E675 / E678: their state table is static-1127/wsk-fail/DIAG.md):
+#   0: run A's y against a float64 numpy reference (3a's form and tolerance): the independent check; it reds every predicate fault
+#      that zeroes a live row in run A, including those that hit both runs alike (inverted, always-skip: q246's pkg-wskm2 passed a
+#      pairwise-only case, both runs zero);
+#   1: run A == run B bit for bit: the pass's exactness claim (live waves run the same ops in the same order), below 0's tolerance;
+#   swiglu _f16o 2 / 3: its second output (F16O11, kit/f16o11.py: each row's flag, 1 live / 0 padding, both columns) depends on the
+#      scales alone, so each run's flags are checked against their own expectation (A: wsk_fa from column 0; B: 1), never against
+#      each other (q236: that pairwise check failed at row 192 on every package).
+# Recurrences: a skip predicate that reads the wrong rows, only the first 32 rows of a wave, wave 0's rows for the whole tile, or is
+# inverted, or reads rows 32-63 only (mutants pkg-wskm1 / 3 / 2 / 4, HRX-like q246, each red at named expectations), or a region
+# rewrite that drops an MMA.
+# Without the switch the case is a control (every expectation holds: q246 ran it on pkg-e480).
+_WSK = [k for k in ("g_gemm_f16_store_m256", "g_gemm_f16_acc_m256", "g_gemm_f16_swiglu_m256_f16o") if f'export("{k}")' in (_pkg_llm_text() or "")]
+if os.environ.get("GEMM_TESTS", "1") == "1" and _WSK:
+    _wrng = np.random.default_rng(653)   # own stream (E653): this case's shape changes no other case's inputs
+    _rows, _K, _nu = 1024, 1024, 256
+    _KP, _NP = _K + _PFPAD, _nu + _PFPAD
+    _live = np.ones(_rows, bool)
+    _live[0:64] = False; _live[192:256] = False; _live[353:384] = False; _live[384:424] = False; _live[448:512] = False
+    _live[512:] = False; _live[512] = True; _live[576:607] = True; _live[703] = True   # tile 2 (512-767); tile 3 all padding
+    _xw = (_wrng.standard_normal((_rows, _K)) * 0.5).astype(np.float16); _xw[~_live] = 0
+    _inv = _wrng.uniform(0.5, 2.0, _rows).astype(np.float32)
+    save("wsk_x", pfpad(_xw)); save("wsk_sp", np.stack([_live.astype(np.float32), _inv], 1))   # padding rows: column 0 = 0
+    save("wsk_sl", np.stack([np.ones(_rows, np.float32), _inv], 1))   # every row live
+    save("wsk_fa", np.repeat(_live.astype(np.float32)[:, None], 2, 1))   # F16O11 flags of the padded run (both columns)
+    _wb = lambda w: pfpad(w, np.float16(0)).reshape(-1).view(np.int8)   # the f16 weight scratch: rows at stride K + PAD
+    _ww = (_wrng.standard_normal((_nu, _K)) * 0.05).astype(np.float16); _wu = (_wrng.standard_normal((_nu, _K)) * 0.05).astype(np.float16)
+    _rr = _wrng.standard_normal((_rows, _nu)).astype(np.float32)
+    save("wsk_w", _wb(_ww)); save("wsk_u", _wb(_wu)); save("wsk_r", _rr)
+    # the independent reference of run A (padding rows: x = 0, so 0 / r there, as the kernel must leave them)
+    _gw = (_xw.astype(np.float64) @ _ww.astype(np.float64).T) * _inv[:, None]
+    _sw = ffn_act(_gw) * ((_xw.astype(np.float64) @ _wu.astype(np.float64).T) * _inv[:, None])
+    save("wsk_e_store", _gw.astype(np.float32)); save("wsk_e_acc", (_rr.astype(np.float64) + _gw).astype(np.float32))
+    save("wsk_e_swiglu", np.pad(_sw, ((0, 0), (0, _NP - _nu))).astype(np.float16))   # the padded stride's columns stay 0
+    _wtol = {"store": 3.0e-2 * float(np.abs(_gw[_live]).std() + 1e-6), "acc": 3.0e-2 * float(np.abs(_gw[_live]).std() + 1e-6),
+             "swiglu": 3.0e-2 * float(np.abs(_sw[_live]).std() + 1e-6)}
+    _WB = _nu * _KP * 2
+    _XT, _ST, _WT = f"tensor<{_rows}x{_KP}xf16>", f"tensor<{_rows}x2xf32>", f"tensor<{_WB}xi8>"
+    for _k in _WSK:
+        _m = _k.split("_")[3]   # store / acc / swiglu
+        if "swiglu" in _k:   # F16O11: f16 rows + row scales out
+            _YT = f"tensor<{_rows}x{_NP}xf16>"
+            _outs = (f"  %u = check.file.read.npy path(\"wsk_u.npy\") : {_WT}\n"
+                     f"  %ya = check.generate.fill value(0.0) : {_YT}\n  %yb = check.generate.fill value(0.0) : {_YT}\n"
+                     f"  %oa = check.generate.fill value(7.0) : {_ST}\n  %ob = check.generate.fill value(7.0) : {_ST}\n"
+                     f"  %fa = check.file.read.npy path(\"wsk_fa.npy\") : {_ST}\n  %fb = check.generate.fill value(1.0) : {_ST}\n")
+            _ta = f"[index, index](index, index, index, {_XT}, {_ST}, {_WT}, {_WT}, {_YT}, {_ST})"
+            _la = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sp, %w, %u, %ya, %oa) : {_ta}\n"
+            _lb = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sl, %w, %u, %yb, %ob) : {_ta}\n"
+            _eq = (f"  check.expect.equal actual(%oa) expected(%fa) : {_ST}\n  check.expect.equal actual(%ob) expected(%fb) : {_ST}\n")
+        else:   # store writes y; acc adds into y, which starts as residual rows
+            _YT = f"tensor<{_rows}x{_nu}xf32>"
+            _src = 'check.file.read.npy path("wsk_r.npy")' if "_acc_" in _k else "check.generate.fill value(0.0)"
+            _outs = f"  %ya = {_src} : {_YT}\n  %yb = {_src} : {_YT}\n"
+            _ta = f"[index, index](index, index, index, {_XT}, {_ST}, {_WT}, {_YT})"
+            _la = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sp, %w, %ya) : {_ta}\n"
+            _lb = f"  kernel.launch @{_k}[%rows, %n](%rows, %k, %n, %x, %sl, %w, %yb) : {_ta}\n"
+            _eq = ""
+        cases.append(f"""check.case public @wave_skip_{_k} {{
+  %rows = check.literal value({_rows}) : index
+  %k = check.literal value({_K}) : index
+  %n = check.literal value({_nu}) : index
+  %x = check.file.read.npy path("wsk_x.npy") : {_XT}
+  %sp = check.file.read.npy path("wsk_sp.npy") : {_ST}
+  %sl = check.file.read.npy path("wsk_sl.npy") : {_ST}
+  %w = check.file.read.npy path("wsk_w.npy") : {_WT}
+  %e = check.file.read.npy path("wsk_e_{_m}.npy") : {_YT}
+{_outs}{_la}{_lb}  check.expect.close actual(%ya) expected(%e) atol({_wtol[_m]:.3e}) rtol(1.0e-2) nan(different) : {_YT}
+  check.expect.equal actual(%ya) expected(%yb) : {_YT}
+{_eq}  check.return
+}}
+""")
 # 3b'. the producers' fp8 twins (gen_mxfp4s.fuse_mxfp4s_f8; choice prefill.gemm.mxfp4s_f8, gfx12 only) against numpy's e4m3 rounding. The fp8 GEMM itself is tested by the
 # gemm_mxfp4s kbench suite (loom-test cases on synthetic split planes).
 def e4m3_round(x):

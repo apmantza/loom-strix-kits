@@ -6486,6 +6486,10 @@ if __name__ == "__main__":
         import gemm_flataddr
         text, _done = gemm_flataddr.apply(text)
         print("GEMM256_FLATADDR:", ", ".join(_done), file=sys.stderr)
+    if os.environ.get("GEMM_WAVE_SKIP", "0") not in ("", "0", "false", "no", "off"):   # kit/gemm_wave_skip.py (HRX-like E635, shortpf O4): after FLATADDR
+        import gemm_wave_skip
+        text, _done = gemm_wave_skip.apply(text)
+        print("GEMM_WAVE_SKIP:", ", ".join(_done), file=sys.stderr)
     if MV_SCHED:   # the build log names the policy and its reach (a reader of the .log sees it was applied)
         _n = sum(1 for _b in re.split(r"(?m)^(?=kernel\.def )", text) if _b.startswith("kernel.def") and MV_SCHED_POL + " {" in _b)
         print(f"MV_SCHED={MV_SCHED_D}:{MV_SCHED_U}: pipeline({MV_SCHED_D}) unroll({MV_SCHED_U}) schedule(recurrence) on {_n} kernels "
