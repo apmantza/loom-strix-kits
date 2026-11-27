@@ -131,6 +131,10 @@ for a fraction of the next one's cost.
   the next sibling); skip work on padding rows (E684); fold a layout-only kernel into its producer's store (E695); cut issue in an
   issue-bound kernel (E689). The sweep records what was searched and what was found clean; a sibling inherits the original's
   exactness and grid conditions as hypotheses to re-check, not as facts (HRX-like E691: a fusion that shrank the grid lost 23 %).
+  A loss is a pattern too: once its mechanism is shown, name the condition it lost under (the bound, the shape, the reuse
+  distance) and list the kernels where that condition does not hold; a lever refuted on a latency-bound kernel can pay on an
+  issue- or bandwidth-bound one (HRX-like E708: a fusion lost because it moved warm code into a cold kernel; E75: halving KV
+  bytes did nothing on latency-bound attention).
 
 **Serving vs isolated gaps (E128-E141: fourteen experiments to find a cause the bench hid by construction).**
 - **Judge the gap against the binary serving runs, on serving-shaped inputs.** loom-serve compiles launch-site
