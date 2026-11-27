@@ -25,13 +25,19 @@ lsk_pkg() {   # PKG (absolute, or relative to WORK) -> absolute dir with a model
   local p; p=$(realpath -m "$1"); [ -f "$p/model.json" ] || die "no $p/model.json"; echo "$p"
 }
 
-lsk_served() {   # the model.json the process on $PORT serves (its --model resolved against its cwd); exit 1 if none
-  local pid m
+lsk_served() {   # the package the process on $PORT serves, as DIR/model.json; exit 1 and print nothing if none or unresolvable
+  # The one identity rule (HRX-like E687): its --model's directory, taken against its cwd and resolved as lsk_pkg resolves a package,
+  # with the leaf kept. loom-serve resolves a card's relative paths against the --model path's own directory (hrx-system v0.2.0
+  # serve/server/configuration.c:958), so a model.json that links into another package still serves this one; following the leaf
+  # named pkg-e480 for pkg-gdnnoo (E685). Fails closed: no --model=, a cwd or directory that does not resolve, or no file at the leaf.
+  local pid m d
   pid=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
   [ -n "$pid" ] || return 1
   m=$(tr '\0' '\n' < /proc/$pid/cmdline | sed -n 's/^--model=//p')
   [ -n "$m" ] || return 1
-  (cd /proc/$pid/cwd && realpath "$m")
+  d=$(cd "/proc/$pid/cwd" 2>/dev/null && realpath -- "$(dirname -- "$m")" 2>/dev/null)
+  [ -f "$d/$(basename -- "$m")" ] || return 1   # the one fail-closed test: an unresolved cwd or directory (d empty or missing) fails here too
+  echo "$d/$(basename -- "$m")"
 }
 
 lsk_up() {   # [SECONDS]: wait until $PORT answers /v1/models (default 60 s)
