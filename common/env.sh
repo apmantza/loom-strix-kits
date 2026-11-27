@@ -25,17 +25,24 @@ lsk_pkg() {   # PKG (absolute, or relative to WORK) -> absolute dir with a model
   local p; p=$(realpath -m "$1"); [ -f "$p/model.json" ] || die "no $p/model.json"; echo "$p"
 }
 
-lsk_served() {   # the model.json the process on $PORT serves (its --model resolved against its cwd); exit 1 if none
-  local pid m
+lsk_served() {   # the package the process on $PORT serves, as DIR/model.json; exit 1 and print nothing if none or unresolvable
+  # The one identity rule (HRX-like E687): its --model's directory, taken against its cwd and resolved as lsk_pkg resolves a package,
+  # with the leaf kept. loom-serve resolves a card's relative paths against the --model path's own directory (hrx-system v0.2.0
+  # serve/server/configuration.c:958), so a model.json that links into another package still serves this one; following the leaf
+  # named pkg-e480 for pkg-gdnnoo (E685). Fails closed: no --model=, a cwd or directory that does not resolve, or no file at the leaf.
+  local pid m d
   pid=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
   [ -n "$pid" ] || return 1
   m=$(tr '\0' '\n' < /proc/$pid/cmdline | sed -n 's/^--model=//p')
   [ -n "$m" ] || return 1
-  (cd /proc/$pid/cwd && realpath "$m")
+  d=$(cd "/proc/$pid/cwd" 2>/dev/null && realpath -- "$(dirname -- "$m")" 2>/dev/null)
+  [ -f "$d/$(basename -- "$m")" ] || return 1   # the one fail-closed test: an unresolved cwd or directory (d empty or missing) fails here too
+  echo "$d/$(basename -- "$m")"
 }
 
-lsk_up() {   # wait until $PORT answers /v1/models (60 s)
-  local i; for i in $(seq 1 30); do curl -s -m 5 127.0.0.1:$PORT/v1/models | grep -q '"object":"list"' && return 0; sleep 2; done; return 1
+lsk_up() {   # [SECONDS]: wait until $PORT answers /v1/models (default 60 s)
+  local t=$((SECONDS + ${1:-60}))
+  while :; do curl -s -m 5 127.0.0.1:$PORT/v1/models | grep -q '"object":"list"' && return 0; [ $SECONDS -lt $t ] || return 1; sleep 2; done
 }
 
 lsk_measuring() {   # a measurement server of ours is alive (its pid file in $STATE)
@@ -43,20 +50,34 @@ lsk_measuring() {   # a measurement server of ours is alive (its pid file in $ST
 }
 
 lsk_stop() {   # stop our servers (pid files), then any managed server (LSK_STOP_HOOK), and wait for the port
-  local f i
+  local f i p c want
   # LSK_GUARD (machine env, optional): a command that must succeed before anything is stopped. The stop hook alone fenced only the
   # managed server: a refused hook still came after the pid-file kills, and a dry run killed another run's profiling servers (E438).
   if [ -n "${LSK_GUARD:-}" ] && ! eval "$LSK_GUARD" >/dev/null; then echo "lsk_stop: LSK_GUARD refused; nothing stopped" >&2; return 1; fi
-  for f in "$STATE"/*.pid; do [ -f "$f" ] || continue; kill "$(cat "$f")" 2>/dev/null; rm -f "$f"; done
+  # a pid file names a server only while that pid's command line runs our server program ($LOOM_SERVE's name, the check loom-skills
+  # stop.sh makes); a stale file's reused pid is reported and left (11-27 review G: a stale state/*.pid killed an unrelated process)
+  want=$(basename "${LOOM_SERVE:-loom-serve}")
+  for f in "$STATE"/*.pid; do
+    [ -f "$f" ] || continue; p=$(cat "$f"); { c=$(tr '\0' ' ' < "/proc/$p/cmdline"); } 2>/dev/null
+    if [ -n "$c" ] && [[ "$c" == *"$want"* ]]; then kill "$p" 2>/dev/null
+    elif [ -n "$c" ]; then echo "lsk_stop: $f names pid $p ($(cat /proc/$p/comm 2>/dev/null)), not a $want: stale, left running" >&2; fi
+    rm -f "$f"
+  done
   [ -n "${LSK_STOP_HOOK:-}" ] && eval "$LSK_STOP_HOOK" >/dev/null 2>&1
   for i in $(seq 1 60); do ss -ltn | grep -q ":$PORT " || return 0; sleep 1; done
-  echo "port $PORT still busy" >&2; return 1
+  echo "lsk_stop: port $PORT still busy" >&2; return 1
 }
 
 lsk_restore() {   # hand the port back: stop ours, then LSK_RESTORE_HOOK (e.g. restart a managed live server); no hook = leave it free
-  lsk_stop || return 1
+  # exit 0 only when the port answers within LSK_RESTORE_WAIT s (default 300) after the hook; every failure prints one line
+  # 'LIVE NOT RESTORED: <reason>' on stderr. Callers print their own success line only on exit 0 (`lsk_restore && echo restored`).
+  local e w=${LSK_RESTORE_WAIT:-300} log=$STATE/restore_hook.log
+  e=$(lsk_stop 2>&1 >/dev/null) || { echo "LIVE NOT RESTORED: the stop before it failed: $(echo "${e:-lsk_stop exit 1}" | grep -v '^ *$' | paste -sd'|' | cut -c1-400)" >&2; return 1; }
+  [ -z "$e" ] || echo "$e" >&2   # a successful stop's notes (a stale pid file left running)
   [ -n "${LSK_RESTORE_HOOK:-}" ] || return 0
-  eval "$LSK_RESTORE_HOOK" >/dev/null 2>&1; lsk_up || { echo "restore hook ran, nothing answers on $PORT" >&2; return 1; }
+  eval "$LSK_RESTORE_HOOK" > "$log" 2>&1; e=$?
+  [ $e -eq 0 ] || { echo "LIVE NOT RESTORED: restore hook exit $e: $(grep -v '^ *$' "$log" | tail -1 | cut -c1-300)" >&2; return 1; }
+  lsk_up "$w" || { echo "LIVE NOT RESTORED: nothing answers on $PORT $w s after the restore hook (its output: $(grep -v '^ *$' "$log" | tail -1 | cut -c1-300))" >&2; return 1; }
 }
 
 lsk_serve_bg() {   # NAME PKG [extra loom-serve args]: serve PKG in the background with the kit's flags; pid in $STATE/NAME.pid

@@ -16,6 +16,7 @@ no row the head reads. The listed split-K fallback (runs shorter than 9 tokens: 
 are written by g_qk_rope_store before, for every token, as before.
 
 Unset: the program is unchanged (the pass is not called)."""
+import collections
 import re
 import sys
 
@@ -196,7 +197,7 @@ func.def inline @g_block_holds_output(%metadata: buffer, %spans: index, %info: b
 
 # Kernels that may run after the last attention layer's flash launches: each is row-local (a token's output row depends only on
 # that token's input rows, or on per-span head rows), so stale attention rows of the tiles left out reach no row the head reads.
-# Anything else (a DFlash tap, a drafter's feature write, a later layer) stops the build: fail closed (rules section 4).
+# Any other kernel (a DFlash tap, a drafter's feature write, a later layer) stops the build: fail closed (rules section 4).
 ROW_LOCAL = re.compile(r"g16_attention_split_listed|g16_attention_combine_listed(_f16o)?|g_attention_split|g_attention_vsplit"
                        r"|g_attention_combine|g_attention_flash2(_partial)?|g_row_scale_f16(_live_lv)?|g_quant_q8|g_deq16_\w+"
                        r"|g_gemm_\w+|g_mv_\w+|g_add_norm_rs_live(_noh)?_lv|g_post_add_norm(_rs_live(_noh)?_lv|_lv)?"
@@ -210,6 +211,45 @@ ALLOC = "  %flash_tiles = buffer.alloca<global> align(256) %list_size : buffer\n
 CROP = ("    kernel.launch @g_flash_tiles_out[%t](%t, %spans, %metadata, %info, %flash_tiles, %flash_tiles_out) : "
         "[index](index, index, buffer, buffer, buffer, buffer)\n")
 LAUNCH = re.compile(r"(?m)^ *kernel\.launch @(\w+)\[")
+# Every other statement after those launches must be one of these forms, each one the served program uses there (keeps-review
+# 11-27: the launch-name list let a buffer.copy into %features and a func.call through). None of them writes memory: values
+# (index), control (scf.if, its braces), a new buffer or a view of one (a write happens only through an admitted launch), the
+# head's weights, config reads and declarations, the return. Anything else (template.apply, buffer.copy, func.call, scf.for, ...)
+# stops the build.
+AFTER_OK = re.compile(r"|//[^\n]*|\}|\} else \{|scf\.if %\w+ \{|command\.return|config\.decl @[^\n]*"
+                      r"|%\w+ = (?:index\.(?:constant|cmp|scale)|buffer\.alloca<global>|buffer\.view|command\.parameter|config\.get) [^\n]*")
+LAUNCH_LINE = re.compile(r"kernel\.launch @(\w+)\[[^\n]*")
+LAUNCH_SIG = re.compile(r"kernel\.launch @(\w+)\[[^\]]*\]\((.*)\) : (?:\[[^\]]*\])?\((.*)\)")
+SCALAR = re.compile(r"index|[if]\d+")
+DEF = re.compile(r"(?m)^ *(%\w+) = ([\w.]+)(?:<[^>\n]*>)?(?: (%\w+))?")
+# The command arguments of @llm_advance a launch after those flash launches may take, per kernel (keeps-review r1 arg_census.txt,
+# E722: the served program's only uses). Any other use of a command argument there stops the build: a row-local kernel writing
+# %features, %arena or %outputs would carry the cropped tiles' stale rows out of the program. Every other buffer operand must be
+# an allocation of the program, a weight (command.parameter of %weights) or a view of an allocation.
+ARGS_OK = ((re.compile(r"g16_attention_split_listed|g_attention_split|g_attention_vsplit"), {"%arena", "%origins"}),
+           (re.compile(r"g_head_mv(_t\d+)?(_q8)?"), {"%metadata"}),
+           (re.compile(r"g_head_select|g_logits_export"), {"%metadata", "%outputs"}))
+
+
+def _launch_ok(s, cargs, defs):
+    """a ROW_LOCAL launch whose command arguments are its ARGS_OK entry and whose other buffers are local (see ARGS_OK)"""
+    m = LAUNCH_SIG.fullmatch(s)
+    if not m or not ROW_LOCAL.fullmatch(m.group(1)):
+        return False
+    ops, tys = [x.strip() for x in m.group(2).split(",")], [x.strip() for x in m.group(3).split(",")]
+    if len(ops) != len(tys):
+        return False
+    allowed = set().union(*[a for r, a in ARGS_OK if r.fullmatch(m.group(1))])
+    for o, t in zip(ops, tys):
+        if o in cargs:
+            if o not in allowed:
+                return False
+        elif not SCALAR.fullmatch(t):
+            op, src = defs.get(o, (None, None))
+            if not (op == "buffer.alloca" or (op == "command.parameter" and src == "%weights")
+                    or (op == "buffer.view" and defs.get(src, (None,))[0] == "buffer.alloca")):
+                return False
+    return True
 MARK = re.compile(r"(?m)^  // ---- layer (\d+)[^\n]*$")
 
 
@@ -242,9 +282,28 @@ def apply(text):
     if len(names) != 2 or None in names or not all(r.fullmatch(n) for r, n in zip(LIST_READERS, names)):
         die(f"layer {layer}: the flash list readers are {names}, expected g_attention_flash2[_f16o] then its partial kernel")
     after = block[block.index(readers[-1]) + len(readers[-1]):] + seg[b1:]
-    other = sorted({k for k in LAUNCH.findall(after) if not ROW_LOCAL.fullmatch(k)})
-    if other or re.search(r"(?m)^ *template\.apply", after):
-        die(f"kernels after layer {layer}'s flash launches that are not known row-local: {other or 'template.apply'}")
+    cargs = set(re.findall(r"(%\w+): buffer", seg.split("\n", 1)[0]))
+    defs = {}
+    for d in DEF.finditer(seg):
+        defs.setdefault(d.group(1), (d.group(2), d.group(3)))
+    # each name defined once in @llm_advance, so an operand's definition is the one read above (keeps-review r2, E726: a nested scope
+    # may shadow a name; the served program defines each of its names once)
+    names = collections.Counter(n for d in re.finditer(r"(?m)^ *(%\w+(?:, *%\w+)*) = ", seg) for n in re.split(r", *", d.group(1)))
+    twice = sorted(n for n, k in names.items() if k > 1)
+    if twice:
+        die(f"@llm_advance defines {len(twice)} names more than once: {twice[:4]}")
+    other = []
+    for ln in after.splitlines():
+        s = ln.strip()
+        if LAUNCH_LINE.fullmatch(s):
+            ok = _launch_ok(s, cargs, defs)
+        else:
+            used = set(re.findall(r"%\w+", s)) & cargs if not s.startswith("//") else set()
+            ok = AFTER_OK.fullmatch(s) and (not used or (used == {"%weights"} and s.split(" = ", 1)[-1].startswith("command.parameter %weights,")))
+        if not ok:
+            other.append(s[:100])
+    if other:
+        die(f"after layer {layer}'s flash launches: {len(other)} statements not known row-local or memory-free: {other[:4]}")
     if seg.count(PROLOGUE) != 1 or seg.count(ALLOC) != 1:
         die(f"@llm_advance has {seg.count(PROLOGUE)} work-list launches and {seg.count(ALLOC)} list allocations (expected 1, 1)")
     for ln in readers:

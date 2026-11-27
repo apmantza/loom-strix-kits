@@ -6470,6 +6470,8 @@ if __name__ == "__main__":
         return subprocess.run([sys.executable, os.path.join(here, "gen_gemm.py")], capture_output=True, text=True, check=True, env=_env).stdout
     assert not (epi_fuse.ON and (POST_NORM or MOE)), "EPI_FUSE: the x-only norm assumes no post-norm and no MoE"
     text = epi_fuse.apply(text, _acc_m256)
+    import qg_split   # QG_SPLIT=1 (HRX-like static-1127/upsw): q / gate stored from the q GEMM's f16 m256 epilogue; unset: unchanged
+    text = qg_split.apply(text, D)
     text = pf16_pad.apply(text)   # PF16_PAD (HRX-like E167); unset: unchanged
     if KV8:
         text = kv8_readers(text)
@@ -6484,6 +6486,10 @@ if __name__ == "__main__":
         import gemm_flataddr
         text, _done = gemm_flataddr.apply(text)
         print("GEMM256_FLATADDR:", ", ".join(_done), file=sys.stderr)
+    if os.environ.get("GEMM_WAVE_SKIP", "0") not in ("", "0", "false", "no", "off"):   # kit/gemm_wave_skip.py (HRX-like E635, shortpf O4): after FLATADDR
+        import gemm_wave_skip
+        text, _done = gemm_wave_skip.apply(text)
+        print("GEMM_WAVE_SKIP:", ", ".join(_done), file=sys.stderr)
     if MV_SCHED:   # the build log names the policy and its reach (a reader of the .log sees it was applied)
         _n = sum(1 for _b in re.split(r"(?m)^(?=kernel\.def )", text) if _b.startswith("kernel.def") and MV_SCHED_POL + " {" in _b)
         print(f"MV_SCHED={MV_SCHED_D}:{MV_SCHED_U}: pipeline({MV_SCHED_D}) unroll({MV_SCHED_U}) schedule(recurrence) on {_n} kernels "

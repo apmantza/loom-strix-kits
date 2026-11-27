@@ -6,10 +6,11 @@ work list (the flash tiles holding a selected span's last token) instead of the 
   leaves its tail blocks on the full list, a silent half-lever);
 - set: the program is exactly the unset program plus the crop launch, its list buffer and the kernel: an independent inverse gives
   the unset program back byte for byte (a rewrite that touched the verify program or another launch would not invert);
-- fail closed (rules section 4: a text pass that finds code by shape must stop on a shape it does not know): a launch after the
-  last attention layer's flash kernels that is not a known row-local kernel (a DFlash tap, a drafter feature write), a layer
-  after the last attention layer, and a third list reader stop the rewrite; so does a second application (its layer then has no
-  reader of the full list).
+- fail closed (rules section 4: a text pass that finds code by shape must stop on a shape it does not know): after the last
+  attention layer's flash kernels only known statement forms pass (keeps-review 11-27: a buffer.copy of the attention output into
+  %features and a func.call passed the old launch-name list); a launch of a kernel not known row-local (a DFlash tap, a drafter
+  feature write), a template.apply, a buffer.copy, a func.call, a layer after the last attention layer, a third list reader and a
+  second work-list prologue stop the rewrite; so does a second application (its layer then has no reader of the full list).
 usage: python3 test_last_q.py (exit 1 on a failure)."""
 import os, re, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -102,10 +103,49 @@ with tempfile.TemporaryDirectory() as d:
     check("unit: the pass applies to the generator-shaped served program, at layer 63", lay == 63 and "%flash_tiles_out" in t_ok)
     part = re.search(r"(?m)^ *kernel\.launch @g_attention_flash2_partial_f16o\[[^\n]*%layer_63,[^\n]*\n", gen).group(0)
     tap = part + "  kernel.launch @g_dfl_tap[%t](%t, %tap_slot_4, %x, %features) : [index](index, index, buffer, buffer)\n"
+    head = "\n  %head = command.parameter"
+    fl = re.search(r"(?m)^( *)kernel\.launch @g_attention_flash2_f16o\[[^\n]*%layer_63,[^\n]*\n", gen)
+    part_m = re.search(r"(?m)^( *)kernel\.launch @g_attention_flash2_partial_f16o\[[^\n]*%layer_63,[^\n]*\n", gen)
+    Q = "  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, {}) : [index, index](index, index, buffer, buffer)\n"
+    prologue = re.search(r"(?m)^ *kernel\.launch @g_attention_fallback_list\[[^\n]*\n", gen).group(0)
     for what, odd in (("a DFlash tap after the last flash launch", gen.replace(part, tap, 1)),
+                      # keeps-review 11-27 (mutant no_template_guard): a template.apply after the last flash launch
+                      ("a template.apply after the last flash launch", gen.replace(part, part + "  template.apply<@sel1_g_mv_x>(%t) : (index)\n", 1)),
+                      # keeps-review 11-27: statements that are not launches passed the launch-name list
+                      ("a buffer.copy of the attention output into %features", gen.replace(head, "\n  buffer.copy %o16, %features : buffer, buffer" + head, 1)),
+                      ("a func.call after the last flash launch", gen.replace(head, "\n  func.call @g_tap_fn(%o16, %features) : (buffer, buffer) -> ()" + head, 1)),
+                      # keeps-review r1 (lq_forms.txt, E722): an admitted row-local kernel writing a command argument carries the
+                      # cropped tiles' stale rows out of the program. A: through a view of %features; B: %features directly;
+                      # B2: a GEMM into %arena (its %w is undefined in the program); B2b: the same with defined operands only
+                      ("A: a view of %features written by g_quant_q8", gen.replace(head, "\n  %fv = buffer.view %features[%pf_zero] : buffer -> view<16xi8>\n" + Q.format("%fv") + head[1:], 1)),
+                      ("B: g_quant_q8 writes %features", gen.replace(head, "\n" + Q.format("%features") + head[1:], 1)),
+                      ("B2: a GEMM writes %arena", gen.replace(head, "\n  kernel.launch @g_gemm_f16_store_m256[%tp, %nH](%tp, %nQ, %nH, %o16, %s_o, %w, %arena) : [index, index](index, index, index, buffer, buffer, buffer, buffer)\n" + head[1:], 1)),
+                      ("B2b: a GEMM with defined operands writes %arena", gen.replace(head, "\n  kernel.launch @g_gemm_f16_store_m256[%tp, %nH](%tp, %nQ, %nH, %o16, %s_o, %h16, %arena) : [index, index](index, index, index, buffer, buffer, buffer, buffer)\n" + head[1:], 1)),
+                      # a view of %features made before layer 63 and written after it (only the operand's definition shows it)
+                      ("A2: a view of %features from before layer 63 written after it", gen.replace("  // ---- layer 63", "  %fv = buffer.view %features[%pf_zero] : buffer -> view<16xi8>\n  // ---- layer 63", 1).replace(head, "\n" + Q.format("%fv") + head[1:], 1)),
+                      # a buffer operand of no known origin (not an allocation, a weight or a view of an allocation)
+                      ("an operand of unknown origin", gen.replace("  // ---- layer 63", "  %zz = scf.select %mm, %o16, %h : buffer\n  // ---- layer 63", 1).replace(head, "\n" + Q.format("%zz") + head[1:], 1)),
+                      # a parameter of a command argument other than %weights from before layer 63, written after it
+                      ("a command.parameter of %features written after layer 63", gen.replace("  // ---- layer 63", '  %fp = command.parameter %features, "x" : view<16xi8>\n  // ---- layer 63', 1).replace(head, "\n" + Q.format("%fp") + head[1:], 1)),
+                      # a view of a command argument after the flash launches, even unused
+                      ("an unused view of %features", gen.replace(head, "\n  %fv = buffer.view %features[%pf_zero] : buffer -> view<16xi8>" + head, 1)),
+                      # keeps-review r2 (lq_r2.txt, E726): each launch-parse guard of _launch_ok reds alone on one of these
+                      ("an ops / types count mismatch", gen.replace(head, "\n  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, %hq1) : [index, index](index, index, buffer)" + head, 1)),
+                      ("a launch with no type list", gen.replace(head, "\n  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, %features)" + head, 1)),
+                      ("a view of a view of %features written after layer 63", gen.replace("  // ---- layer 62", "  %fa = buffer.view %features[%pf_zero] : buffer -> view<16xi8>\n  %fb = buffer.view %fa[%pf_zero] : view<16xi8> -> view<16xi8>\n  // ---- layer 62", 1)
+                       .replace(head, "\n  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, %fb) : [index, index](index, index, buffer, view<16xi8>)" + head, 1)),
+                      # keeps-review r2 (lq_shadow.txt, E726): a name defined twice (a nested scope may shadow it) makes the operand's
+                      # definition ambiguous: %o redefined as a view of %features inside the flash's scope, written after it
+                      ("a shadowed name (%o redefined as a view of %features before the flash)", gen[:fl.start()] + f"{fl.group(1)}%o = buffer.view %features[%pf_zero] : buffer -> view<16xi8>\n"
+                       + gen[fl.start():part_m.end()] + f"{fl.group(1)}kernel.launch @g_quant_q8[%t, %nQ](%t, %nQ, %h, %o) : [index, index](index, index, buffer, buffer)\n" + gen[part_m.end():]),
+                      # keeps-review 11-27 (mutant no_prologue_count): a second work-list launch before layer 0
+                      ("a second work-list prologue", gen.replace("  // ---- layer 0", prologue + "  // ---- layer 0", 1)),
                       ("a layer after the last attention layer", gen.replace("\n  %head = command.parameter", "\n  // ---- layer 64 (gated delta-net)\n  %head = command.parameter", 1)),
                       ("a third list reader", gen.replace(part, part + part.replace("g_attention_flash2_partial_f16o", "g_attention_flash2_deep_f16o"), 1)),
                       ("a second application", t_ok)):
+        if odd == gen:
+            check(f"unit: {what}: the case changes the program", False, "replace matched nothing")
+            continue
         try:
             last_q.apply(odd)
             check(f"unit: {what} stops the rewrite", False, "no exit")
