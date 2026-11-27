@@ -43,26 +43,23 @@ lsk_measuring() {   # a measurement server of ours is alive (its pid file in $ST
   local f; for f in "$STATE"/*.pid; do [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && { echo "$(basename "$f" .pid) pid $(cat "$f")"; return 0; }; done; return 1
 }
 
-lsk_alive() {   # PID: the process exists and is not a zombie (an exited child its parent has not reaped holds nothing)
-  local s; s=$(ps -o stat= -p "$1" 2>/dev/null) && [ -n "$s" ] && [ "${s:0:1}" != Z ]
-}
-
-lsk_stop() {   # stop our servers (pid files), then any managed server (LSK_STOP_HOOK); wait for the port and for the stopped pids to exit
-  local f i p pids
+lsk_stop() {   # stop our servers (pid files), then any managed server (LSK_STOP_HOOK), and wait for the port
+  local f i p c want
   # LSK_GUARD (machine env, optional): a command that must succeed before anything is stopped. The stop hook alone fenced only the
   # managed server: a refused hook still came after the pid-file kills, and a dry run killed another run's profiling servers (E438).
   if [ -n "${LSK_GUARD:-}" ] && ! eval "$LSK_GUARD" >/dev/null; then echo "lsk_stop: LSK_GUARD refused; nothing stopped" >&2; return 1; fi
-  # the servers stopped here: pid files and whatever listens on the port. A SIGTERMed server closes its port before it releases its
-  # memory, so a free port is not a stopped server (HRX-like 11-26 q214: a restore started beside one and live stayed down)
-  pids=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | cut -d= -f2)
-  for f in "$STATE"/*.pid; do [ -f "$f" ] || continue; p=$(cat "$f"); pids="$pids $p"; kill "$p" 2>/dev/null; rm -f "$f"; done
-  [ -n "${LSK_STOP_HOOK:-}" ] && eval "$LSK_STOP_HOOK" >/dev/null 2>&1
-  for i in $(seq 1 60); do ss -ltn | grep -q ":$PORT " || break; sleep 1; done
-  ss -ltn | grep -q ":$PORT " && { echo "lsk_stop: port $PORT still busy" >&2; return 1; }
-  local t=$((SECONDS + ${LSK_EXIT_WAIT:-60}))   # LSK_EXIT_WAIT: seconds a stopped server may take to exit (default 60)
-  for p in $(echo $pids | tr ' ' '\n' | sort -u); do
-    while lsk_alive "$p"; do [ $SECONDS -lt $t ] || { echo "lsk_stop: pid $p ($(cat /proc/$p/comm 2>/dev/null)) still running ${LSK_EXIT_WAIT:-60} s after the stop" >&2; return 1; }; sleep 0.5; done
+  # a pid file names a server only while that pid's command line runs our server program ($LOOM_SERVE's name, the check loom-skills
+  # stop.sh makes); a stale file's reused pid is reported and left (11-27 review G: a stale state/*.pid killed an unrelated process)
+  want=$(basename "${LOOM_SERVE:-loom-serve}")
+  for f in "$STATE"/*.pid; do
+    [ -f "$f" ] || continue; p=$(cat "$f"); c=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+    if [ -n "$c" ] && [[ "$c" == *"$want"* ]]; then kill "$p" 2>/dev/null
+    elif [ -n "$c" ]; then echo "lsk_stop: $f names pid $p ($(cat /proc/$p/comm 2>/dev/null)), not a $want: stale, left running" >&2; fi
+    rm -f "$f"
   done
+  [ -n "${LSK_STOP_HOOK:-}" ] && eval "$LSK_STOP_HOOK" >/dev/null 2>&1
+  for i in $(seq 1 60); do ss -ltn | grep -q ":$PORT " || return 0; sleep 1; done
+  echo "lsk_stop: port $PORT still busy" >&2; return 1
 }
 
 lsk_restore() {   # hand the port back: stop ours, then LSK_RESTORE_HOOK (e.g. restart a managed live server); no hook = leave it free
@@ -70,6 +67,7 @@ lsk_restore() {   # hand the port back: stop ours, then LSK_RESTORE_HOOK (e.g. r
   # 'LIVE NOT RESTORED: <reason>' on stderr. Callers print their own success line only on exit 0 (`lsk_restore && echo restored`).
   local e w=${LSK_RESTORE_WAIT:-300} log=$STATE/restore_hook.log
   e=$(lsk_stop 2>&1 >/dev/null) || { echo "LIVE NOT RESTORED: the stop before it failed: $(echo "${e:-lsk_stop exit 1}" | grep -v '^ *$' | paste -sd'|' | cut -c1-400)" >&2; return 1; }
+  [ -z "$e" ] || echo "$e" >&2   # a successful stop's notes (a stale pid file left running)
   [ -n "${LSK_RESTORE_HOOK:-}" ] || return 0
   eval "$LSK_RESTORE_HOOK" > "$log" 2>&1; e=$?
   [ $e -eq 0 ] || { echo "LIVE NOT RESTORED: restore hook exit $e: $(grep -v '^ *$' "$log" | tail -1 | cut -c1-300)" >&2; return 1; }
