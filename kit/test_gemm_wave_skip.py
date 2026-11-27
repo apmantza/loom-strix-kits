@@ -141,6 +141,26 @@ def main():
     refused("a kernel for an unknown target stops the build", other, "target rdna5", lambda: gemm_wave_skip.apply(other))
     twin = text + k0.replace("target(@rdna3) ", "target(@rdna4) ", 1).replace("g_gemm_f16_swiglu_m256_f16o", "g_gemm_f16_store_m256")
     refused("a gfx12 kernel without the _rdna4 name stops the build (not skipped)", twin, "target rdna4", lambda: gemm_wave_skip.apply(twin))
+    # QG_SPLIT's _qgs (HRX-like keeps-1127 sweep: GEMM_WAVE_SKIP stopped every build with QG_SPLIT=1 on its name): fixture cut from
+    # QG_SPLIT=1's generated program. The rewrite must take it, skip its gfx12 twin, and insert in it exactly the lines it inserts
+    # in store_m256 (same predicate, same region), so its K loop is store_m256's and only the epilogue differs.
+    import difflib
+    qt = open(os.path.join(HERE, "fixtures", "gemm_f16_store_m256_qgs.loom")).read()
+    qout, qdone = gemm_wave_skip.apply(qt)
+    case(f"QG_SPLIT's _qgs is rewritten beside store_m256, its twin skipped ({qdone})",
+         sorted(qdone) == ["g_gemm_f16_store_m256", "g_gemm_f16_store_m256_qgs"])
+    def added(name):
+        a, b = body(qt, name).split("\n"), body(qout, name).split("\n")
+        return [ln for ln in difflib.ndiff(a, b) if ln[:2] in ("+ ", "- ")]
+    qa, sa = added("g_gemm_f16_store_m256_qgs"), added("g_gemm_f16_store_m256")
+    case(f"the rewrite changes the same {len(sa)} lines in _qgs as in store_m256 (predicate added, region wrapped)", bool(sa) and qa == sa)
+    kl = lambda k: k[k.index("scf.for"):k.index("\n  }\n", k.index("scf.for"))]
+    case("_qgs's generated K loop is store_m256's, character for character",
+         kl(body(qt, "g_gemm_f16_store_m256_qgs")) == kl(body(qt, "g_gemm_f16_store_m256")))
+    case("the _qgs gfx12 twin is left as generated", body(qout, "g_gemm_f16_store_m256_qgs_rdna4") == body(qt, "g_gemm_f16_store_m256_qgs_rdna4"))
+    qodd = qt.replace("g_gemm_f16_store_m256_qgs", "g_gemm_f16_store_m256_qgt")
+    case("a _qgs-like kernel under another name still stops the build (fail closed)",
+         refuses(lambda: gemm_wave_skip.apply(qodd), "g_gemm_f16_store_m256_qgt"))
     if len(sys.argv) > 1:
         prog = open(sys.argv[1]).read()
         names = [m.group(2) for m in gemm_wave_skip.KERNEL.finditer(prog) if m.group(1) != "rdna4"]
