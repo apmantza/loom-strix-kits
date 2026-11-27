@@ -91,6 +91,10 @@ for a fraction of the next one's cost.
   writes) and is judged on the summed served time of every lane in that cut, never on the lane it shrinks; the launch count is not
   the objective (HRX-like E314: a deferred GDN fold cut its lane 3.61 -> 2.86 ms/step and moved the work into the matvecs, +0.6-0.8
   ms/step, bench tie; E329: an epilogue fusion paid 2.75 s).
+  Price a fusion or a move with what the moved work costs where it lands, not only the launch it removes: a small kernel that runs
+  after a large one starts with its code and data cold. Measured on gfx1151 (HRX-like E741, icache counters through the HIP harness):
+  code-cold ~0.8-1.1 us per launch (instruction-fetch waits 1 -> 25 % of wave cycles), data-cold 0.7-1.9 us more; a fusion predicted
+  at 0.86-0.93 of its lane served 1.23 (E691 / E708), because the fused kernel paid both while the removed launch saved ~0.7 us.
 - **Price the lever before building it** (E15/E24): the price goes in the step's `# bound:` line (strix-ledger: the part now, its
   limit and the best engine, the lever's best case as a share of the request, the measurement that resolves it); a best case below
   every measurement's floor is not built. A best case below the deciding bench's floor names the finer measurement that decides
