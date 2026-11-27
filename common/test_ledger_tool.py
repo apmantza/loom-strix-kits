@@ -92,6 +92,10 @@ def main():
         case(f"'not slower' is not a loss, '3 % slower ... removed' is ({pr})", len(pr) == 1 and "E12" in pr[0])
         pr, _ = lt.preflight(sw, log, exclude={"SW_B"})
         case("a switch the live build carries is not re-litigated", not pr)
+        # Recurrence (HRX-like q250): a step that runs a pre-built package names no switch in its text; the caller passes them
+        pr, _ = lt.preflight(w("q305.sh", '#!/bin/bash\n# prior: none (searched: zzz)\nbash run.sh pkg-cand\n'), log,
+                             extra_switches={"SW_B"})
+        case(f"a switch passed from outside the text (a package's build command) is checked ({pr})", len(pr) == 1 and "E12" in pr[0])
         hid = w("q304.sh", '#!/bin/bash\n# prior: none (searched: zzz)\nEXTRA="$SW" bash build.sh\n')
         case("switches hidden in a variable are refused (fail closed)", any("not readable" in x for x in lt.preflight(hid, log)[0]))
         # Recurrence (11-25, T6 builder): '(searched: ...)' on a continuation line, or a dangling comma, read as no terms and passed

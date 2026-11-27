@@ -203,8 +203,10 @@ def grandfathered(step, listfile):
     return name in want and hashlib.sha256(open(step, "rb").read()).hexdigest() == want[name]
 
 
-def preflight(step, log, exclude=frozenset(), exclude_note=None, grandfather=None, switch_var="EXTRA"):
-    """(problems, notes) for one step against the log"""
+def preflight(step, log, exclude=frozenset(), exclude_note=None, grandfather=None, switch_var="EXTRA", extra_switches=frozenset()):
+    """(problems, notes) for one step against the log. extra_switches: switch names the caller found outside the step's text (a
+    pre-built candidate package's build command: HRX-like q250 ran MV_Q8_MINWG=80 from its .cmd and the step's text showed none,
+    'switches checked none'); matched like the step's own, minus exclude"""
     name = os.path.basename(step)
     if grandfathered(step, grandfather):
         return [], [f"{name}: grandfathered (listed with its sha256 in {os.path.basename(grandfather)}, written before this check)"]
@@ -249,6 +251,7 @@ def preflight(step, log, exclude=frozenset(), exclude_note=None, grandfather=Non
             else:
                 answered.add(c.group(1))
     sw, unreadable = switches(text, switch_var)
+    sw = sw | set(extra_switches)
     for u in unreadable:
         probs.append(f"{name}: switches not readable from {u!r} (write them literally in {switch_var})")
     notes.append(exclude_note or ("excluded switches: " + (", ".join(sorted(exclude)) or "none")))
