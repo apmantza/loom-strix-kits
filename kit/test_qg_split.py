@@ -40,7 +40,10 @@ def arity_ok(out):
 F16 = "kernel.launch @g_gemm_f16_store_m256[%tp, %nQ2](%tp, %nH, %nQ2, %h16, %s_h, %w16, %qg) : [index, index](index, index, index, buffer, buffer, buffer, buffer)"
 Q256 = "kernel.launch @g_gemm_q5_k_store_m256[%tp, %nQ2](%tp, %nH, %nQ2, %h16, %s_h, %wq, %qg) : [index, index](index, index, index, buffer, buffer, buffer, buffer)"
 Q128 = "kernel.launch @g_gemm_q5_k_store_m128[%tp, %nQ2](%tp, %nH, %nQ2, %h16, %s_h, %wq, %qg) : [index, index](index, index, index, buffer, buffer, buffer, buffer)"
-MV = "kernel.launch @g_mv_q5_k[%nQ2, %t](%nQ2, %t, %h16q, %wq, %qg) : [index, index](index, index, buffer, buffer, buffer)"
+MV = "kernel.launch @g_mv_q5_k_k5120_t4_q8_r2[%nQ2, %t](%nQ2, %t, %h16q, %wq, %qg) : [index, index](index, index, buffer, buffer, buffer)"
+R_LAST = "  kernel.launch @g_probe[%t](%t, %y, %qg) : [index](index, buffer, buffer)\n"   # reads %qg as its last operand
+R_NAME = "  kernel.launch @g_split_qgate_probe[%t](%t, %qg, %y) : [index](index, buffer, buffer)\n"
+R_COMMENT = "  kernel.launch @g_probe[%t](%t, %qg, %y) : [index](index, buffer, buffer) // g_split_qgate\n"
 LIVE = f"""  scf.if %mm {{
     scf.if %pf_big {{
       scf.if %big {{
@@ -93,8 +96,20 @@ CASES = {
 """ + SPLIT, 0, 1),
     # no f16 m256 at all
     "no_m256": (LIVE.replace(F16, F16.replace("m256", "m128")) + SPLIT, 0, 1),
-    # another reader of %qg in the program: no layer is converted
-    "extra_qg_reader": (LIVE + SPLIT + "  kernel.launch @g_probe[%t](%t, %qg, %y) : [index](index, buffer, buffer)\n", 0, 1),
+    # another reader of %qg between two layers: no layer is converted
+    "extra_qg_reader": (LIVE + SPLIT + "  kernel.launch @g_probe[%t](%t, %qg, %y) : [index](index, buffer, buffer)\n" + LIVE + SPLIT, 0, 2),
+    # keeps-review r1 (qgs_gap.txt HOLE shapes): a launch naming %qg after the last split block stops the build, whatever its name or
+    # operand position (the split it would read after was skipped); readers between layers refuse every layer
+    "last_operand_reader_after_last_split": (LIVE + SPLIT + R_LAST, "stop", 0),
+    "last_operand_reader_between_layers": (LIVE + SPLIT + R_LAST + LIVE + SPLIT, 0, 2),
+    "substring_named_reader_after_split": (LIVE + SPLIT + R_NAME, "stop", 0),
+    "comment_substring_reader_after_split": (LIVE + SPLIT + R_COMMENT, "stop", 0),
+    # the split exemption is by exact kernel name, not a substring of the line (r2: r1 exempted any line containing g_split_qgate)
+    "substring_named_reader_between_layers": (LIVE + SPLIT + R_NAME + LIVE + SPLIT, 0, 2),
+    "comment_substring_reader_between_layers": (LIVE + SPLIT + R_COMMENT + LIVE + SPLIT, 0, 2),
+    # %qg used by a statement that is not a launch (a view a reader could take): unrecognized, the build stops
+    "qg_view_between_layers": (LIVE + SPLIT + "  %qv = buffer.view %qg[%c0] : buffer\n"
+                               "  kernel.launch @g_probe[%t](%t, %qv, %y) : [index](index, buffer, buffer)\n" + LIVE + SPLIT, "stop", 0),
     # the store runs under the skipped path's conditions and one more (a recipe switch around it): when %other is false the split
     # is skipped and %q / %gate keep the previous epoch's values (keeps-review 11-27, mutant q5: the subset check removed)
     "extra_condition_inside_path": (LIVE.replace("          " + F16, "          scf.if %other {\n            " + F16 + "\n          }", 1)
@@ -156,15 +171,6 @@ def main():
             ok = ok and out == text
         bad += not ok
         print(("PASS " if ok else "FAIL ") + f"{name}: converted {n}, refused {refused}")
-    # a PATH condition the program does not define (a recipe without the %big branch): %qgs_ok cannot be built, the build stops
-    # (keeps-review 11-27 F2; the old code checked only %pf_big)
-    try:
-        qg_split.program(HEAD.replace("  %big = index.cmp uge, %t, %c128 : index\n", "") + LIVE + SPLIT + TAIL)
-        ok = False
-    except SystemExit as e:
-        ok = str(e).startswith("QG_SPLIT: ") and "%big" in str(e)
-    bad += not ok
-    print(("PASS " if ok else "FAIL ") + "path_condition_undefined: stops")
     return 1 if bad else 0
 
 

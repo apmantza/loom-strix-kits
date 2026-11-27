@@ -10,9 +10,10 @@ f32 values land at the same places: exact by construction (the kernel test compa
 Our projection launches m256 kernels in both the f16-scratch branch (`scf.if %pf_big`) and the quantized branch, so the split is
 skipped only under %qgs_ok = the AND of PATH's conditions (%mm, %pf_big, %big, %huge), where the one converted f16 m256 store is the
 only %qg writer that can run. A layer is converted only when, on that path, every %qg writer is one f16 m256 store run exactly under
-%mm / %pf_big / %big / %huge, and the only %qg readers in @llm_advance are the split launches; anything else leaves the layer
-unchanged and is counted (fail closed); a split launch outside a block SPLIT matches (a layer whose split is not in the expected
-form) stops the build. Off (unset): the text is unchanged."""
+%mm / %pf_big / %big / %huge, and the only %qg readers in @llm_advance are the split launches (exact names). %qg is written only by
+the WRITER launches, as their last operand; any other launch naming %qg is a reader and leaves every layer unchanged (counted).
+The build stops on a split launch outside a block SPLIT matches, on a launch naming %qg after the last split block, and on any
+statement other than a launch or its allocation that names %qg (fail closed, keeps-review 11-27 r1). Off: the text is unchanged."""
 import os
 import re
 import sys
@@ -21,6 +22,11 @@ ON = os.environ.get("QG_SPLIT", "0").strip().lower() not in ("", "0", "false", "
 PATH = {"%mm": "then", "%pf_big": "then", "%big": "then", "%huge": "then"}   # the epoch the split is skipped in
 LAUNCH = re.compile(r"^(?P<ind>\s*)kernel\.launch @(?P<k>\w+)\[(?P<g>[^\]]*)\]\((?P<args>.*)\) : (?P<ty>.*)$")
 SPLIT = re.compile(r"(?m)^  scf\.if %gemm \{\n\s*kernel\.launch @g_split_qgate_lv\[[^\n]*\n  \} else \{\n\s*kernel\.launch @g_split_qgate\[[^\n]*\n  \}\n")
+SPLITS = ("g_split_qgate", "g_split_qgate_lv")
+# the launches that write %qg (as their last operand) in the served program (pkg-keeps-unset @llm_advance): the q projection's GEMM
+# stores and decode matvecs in every format the kit's quantizations put there
+WRITER = re.compile(r"g_gemm_(?:f16|iq4_xs|q4_k|q5_k)_store(?:_m128|_m256)?|g_mv_(?:iq4_xs|q4_k|q5_k)_k\d+(?:_t\d+)?_q8(?:_r\d+)?")
+QG_ALLOC = re.compile(r"  %qg = buffer\.alloca<global> [^\n]*")
 KDEF = re.compile(r'(?m)^kernel\.def (?:target\(@\w+\) )?export\("(g_gemm_f16_store_m256(?:_rdna4)?)"\)')
 from epi_fuse import _advance, _stacks, _reachable, _operands, kernel_text   # noqa: E402  (the same block reader as EPI_FUSE)
 
@@ -31,12 +37,24 @@ def program(text):
     body = text[a:b]
     splits = list(SPLIT.finditer(body))
     lines_all = body.split("\n")
-    nsplit = sum(1 for l in lines_all if LAUNCH.match(l) and LAUNCH.match(l).group("k") in ("g_split_qgate", "g_split_qgate_lv"))
+    nsplit = sum(1 for l in lines_all if LAUNCH.match(l) and LAUNCH.match(l).group("k") in SPLITS)
     if nsplit != 2 * len(splits):   # its layer's store would share the next layer's segment while its split reads %qg
         raise SystemExit(f"QG_SPLIT: {nsplit} split launches, {len(splits)} split blocks in the expected form (2 launches each)")
-    readers = [l for l in lines_all if LAUNCH.match(l) and "%qg" in _operands(LAUNCH.match(l).group("args"))[:-1]]
-    if any("g_split_qgate" not in l for l in readers):
-        return text, 0, len(splits)   # another %qg reader: leave every layer as it is
+    odd = [l.strip() for l in lines_all if "%qg" in re.findall(r"%\w+", l) and not l.strip().startswith("//")
+           and not LAUNCH.match(l) and not QG_ALLOC.fullmatch(l)]
+    if odd:
+        raise SystemExit(f"QG_SPLIT: %qg used by a statement that is not a launch: {odd[:2]}")
+    tail = body[splits[-1].end():] if splits else ""
+    late = [LAUNCH.match(l).group("k") for l in tail.split("\n") if LAUNCH.match(l) and "%qg" in _operands(LAUNCH.match(l).group("args"))]
+    if late:   # after the last split block nothing may touch %qg: in a skipped epoch it holds the previous epoch's values
+        raise SystemExit(f"QG_SPLIT: launches naming %qg after the last split block: {late}")
+    for l in lines_all:
+        lm = LAUNCH.match(l)
+        ops = _operands(lm.group("args")) if lm else []
+        if "%qg" not in ops or lm.group("k") in SPLITS:
+            continue
+        if not (WRITER.fullmatch(lm.group("k")) and ops[-1] == "%qg" and "%qg" not in ops[:-1]):
+            return text, 0, len(splits)   # another %qg reader: leave every layer as it is
     out, pos, n, refused = [], 0, 0, 0
     for m in splits:
         seg = body[pos:m.start()]
@@ -52,7 +70,7 @@ def program(text):
                 continue
             conds = {c: br for c, br in st[j]}
             exact = all(conds.get(c) == "then" for c in PATH) and set(conds) <= set(PATH)
-            if lm.group("k") == "g_gemm_f16_store_m256" and ops[-1] == "%qg" and "%qg" not in ops[:-1] and exact:
+            if lm.group("k") == "g_gemm_f16_store_m256" and exact:   # a writer: %qg is its last operand only (checked above)
                 conv.append((j, lm))
             else:
                 ok = False
@@ -74,10 +92,7 @@ def program(text):
     if n:
         # %qgs_ok: every PATH condition true (PATH's branches are all 'then'), defined after the last of them
         conds = list(PATH)
-        defs = [re.search(rf"(?m)^  {c} = [^\n]*\n", body) for c in conds]
-        if not all(defs):
-            raise SystemExit(f"QG_SPLIT: {[c for c, d in zip(conds, defs) if not d]} not defined in @llm_advance")
-        at = max(d.end() for d in defs)
+        at = max(re.search(rf"(?m)^  {c} = [^\n]*\n", body).end() for c in conds)   # a condition not defined: AttributeError, the build stops
         chain, acc = [], conds[0]
         for i, c in enumerate(conds[1:], 1):
             name = "%qgs_ok" if i == len(conds) - 1 else f"%qgs_ok{i}"
