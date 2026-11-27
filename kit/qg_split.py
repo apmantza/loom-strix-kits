@@ -54,8 +54,10 @@ def program(text):
         if ok and len(conv) == 1:
             j, lm = conv[0]
             ops = _operands(lm.group("args"))
+            ty = lm.group("ty")
+            assert ty.endswith(")"), f"QG_SPLIT: launch type not in the expected form: {ty}"
             lines[j] = (f"{lm.group('ind')}kernel.launch @g_gemm_f16_store_m256_qgs[{lm.group('g')}]({', '.join(ops + ['%q', '%gate'])})"
-                        f" : {lm.group('ty')}, buffer, buffer")
+                        f" : {ty[:-1]}, buffer, buffer)")
             blk = m.group(0).rstrip("\n").split("\n")
             out += ["\n".join(lines), "  scf.if %qgs_run {\n" + "\n".join("  " + l for l in blk) + "\n  }\n"]
             n += 1

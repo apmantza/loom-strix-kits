@@ -2,6 +2,7 @@
 %qg writer other than the converted f16 m256 store can run on that path (q / gate keep the previous epoch's values: wrong
 attention, silently), or while something else still reads %qg. Mirrors test_epi_fuse.py (E200: the same two-branch projection).
 usage: python3 test_qg_split.py (exit 1 on a failure)."""
+import re
 import sys
 
 import qg_split
@@ -17,6 +18,18 @@ SPLIT = """  scf.if %gemm {
   }
 """
 TAIL = "}\n"
+
+
+def arity_ok(out):
+    """every converted launch's operand type list has one type per operand (11-27 pkg-qgs: the two buffer types were appended after
+    the closing paren, PARSE/003 at loom-compile, which no static case caught)"""
+    for line in out.split("\n"):
+        if "@g_gemm_f16_store_m256_qgs[" not in line:
+            continue
+        m = re.search(r"\]\((.*)\) : \[[^\]]*\]\((.*)\)$", line)
+        if not m or len(m.group(1).split(", ")) != len(m.group(2).split(", ")):
+            return False
+    return True
 F16 = "kernel.launch @g_gemm_f16_store_m256[%tp, %nQ2](%tp, %nH, %nQ2, %h16, %s_h, %w16, %qg) : [index, index](index, index, index, buffer, buffer, buffer, buffer)"
 Q256 = "kernel.launch @g_gemm_q5_k_store_m256[%tp, %nQ2](%tp, %nH, %nQ2, %h16, %s_h, %wq, %qg) : [index, index](index, index, index, buffer, buffer, buffer, buffer)"
 Q128 = "kernel.launch @g_gemm_q5_k_store_m128[%tp, %nQ2](%tp, %nH, %nQ2, %h16, %s_h, %wq, %qg) : [index, index](index, index, index, buffer, buffer, buffer, buffer)"
@@ -87,7 +100,7 @@ def main():
         if want:
             ok = ok and out.count("@g_gemm_f16_store_m256_qgs[") == want and out.count("%qgs_run = ") == 1 \
                 and out.count("  scf.if %qgs_run {") == want and "%h16, %s_h, %w16, %qg, %q, %gate)" in out \
-                and "@g_gemm_q5_k_store_m256[" in out and out.count("@g_split_qgate_lv[") == want
+                and "@g_gemm_q5_k_store_m256[" in out and out.count("@g_split_qgate_lv[") == want and arity_ok(out)
         else:
             ok = ok and out == text
         bad += not ok
