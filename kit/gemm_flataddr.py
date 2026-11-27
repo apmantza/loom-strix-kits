@@ -82,7 +82,7 @@ def flataddr(text):
 
 
 KERNEL = re.compile(r'^kernel\.def (?:target\(@(\w+)\) )?export\("(g_gemm_f16_\w*m256\w*)"\).*?\n\} launch\(.*?\n\}\n', re.S | re.M)
-REWRITE = re.compile(r"g_gemm_f16_(acc|store|swiglu)_m256(_f16o)?")
+REWRITE = re.compile(r"g_gemm_f16_(acc|store|swiglu)_m256(_f16o|_qgs)?")   # _qgs: QG_SPLIT (qg_split.py), same loads as store
 
 
 def apply(text):
