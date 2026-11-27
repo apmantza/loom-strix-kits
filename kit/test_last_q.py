@@ -104,6 +104,8 @@ with tempfile.TemporaryDirectory() as d:
     part = re.search(r"(?m)^ *kernel\.launch @g_attention_flash2_partial_f16o\[[^\n]*%layer_63,[^\n]*\n", gen).group(0)
     tap = part + "  kernel.launch @g_dfl_tap[%t](%t, %tap_slot_4, %x, %features) : [index](index, index, buffer, buffer)\n"
     head = "\n  %head = command.parameter"
+    fl = re.search(r"(?m)^( *)kernel\.launch @g_attention_flash2_f16o\[[^\n]*%layer_63,[^\n]*\n", gen)
+    part_m = re.search(r"(?m)^( *)kernel\.launch @g_attention_flash2_partial_f16o\[[^\n]*%layer_63,[^\n]*\n", gen)
     Q = "  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, {}) : [index, index](index, index, buffer, buffer)\n"
     prologue = re.search(r"(?m)^ *kernel\.launch @g_attention_fallback_list\[[^\n]*\n", gen).group(0)
     for what, odd in (("a DFlash tap after the last flash launch", gen.replace(part, tap, 1)),
@@ -127,6 +129,15 @@ with tempfile.TemporaryDirectory() as d:
                       ("a command.parameter of %features written after layer 63", gen.replace("  // ---- layer 63", '  %fp = command.parameter %features, "x" : view<16xi8>\n  // ---- layer 63', 1).replace(head, "\n" + Q.format("%fp") + head[1:], 1)),
                       # a view of a command argument after the flash launches, even unused
                       ("an unused view of %features", gen.replace(head, "\n  %fv = buffer.view %features[%pf_zero] : buffer -> view<16xi8>" + head, 1)),
+                      # keeps-review r2 (lq_r2.txt, E726): each launch-parse guard of _launch_ok reds alone on one of these
+                      ("an ops / types count mismatch", gen.replace(head, "\n  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, %hq1) : [index, index](index, index, buffer)" + head, 1)),
+                      ("a launch with no type list", gen.replace(head, "\n  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, %features)" + head, 1)),
+                      ("a view of a view of %features written after layer 63", gen.replace("  // ---- layer 62", "  %fa = buffer.view %features[%pf_zero] : buffer -> view<16xi8>\n  %fb = buffer.view %fa[%pf_zero] : view<16xi8> -> view<16xi8>\n  // ---- layer 62", 1)
+                       .replace(head, "\n  kernel.launch @g_quant_q8[%t, %nH](%t, %nH, %h, %fb) : [index, index](index, index, buffer, view<16xi8>)" + head, 1)),
+                      # keeps-review r2 (lq_shadow.txt, E726): a name defined twice (a nested scope may shadow it) makes the operand's
+                      # definition ambiguous: %o redefined as a view of %features inside the flash's scope, written after it
+                      ("a shadowed name (%o redefined as a view of %features before the flash)", gen[:fl.start()] + f"{fl.group(1)}%o = buffer.view %features[%pf_zero] : buffer -> view<16xi8>\n"
+                       + gen[fl.start():part_m.end()] + f"{fl.group(1)}kernel.launch @g_quant_q8[%t, %nQ](%t, %nQ, %h, %o) : [index, index](index, index, buffer, buffer)\n" + gen[part_m.end():]),
                       # keeps-review 11-27 (mutant no_prologue_count): a second work-list launch before layer 0
                       ("a second work-list prologue", gen.replace("  // ---- layer 0", prologue + "  // ---- layer 0", 1)),
                       ("a layer after the last attention layer", gen.replace("\n  %head = command.parameter", "\n  // ---- layer 64 (gated delta-net)\n  %head = command.parameter", 1)),

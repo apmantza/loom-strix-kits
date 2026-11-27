@@ -16,6 +16,7 @@ no row the head reads. The listed split-K fallback (runs shorter than 9 tokens: 
 are written by g_qk_rope_store before, for every token, as before.
 
 Unset: the program is unchanged (the pass is not called)."""
+import collections
 import re
 import sys
 
@@ -285,6 +286,12 @@ def apply(text):
     defs = {}
     for d in DEF.finditer(seg):
         defs.setdefault(d.group(1), (d.group(2), d.group(3)))
+    # each name defined once in @llm_advance, so an operand's definition is the one read above (keeps-review r2, E726: a nested scope
+    # may shadow a name; the served program defines each of its names once)
+    names = collections.Counter(n for d in re.finditer(r"(?m)^ *(%\w+(?:, *%\w+)*) = ", seg) for n in re.split(r", *", d.group(1)))
+    twice = sorted(n for n, k in names.items() if k > 1)
+    if twice:
+        die(f"@llm_advance defines {len(twice)} names more than once: {twice[:4]}")
     other = []
     for ln in after.splitlines():
         s = ln.strip()
