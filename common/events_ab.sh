@@ -29,7 +29,7 @@ OUT=$(realpath -m "${2:?out dir}"); L=${3:?prompt length}; shift 3
 [ -n "${IREE_PROFILE:-}" ] && [ -x "$IREE_PROFILE" ] || die "set IREE_PROFILE to an iree-profile binary (machine env)"
 eb=(); for p in "$@"; do eb+=(--pkg "$(lsk_pkg "$p")") || exit 1; done   # every package, in the environment block
 TEL=
-trap '[ -n "$TEL" ] && kill $TEL 2>/dev/null; lsk_restore; echo "restored $(date +%T)"' EXIT
+trap '[ -n "$TEL" ] && kill $TEL 2>/dev/null; lsk_restore && echo "restored $(date +%T)"' EXIT
 mkdir -p "$OUT"; n=0; runs=(); unclean=(); gpuunclean=()
 for p in "$@"; do
   n=$((n + 1)); b=$(basename "$p"); d=$OUT/$n-${b#pkg-}; tag=$(basename "$d"); rm -rf "$d"; mkdir -p "$d"; runs+=("$d")

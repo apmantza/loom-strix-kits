@@ -4,7 +4,7 @@
 set -u
 H=$(cd "$(dirname "$0")" && pwd); T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; fails=0
 . "$H/env.sh"
-STATE=$T; PORT=1; LSK_STOP_HOOK=""
+STATE=$T; PORT=1; LSK_STOP_HOOK=""; LOOM_SERVE=/bin/sleep   # the pid files name sleep processes standing in for the server program
 check() { if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: got '$2', want '$3'"; fails=$((fails + 1)); fi; }
 sleep 300 & p=$!; echo $p > "$T/x.pid"
 LSK_GUARD=false; lsk_stop 2>/dev/null; rc=$?
