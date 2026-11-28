@@ -4601,11 +4601,73 @@ kernel.def export("test_keep_rows_f32") @test_keep_rows_f32(%rows: index) {
 """)
         if tag == "a":
             cases.append(negtwin(cases[-1], ('path("lr_sm_a.npy")', 'path("lr_sm_neg_a.npy")')))
+    if 'export("g_gemm_f16_store_m256_qgs")' in (_pkg_llm_text() or ""):
+        _lastrows_qgs_case(R, K, N, KP, wb)
+
+
+# @lastrows_qgs (keeps-review 11-28, before go-live): the mask feeding QG_SPLIT's q GEMM, the served layer-63 q launch of the all-four
+# package (with GEMM_WAVE_SKIP its waves skip on the masked scales): g_scale_head_rows, then g_gemm_f16_store_m256_qgs over 512 rows
+# (two m256 tiles, N = 512: one head, q = weight rows 0-255, gate = 256-511) with one head row (row 100: tile 0, wave 1, so waves 0, 2
+# and 3 of tile 0 and all of tile 1 skip). Reference: the same launch on the unmasked scales (every row live). Checks: the masked
+# scales equal the numpy mask; q and gate of the candidate (both starting at the 7.0 sentinel) equal, with check.expect.equal (atol
+# 0): the reference's head row, 0.0 on every other row of its tile (written: acc x a zero inverse, or a skipped wave's zero
+# accumulators), and the sentinel on tile 1 (skipped whole). Recurrence: a wave-skip predicate or mask that drops the head row's wave
+# (served logits change, EXACT sees it only on a request whose span ends there), or a head row that depends on its tile's other rows.
+# @lastrows_qgs_negcontrol: the expected output keeps no head row (must FAIL).
+def _lastrows_qgs_case(R, K, N, KP, wb):
+    qr = np.random.default_rng(1128)   # own stream: this case changes no other case's inputs
+    HR = 100
+    save("lrq_w", wb((qr.standard_normal((2 * N, K)) * 0.05).astype(np.float16)))
+    save("lrq_x16", pfpad((qr.standard_normal((R, K)) * 0.5).astype(np.float16)))
+    sq = np.stack([np.ones(R, np.float32), qr.uniform(0.5, 2.0, R).astype(np.float32)], 1)
+    meta = np.zeros(4 + 9, np.int32); meta[0] = 1
+    meta[4:13] = [HR + 1, 3000, 0, 0, 0, 0, 1, 0, 0]   # one selected span of row 0 at 3000: tokens 0-100, the head reads token 100
+    head = np.zeros(R, np.int32); head[HR] = 1
+    base = np.full((R, N), 7.0, np.float32); base[:256] = 0.0
+    save("lrq_s", sq); save("lrq_meta", meta); save("lrq_head", head); save("lrq_head_neg", np.zeros(R, np.int32))
+    save("lrq_sm", np.where(head[:, None] != 0, sq, 0).astype(np.float32)); save("lrq_base", base)
+    WQ2 = 2 * N * KP * 2
+    MT, T2, TX, TN, TI = "tensor<13xi32>", f"tensor<{R}x2xf32>", f"tensor<{R}x{KP}xf16>", f"tensor<{R}x{N}xf32>", f"tensor<{R}x4xi32>"
+    TG = f"[index, index](index, index, index, {TX}, {T2}, tensor<{WQ2}xi8>, {TN}, {TN})"
+    keep = lambda src, dst: f"  kernel.launch @test_keep_rows_f32[%rows](%rows, %n, %n, %head, {src}, {dst}) : [index](index, index, index, tensor<{R}xi32>, {TN}, {TN})\n"
+    case = f"""check.case public @lastrows_qgs {{
+  %rows = check.literal value({R}) : index
+  %t = check.literal value({R}) : index
+  %spans = check.literal value(1) : index
+  %k = check.literal value({K}) : index
+  %n = check.literal value({N}) : index
+  %n2 = check.literal value({2 * N}) : index
+  %meta = check.file.read.npy path("lrq_meta.npy") : {MT}
+  %head = check.file.read.npy path("lrq_head.npy") : tensor<{R}xi32>
+  %x16 = check.file.read.npy path("lrq_x16.npy") : {TX}
+  %w = check.file.read.npy path("lrq_w.npy") : tensor<{WQ2}xi8>
+  %sa = check.file.read.npy path("lrq_s.npy") : {T2}
+  %sb = check.file.read.npy path("lrq_s.npy") : {T2}
+  %esb = check.file.read.npy path("lrq_sm.npy") : {T2}
+  %eq = check.file.read.npy path("lrq_base.npy") : {TN}
+  %eg = check.file.read.npy path("lrq_base.npy") : {TN}
+  %info = check.generate.fill value(0) : {TI}
+  %qa = check.generate.fill value(0.0) : {TN}
+  %ga = check.generate.fill value(0.0) : {TN}
+  %qb = check.generate.fill value(7.0) : {TN}
+  %gb = check.generate.fill value(7.0) : {TN}
+  kernel.launch @g_token_info[%t](%t, %spans, %meta, %info) : [index](index, index, {MT}, {TI})
+  kernel.launch @g_gemm_f16_store_m256_qgs[%rows, %n2](%rows, %k, %n2, %x16, %sa, %w, %qa, %ga) : {TG}
+  kernel.launch @g_scale_head_rows[%rows](%rows, %t, %spans, %meta, %info, %sb) : [index](index, index, index, {MT}, {TI}, {T2})
+  kernel.launch @g_gemm_f16_store_m256_qgs[%rows, %n2](%rows, %k, %n2, %x16, %sb, %w, %qb, %gb) : {TG}
+{keep("%qa", "%eq")}{keep("%ga", "%eg")}  check.expect.equal actual(%sb) expected(%esb) : {T2}
+  check.expect.equal actual(%qb) expected(%eq) : {TN}
+  check.expect.equal actual(%gb) expected(%eg) : {TN}
+  check.return
+}}
+"""
+    cases.append(case)
+    cases.append(negtwin(case, ('path("lrq_head.npy")', 'path("lrq_head_neg.npy")')))
 
 
 if not KS and 'export("g_scale_head_rows")' in (_pkg_llm_text() or ""):
-    kt_section(["g_scale_head_rows", "g_token_info", "g_gemm_f16_store_m256", "g_gemm_f16_acc_m256", "g_gemm_f16_swiglu_m256_f16o"],
-               _lastrows_cases)
+    kt_section(["g_scale_head_rows", "g_token_info", "g_gemm_f16_store_m256", "g_gemm_f16_acc_m256", "g_gemm_f16_swiglu_m256_f16o",
+                "g_gemm_f16_store_m256_qgs"], _lastrows_cases)
 
 # 6. MoE (gen_moe.py) on real tensors, one layer per expert-down format: the decode chain (router -> top-k ->
 # gate/up -> down -> combine, plus the prefill router with padding tokens) and the prefill chain (prefill router ->
