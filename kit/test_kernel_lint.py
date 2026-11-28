@@ -62,7 +62,8 @@
   - a register-costing lever priced as a lost tier where the grid, not the registers, sets occupancy (E417 / E469 / E614 vs q213's
     [1,64] matvecs; SWEEP 11-27 L4): grid_waves() must give gw 3 for g_attention_combine at [8,24,1] and note gridlim, gw 5 for the
     [1,64,1] matvec grid, and no note for a bulk 17-wave matvec at its served [1,320,1] (gw 9 = its tier); text sites sized by tokens
-    are unresolved, never guessed;
+    are unresolved, never guessed; review E737: a served [0,0,0] (indirect) grid is unresolved, the note speaks for the kernel only
+    at >= 50 % of its served time, names a VGPR budget (216 for alpha / beta at [2,48,1]) and is suppressed below a lane's noise floor;
   - C19 Loom candidates (loom_cands(), HANDOFF failure list): a report's phantom next tier (E533), allocation-emitted back-edge
     copies VOPD could pair (E592) and a shape moved by the compiler alone (E177 / E227) found only by hand; each with near misses
     (agreeing tier, wave cap, unverified tier; short, distant, ordered or paired copies; programs, roots, target or compiler not
@@ -228,46 +229,95 @@ def livereg():
 
 
 def grid_waves():
-    """gw / gridlim (SWEEP 11-27 L4). Recurrence: E417 / E469 / E614 priced a register-costing prefetch on decode matvecs as a lost
-    residency tier everywhere, while on the [1,64,1] k / v matvecs and g_attention_combine the grid, not the registers, sets the
-    occupancy (MV_SCHED 0.944-0.972 there vs 0.98-1.06 on bulk grids, q213): the lint must say which kernels are grid-limited.
-    Tier rows are live pkg-e480 reports; grids are the served ones (1-sfa events)."""
+    """gw / gridlim (SWEEP 11-27 L4; review E737). Recurrence: E417 / E469 / E614 priced a register-costing prefetch on decode
+    matvecs as a lost residency tier everywhere, while on the [1,64,1] k / v matvecs and g_attention_combine the grid, not the
+    registers, sets the occupancy (MV_SCHED 0.944-0.972 there vs median 1.004 elsewhere, q213): the lint must say which kernels
+    are grid-limited, at which grids, and how many VGPRs stay free there. Tier rows are live pkg-e480 reports; grids the served
+    ones (1-sfa events). Model: an even spread over WGPs / SIMDs (placement unmeasured, E737 F3)."""
     comb = kl.tier_state(occ(32, 24, 16, 0, 16, 16, 16), 4)          # g_attention_combine: 1-wave WGs, 64 per WGP at tier 16
     mv = kl.tier_state(occ(160, 114, 12, 2560, 16, 15, 12), 4)       # g_mv_q5_k_k5120_t8_q8: 5-wave WGs, 9 per WGP at tier 12
     big = kl.tier_state(occ(544, 114, 12, 8704, 16, 13, 12), 4)      # g_mv_q5_k_k17408_t8_q8: 17-wave WGs, 2 per WGP at tier 9
+    ab = kl.tier_state(occ(160, 151, 9, 80, 16, 15, 9), 4)           # g_mv_q8_0_k5120_t4_r1 (GDN alpha / beta): 7 per WGP at tier 9
+    def gl(*args):
+        try:
+            getattr(kl, "grid_limits", lambda *a: None)(*args)
+        except TypeError:                                             # 8a485df's grid_limits(rows, texts, served), for the red run
+            pass
     gw = getattr(kl, "grid_waves", None)
     vals = [gw(192, comb, 20), gw(64, mv, 20), gw(1088, mv, 20), gw(320, big, 20)] if gw else None
     ok(vals == [3, 5, 12, 9], f"gw: combine 192 WGs -> 10 per WGP -> 3 waves/SIMD; [1,64] matvec 4 x 5 waves -> 5; [1,1088] capped at "
        f"the tier 12; the 17-wave [1,320] at its tier 9 ({vals})")
+    model = {"prefill_marker": "^g_never$", "lanes": [
+        {"lane": "decode: verify attention", "phase": "decode", "regex": "^g_attention|^g16_attention"},
+        {"lane": "decode: matvecs", "phase": "decode", "regex": "^g_mv_"}, {"lane": "decode: other", "phase": "decode", "regex": "."},
+        {"lane": "prefill: other", "phase": "prefill", "regex": "."}]}
     with tempfile.TemporaryDirectory() as t:
         run = os.path.join(t, "run"); os.makedirs(run)
         with open(os.path.join(run, "events.jsonl"), "w") as f:
             for k, g, ns, n in (("g_attention_combine", [8, 24, 1], 59_000, 3), ("g_mv_q5_k_k5120_t8_q8", [1, 64, 1], 20_000, 2),
-                                ("g_mv_q5_k_k5120_t8_q8", [1, 1088, 1], 284_000, 2), ("g_mv_q5_k_k17408_t8_q8", [1, 320, 1], 286_000, 4)):
+                                ("g_mv_q5_k_k5120_t8_q8", [1, 1088, 1], 284_000, 2), ("g_mv_q5_k_k17408_t8_q8", [1, 320, 1], 286_000, 4),
+                                ("g_mv_q8_0_k5120_t4_r1", [2, 48, 1], 6_000, 10),
+                                ("g16_attention_combine_listed_f16o", [0, 0, 0], 40_000, 2),    # an indirect dispatch: no count (F4)
+                                ("g_mv_q5_k_k5120_t8_q8", None, 900_000, 1)):                   # an event with no workgroup_count
                 for _ in range(n):
-                    f.write(json.dumps({"type": "dispatch_event", "valid": True, "key": k, "duration_ns": ns, "workgroup_count": g}) + "\n")
+                    e = {"type": "dispatch_event", "valid": True, "key": k, "duration_ns": ns, "submission_id": 1}
+                    if g is not None:
+                        e["workgroup_count"] = g
+                    f.write(json.dumps(e) + "\n")
         open(os.path.join(run, "x.req.json"), "w").write(json.dumps({"requests": [{"prompt_tokens": 81430}]}))
-        got = kl.served_stats(run)
+        try:
+            got = kl.served_stats(run, model)
+        except TypeError:                                             # 8a485df's served_stats(run), for the red run
+            got = kl.served_stats(run)
         grids = got[2] if len(got) > 2 else {}
+        lanes = got[3] if len(got) > 3 else None
         ok(grids.get("g_mv_q5_k_k5120_t8_q8") == {(1, 64, 1): [0.04, 2], (1, 1088, 1): [0.568, 2]},
-           f"gw: served grids per kernel from the events' workgroup_count ({grids.get('g_mv_q5_k_k5120_t8_q8')})")
-        rows = [{"kernel": "g_attention_combine", "occ": comb, "cover_min": 4, "in_flight": 0},
-                {"kernel": "g_mv_q5_k_k5120_t8_q8", "occ": mv, "cover_min": 2, "in_flight": 0},
-                {"kernel": "g_mv_q5_k_k17408_t8_q8", "occ": big, "cover_min": 2, "in_flight": 0}]
+           f"gw: served grids per kernel from the events' workgroup_count; an event without one adds to no grid (review MA) "
+           f"({grids.get('g_mv_q5_k_k5120_t8_q8')})")
+        ok(lanes and round(lanes["by"][("g_attention_combine", (8, 24, 1))]["decode: verify attention"], 3) == 0.177
+           and round(lanes["total"]["decode: matvecs"], 3) == 2.712, f"gw: served time per lane and per (kernel, grid) from the kit's "
+           f"lanes ({lanes and dict(lanes['total'])})")
+        mk = lambda: [{"kernel": "g_attention_combine", "occ": comb, "cover_min": 4, "in_flight": 0, "vgpr": 24},
+                      {"kernel": "g_mv_q5_k_k5120_t8_q8", "occ": mv, "cover_min": 2, "in_flight": 0, "vgpr": 114},
+                      {"kernel": "g_mv_q5_k_k17408_t8_q8", "occ": big, "cover_min": 2, "in_flight": 0, "vgpr": 114},
+                      {"kernel": "g_mv_q8_0_k5120_t4_r1", "occ": ab, "cover_min": 5, "in_flight": 0, "vgpr": 151},
+                      {"kernel": "g16_attention_combine_listed_f16o", "occ": comb, "cover_min": 1, "in_flight": 0, "vgpr": 24}]
+        rows = mk()
         getattr(kl, "grid_limits", lambda *a: None)(rows, [], grids)
+        floor_rows = mk()
+        gl(floor_rows, [], grids, lanes, {"decode: verify attention": 80})
+        low_rows = mk()
+        gl(low_rows, [], grids, lanes, {"decode: verify attention": 50})
     notes = lambda r: r.get("notes", [])
     text = getattr(kl, "gw_text", lambda r: None)
     lines = [ln for ln in kl.lesson_lines(rows) if ln.startswith("gridlim")]
-    ok("gridlim" in notes(rows[0]) and text(rows[0]) == "3" and any("gridlim g_attention_combine" in ln and "[8,24,1] 192 WGs gw 3" in ln
-       and "registers above the tier are free" in ln for ln in lines),
-       f"gw: g_attention_combine at [8,24,1] (24 VGPRs, tier 16) gets gridlim, gw 3 ({notes(rows[0])}, {text(rows[0])}, {lines})")
-    ok("gridlim" in notes(rows[1]) and text(rows[1]) == "5-12" and any("gridlim g_mv_q5_k_k5120_t8_q8" in ln and "1 of 2 grid(s)" in ln
-       and "[1,64,1] 64 WGs gw 5" in ln and "1088" not in ln and "served-weighted gw 11.5" in ln for ln in lines),
-       f"gw: one kernel at a [1,64,1] and a [1,1088,1] grid: min-max 5-12, the [1,64,1] grid named, served-weighted 11.5 ({text(rows[1])}, "
-       f"{lines})")
-    ok("gridlim" not in notes(rows[2]) and text(rows[2]) == "9", f"gw: near miss, a bulk 17-wave matvec at its served [1,320,1] fills "
-       f"its tier 9: no note ({notes(rows[2])}, {text(rows[2])})")
-    ok(not any(ln.startswith("gridlim") for ln in kl.lesson_lines(rows[2:])), "gw: no line for the near miss")
+    line = lambda k: next((ln for ln in lines if ln.startswith(f"gridlim {k} ")), "")
+    c = line("g_attention_combine")
+    ok("gridlim" in notes(rows[0]) and text(rows[0]) == "3" and "[8,24,1] 192 WGs gw 3" in c and "model: even spread" in c
+       and "100 % of the kernel's served time" in c and "the kernel is grid-limited" in c and "VGPRs up to 256 (now 24)" in c,
+       f"gw: g_attention_combine at [8,24,1] (24 VGPRs, tier 16): gridlim, gw 3, all its served time, budget capped at the 256 a "
+       f"wave can address ({notes(rows[0])}, {text(rows[0])}, {c})")
+    m = line("g_mv_q5_k_k5120_t8_q8")
+    ok("gridlim" in notes(rows[1]) and text(rows[1]) == "5-12" and "1 of 2 grid(s)" in m and "[1,64,1] 64 WGs gw 5" in m
+       and "1088" not in m and "served-weighted gw 11.5" in m and "grid-limited 7 %" in m and "grid-limited at these grids only" in m
+       and "the kernel is grid-limited" not in m, f"gw: [1,64,1] beside [1,1088,1]: min-max 5-12, only the [1,64,1] grid named, "
+       f"time-weighted 11.5, 7 % of its time: the note speaks for that grid, not the kernel (F2a) ({text(rows[1])}, {m})")
+    ok("gridlim" not in notes(rows[2]) and text(rows[2]) == "9" and not line("g_mv_q5_k_k17408_t8_q8"),
+       f"gw: near miss, a bulk 17-wave matvec at its served [1,320,1] fills its tier 9: no note ({notes(rows[2])}, {text(rows[2])})")
+    a = line("g_mv_q8_0_k5120_t4_r1")
+    ok("[2,48,1] 96 WGs gw 7" in a and "VGPRs up to 216 (now 151)" in a, f"gw: alpha / beta at [2,48,1]: 5 WGs per WGP need "
+       f"ceil(25 / 4) = 7 waves, 1536 // 7 = 219 -> 216 VGPRs in whole granules of 24 (F2 budget) ({a})")
+    ok("gridlim" not in notes(rows[4]) and text(rows[4]) == "-?", f"gw: a served [0,0,0] grid (an indirect dispatch) is unresolved "
+       f"'?', never a grid of 0 workgroups (F4) ({rows[4].get('gw')}, {text(rows[4])})")
+    ok("gridlim" not in notes(floor_rows[0]) and (floor_rows[0].get("gw") or {}).get("suppressed")
+       and "gridlim" in notes(floor_rows[1]) and "gridlim" in notes(floor_rows[3]),
+       f"gw: combine's 0.177 ms is below an 80 % floor of its lane's 0.257 ms (0.206): suppressed; kernels in lanes without a floor keep the note "
+       f"(F2b) ({[(r['kernel'], notes(r), (r.get('gw') or {}).get('suppressed')) for r in floor_rows[:4]]})")
+    summ = getattr(kl, "gridlim_summary", lambda r, f: "")
+    ok("1 note(s) suppressed" in summ(floor_rows, True) and "g_attention_combine" in summ(floor_rows, True)
+       and "no --noise-floor" in summ(rows, False), f"gw: the suppressed notes are counted and named ({summ(floor_rows, True)})")
+    ok("gridlim" in notes(low_rows[0]) and not (low_rows[0].get("gw") or {}).get("suppressed"),
+       f"gw: near miss, the same 0.177 ms against a 50 % floor (0.129 ms) is kept (F2b) ({(low_rows[0].get('gw') or {}).get('suppressed')})")
     # program text, no profile: a constant grid is evaluated; a run-time size (tokens) is counted unresolved, never guessed
     prog = ('kernel.def export("g_c") @g_c(%n: index) {\n  %c1 = index.constant 1 : index\n'
             '  kernel.launch.config workgroups(%c1, %n, %c1) workgroup_size(%c1, %c1, %c1) : index\n} launch(%x: index) {\n}\n'
@@ -275,16 +325,24 @@ def grid_waves():
             '  kernel.launch.config workgroups(%n, %c1, %c1) workgroup_size(%c1, %c1, %c1) : index\n} launch(%x: index) {\n}\n'
             'command.def public target(@device) @llm_advance() launch(%x: buffer) {\n  %r = index.constant 64 : index\n'
             '  %t = config.get @llm.tokens : index\n  kernel.launch @g_c[%r](%r) : [index](index)\n'
-            '  kernel.launch @g_s[%t](%t) : [index](index)\n}\n')
+            '  kernel.launch @g_c[%t](%t) : [index](index)\n  kernel.launch @g_s[%t](%t) : [index](index)\n}\n')
     rows = [{"kernel": "g_c", "occ": mv}, {"kernel": "g_s", "occ": comb}]
     getattr(kl, "grid_limits", lambda *a: None)(rows, [prog], None)
-    ok("gridlim" in notes(rows[0]) and text(rows[0]) == "5" and rows[0].get("gw", {}).get("src") == "text",
-       f"gw: a constant [1,64,1] text grid at tier 12 gets gridlim from the program alone ({rows[0].get('gw')})")
+    tl = [ln for ln in kl.lesson_lines(rows) if ln.startswith("gridlim g_c ")]
+    ok("gridlim" in notes(rows[0]) and text(rows[0]) == "5?" and rows[0].get("gw", {}).get("src") == "text" and tl
+       and "1 of 1 grid(s) + 1 unresolved" in tl[0] and "grid-limited at these grids only" in tl[0],
+       f"gw: a constant [1,64,1] text grid at tier 12 gets gridlim from the program alone; its tokens-sized sibling site is counted "
+       f"'+ 1 unresolved' (iii) ({rows[0].get('gw')}, {tl})")
     ok("gridlim" not in notes(rows[1]) and text(rows[1]) == "-?", f"gw: a tokens-sized grid without a profile is unresolved, no note "
-       f"({rows[1].get('gw')}, {text(rows[1])})")
+       f"(review ME) ({rows[1].get('gw')}, {text(rows[1])})")
     rows = [{"kernel": "g_c", "occ": kl.tier_state(occ(160, 114, 12, 2560, 16, 15, 11), 4)}]   # unverified tier: no figure
     getattr(kl, "grid_limits", lambda *a: None)(rows, [prog], None)
     ok("gw" not in rows[0] and "gridlim" not in notes(rows[0]), f"gw: an unverified tier gives no gw ({rows[0].get('gw')})")
+    o = dict(occ(160, 114, 12, 2560, 16, 15, 12), target="nonesuch")          # lint_counters' caller passes SIMDs from --device
+    rows = [{"kernel": "g_c", "occ": kl.tier_state(o, 4)}]
+    getattr(kl, "grid_limits", lambda *a: None)(rows, [prog], None)
+    ok("tier" in rows[0]["occ"] and "gw" not in rows[0], f"gw: a verified tier for a target with no device file has no WGP count: "
+       f"no figure, never a guessed 20 (review MD) ({rows[0].get('gw')})")
 
 
 def lesson_notes():
