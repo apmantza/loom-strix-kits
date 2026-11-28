@@ -194,9 +194,9 @@ def apply(text):
     # the q region: the q block and what follows it up to the K block (the q / gate split, or its QG_SPLIT form)
     qa, qb = st[iq][0], st[ik][0]
     region = block[qa:qb]
-    kinds = sorted({k for k in LAUNCH.findall(region) if not Q_REGION.fullmatch(k)})
-    if kinds or re.search(r"(?m)^ *template\.apply", region):
-        die(f"layer {L}: the q region launches {kinds or 'template.apply'} (expected weight conversion, projection, q / gate split)")
+    # the q region moves past the %s_h mask, before the post-flash gate's window: the same gate judges it (statement forms; launches
+    # of Q_REGION only, whose buffers are allocations, views of them or weights: no command argument; keeps-review O1, 11-28)
+    last_q.gate(text[s0:s1], region, L, "LAST_ROWS", Q_REGION, (), "layer {}'s q region (weight conversion, projection, q / gate split)")
     if re.search(r"%(k|v|wk_\d+|wv_\d+)\b", region):
         die(f"layer {L}: the q region reads or writes the K / V projections")
     kv = block[qb:st[ir][0]]

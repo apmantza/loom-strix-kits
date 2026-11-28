@@ -233,15 +233,15 @@ ARGS_OK = ((re.compile(r"g16_attention_split_listed|g_attention_split|g_attentio
            (re.compile(r"g_scale_head_rows"), {"%metadata"}))   # LAST_ROWS's masks: the span packets, read only
 
 
-def _launch_ok(s, cargs, defs):
-    """a ROW_LOCAL launch whose command arguments are its ARGS_OK entry and whose other buffers are local (see ARGS_OK)"""
+def _launch_ok(s, cargs, defs, kernels=ROW_LOCAL, args_ok=ARGS_OK):
+    """a launch of KERNELS whose command arguments are its ARGS_OK entry and whose other buffers are local (see ARGS_OK)"""
     m = LAUNCH_SIG.fullmatch(s)
-    if not m or not ROW_LOCAL.fullmatch(m.group(1)):
+    if not m or not kernels.fullmatch(m.group(1)):
         return False
     ops, tys = [x.strip() for x in m.group(2).split(",")], [x.strip() for x in m.group(3).split(",")]
     if len(ops) != len(tys):
         return False
-    allowed = set().union(*[a for r, a in ARGS_OK if r.fullmatch(m.group(1))])
+    allowed = set().union(*[a for r, a in args_ok if r.fullmatch(m.group(1))])
     for o, t in zip(ops, tys):
         if o in cargs:
             if o not in allowed:
@@ -293,10 +293,11 @@ def apply(text):
     return text[:m.start()] + seg + text[end:] + "\n" + KERNEL, layer
 
 
-def gate(seg, after, layer, who="LAST_Q"):
+def gate(seg, after, layer, who="LAST_Q", kernels=ROW_LOCAL, args_ok=ARGS_OK, where="after layer {}'s flash launches"):
     """Stops the build unless every statement of AFTER (the text of @llm_advance segment SEG after the last attention layer's flash
     launches) is a known memory-free form or a ROW_LOCAL launch with its ARGS_OK command arguments, and SEG defines each name
-    once. LAST_Q judges the program before its rewrite; LAST_ROWS (applied after it) judges its own output, masks included."""
+    once. LAST_Q judges the program before its rewrite; LAST_ROWS (applied after it) judges its own output, masks included, and
+    its moved q region (KERNELS: that region's kernels, ARGS_OK empty: no command argument; WHERE names the region, {} its layer)."""
     def stop(msg):
         sys.exit(f"{who}: {msg}")
     cargs = set(re.findall(r"(%\w+): buffer", seg.split("\n", 1)[0]))
@@ -313,11 +314,11 @@ def gate(seg, after, layer, who="LAST_Q"):
     for ln in after.splitlines():
         s = ln.strip()
         if LAUNCH_LINE.fullmatch(s):
-            ok = _launch_ok(s, cargs, defs)
+            ok = _launch_ok(s, cargs, defs, kernels, args_ok)
         else:
             used = set(re.findall(r"%\w+", s)) & cargs if not s.startswith("//") else set()
             ok = AFTER_OK.fullmatch(s) and (not used or (used == {"%weights"} and s.split(" = ", 1)[-1].startswith("command.parameter %weights,")))
         if not ok:
             other.append(s[:100])
     if other:
-        stop(f"after layer {layer}'s flash launches: {len(other)} statements not known row-local or memory-free: {other[:4]}")
+        stop(f"{where.format(layer)}: {len(other)} statements not known row-local or memory-free: {other[:4]}")

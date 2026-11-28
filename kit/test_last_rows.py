@@ -16,6 +16,10 @@ case prevents:
 - the pass runs LAST_Q's post-flash gate on its own output (gen_llm applies LAST_Q first, so LAST_Q's gate never sees the masks,
   and without LAST_Q no gate runs; this pass's own check reads launch names only): LAST_ROWS alone stops on a GEMM writing
   %features after the flash (keeps-review 11-27 / E722: an admitted kernel name writing a command argument passed a name list).
+- the moved q region passes the same gate (its statement forms, its launches' operands, no command argument): a q-region GEMM
+  writing %features, a matvec writing %arena, a buffer.copy into %features and a launch of a
+  kernel outside the region's list stop (keeps-review O1, 11-28: the q region was judged
+  by kernel names only and moved past the %s_h mask; the post-flash gate starts after it).
 usage: python3 test_last_rows.py (exit 1 on a failure)."""
 import os, re, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -104,6 +108,11 @@ def unit(base_gen):
 
     def sub(t, a, b, count=1):
         return t[:after63] + t[after63:].replace(a, b, count)
+    # the K block's first line: the q region ends there, so a statement inserted before it is in the q region and moves
+    kb = after63 + re.search(r"(?m)^  scf\.if %mm \{\n(?:(?!^  \S)[^\n]*\n)*?[^\n]*%wk_63,", l63).start()
+
+    def in_q(s):
+        return base_gen[:kb] + s + base_gen[kb:]
     qs = sorted(set(re.findall(r"(?m)^[^\n]*%h16, %s_h, [^\n]*%qg\)[^\n]*\n", l63)))
     q_on_o = base_gen
     for ln in qs:
@@ -115,6 +124,12 @@ def unit(base_gen):
             ("LAST_ROWS alone: a GEMM writing %features after the flash", sub(base_gen, down, down + "  kernel.launch @g_gemm_f16_store_m256[%tp, %nH](%tp, %nQ, %nH, %o16, %s_o, %h16, %features) : [index, index](index, index, index, buffer, buffer, buffer, buffer)\n")),
             ("a %s_h reader between the attention and the FFN norm", sub(base_gen, rope, rope + "  kernel.launch @g_row_scale_f16_live_lv[%t](%t, %info, %nH, %h, %s_h, %h16) : [index](index, buffer, index, buffer, buffer, buffer)\n")),
             ("the q GEMM on another scale buffer", q_on_o),
+            # keeps-review O1 (11-28, static-1127/keeps-review/lr/probe.txt): the q region was judged by kernel names only and the
+            # post-flash gate starts after it, so a q-region launch writing a command argument moved past the mask unrefused
+            ("a q-region GEMM writing %features", in_q("  kernel.launch @g_gemm_f16_store[%tp, %nQ2](%tp, %nH, %nQ2, %h16, %s_h, %pf16a, %features) : [index, index](index, index, index, buffer, buffer, buffer, buffer)\n")),
+            ("a q-region matvec writing %arena", in_q("  kernel.launch @g_mv_q5_k_k5120_t4_q8_r2[%nQ2, %t](%nQ2, %t, %zero_i32, %h16q, %wq_63, %arena) : [index, index](index, index, i32, buffer, buffer, buffer)\n")),
+            ("a q-region buffer.copy into %features", in_q("  buffer.copy %qg, %features : buffer, buffer\n")),
+            ("a q-region launch of another kernel (on local buffers)", in_q("  kernel.launch @g_dfl_tap[%t](%t, %tap_slot_4, %qg, %q) : [index](index, index, buffer, buffer)\n")),
             ("a half-converted layer (one mask removed)", t_ok.replace(one_mask, "", 1)),
             ("a half-converted layer (a mask, no move)", sub(base_gen, rope, one_mask + rope) + "\n" + last_rows.KERNEL)):
         try:
