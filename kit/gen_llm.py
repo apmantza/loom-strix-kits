@@ -6500,6 +6500,12 @@ if __name__ == "__main__":
         import last_q
         text, _lq = last_q.apply(text)
         print(f"LAST_Q: layer {_lq}'s flash kernels read g_flash_tiles_out's list (the tiles holding a selected span's last token)", file=sys.stderr)
+    if os.environ.get("LAST_ROWS", "0") not in ("", "0", "false", "no", "off"):   # HRX-like static-1127 SWEEP A1 (kit/last_rows.py): A/B open (q252); unset: unchanged
+        # the last layer's q / o / gate-up / down GEMMs run only on the row tiles holding a row the head reads (exact); on the final
+        # text, so its fail-closed check sees every kernel the served program launches after them
+        import last_rows
+        text, _lr = last_rows.apply(text)
+        print(f"LAST_ROWS: layer {_lr}'s q, o, gate/up and down GEMMs read row scales masked to the head's rows (K / V first)", file=sys.stderr)
     out = os.path.join(out_dir, "model.loom")
     open(out, "w", newline="\n").write(text)
     print("wrote", out)

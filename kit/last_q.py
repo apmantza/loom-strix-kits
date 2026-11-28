@@ -201,7 +201,8 @@ func.def inline @g_block_holds_output(%metadata: buffer, %spans: index, %info: b
 ROW_LOCAL = re.compile(r"g16_attention_split_listed|g16_attention_combine_listed(_f16o)?|g_attention_split|g_attention_vsplit"
                        r"|g_attention_combine|g_attention_flash2(_partial)?|g_row_scale_f16(_live_lv)?|g_quant_q8|g_deq16_\w+"
                        r"|g_gemm_\w+|g_mv_\w+|g_add_norm_rs_live(_noh)?_lv|g_post_add_norm(_rs_live(_noh)?_lv|_lv)?"
-                       r"|g_head_mv(_t\d+)?(_q8)?|g_head_select|g_logits_export")
+                       r"|g_head_mv(_t\d+)?(_q8)?|g_head_select|g_logits_export"
+                       r"|g_scale_head_rows")   # LAST_ROWS (kit/last_rows.py): zeroes the scales of rows the head does not read, per row
 # The two kernels that read the list in the layout g_flash_tiles_out writes ([0] / [tokens/2] counts, the workgroup id picks the
 # entry only): one launch of each in the layer, as the served program has them (F16O_O: their f16-output forms).
 LIST_READERS = (re.compile(r"g_attention_flash2(_f16o)?"), re.compile(r"g_attention_flash2_partial(_f16o)?"))
@@ -228,18 +229,19 @@ DEF = re.compile(r"(?m)^ *(%\w+) = ([\w.]+)(?:<[^>\n]*>)?(?: (%\w+))?")
 # an allocation of the program, a weight (command.parameter of %weights) or a view of an allocation.
 ARGS_OK = ((re.compile(r"g16_attention_split_listed|g_attention_split|g_attention_vsplit"), {"%arena", "%origins"}),
            (re.compile(r"g_head_mv(_t\d+)?(_q8)?"), {"%metadata"}),
-           (re.compile(r"g_head_select|g_logits_export"), {"%metadata", "%outputs"}))
+           (re.compile(r"g_head_select|g_logits_export"), {"%metadata", "%outputs"}),
+           (re.compile(r"g_scale_head_rows"), {"%metadata"}))   # LAST_ROWS's masks: the span packets, read only
 
 
-def _launch_ok(s, cargs, defs):
-    """a ROW_LOCAL launch whose command arguments are its ARGS_OK entry and whose other buffers are local (see ARGS_OK)"""
+def _launch_ok(s, cargs, defs, kernels=ROW_LOCAL, args_ok=ARGS_OK):
+    """a launch of KERNELS whose command arguments are its ARGS_OK entry and whose other buffers are local (see ARGS_OK)"""
     m = LAUNCH_SIG.fullmatch(s)
-    if not m or not ROW_LOCAL.fullmatch(m.group(1)):
+    if not m or not kernels.fullmatch(m.group(1)):
         return False
     ops, tys = [x.strip() for x in m.group(2).split(",")], [x.strip() for x in m.group(3).split(",")]
     if len(ops) != len(tys):
         return False
-    allowed = set().union(*[a for r, a in ARGS_OK if r.fullmatch(m.group(1))])
+    allowed = set().union(*[a for r, a in args_ok if r.fullmatch(m.group(1))])
     for o, t in zip(ops, tys):
         if o in cargs:
             if o not in allowed:
@@ -281,7 +283,23 @@ def apply(text):
     names = [LAUNCH.match(ln).group(1) if LAUNCH.match(ln) else None for ln in readers]
     if len(names) != 2 or None in names or not all(r.fullmatch(n) for r, n in zip(LIST_READERS, names)):
         die(f"layer {layer}: the flash list readers are {names}, expected g_attention_flash2[_f16o] then its partial kernel")
-    after = block[block.index(readers[-1]) + len(readers[-1]):] + seg[b1:]
+    gate(seg, block[block.index(readers[-1]) + len(readers[-1]):] + seg[b1:], layer)
+    if seg.count(PROLOGUE) != 1 or seg.count(ALLOC) != 1:
+        die(f"@llm_advance has {seg.count(PROLOGUE)} work-list launches and {seg.count(ALLOC)} list allocations (expected 1, 1)")
+    for ln in readers:
+        block = block.replace(ln, ln.replace("%flash_tiles,", "%flash_tiles_out,", 1), 1)
+    seg = seg[:b0] + block + seg[b1:]
+    seg = seg.replace(ALLOC, ALLOC + ALLOC.replace("%flash_tiles ", "%flash_tiles_out "), 1).replace(PROLOGUE, PROLOGUE + CROP, 1)
+    return text[:m.start()] + seg + text[end:] + "\n" + KERNEL, layer
+
+
+def gate(seg, after, layer, who="LAST_Q", kernels=ROW_LOCAL, args_ok=ARGS_OK, where="after layer {}'s flash launches"):
+    """Stops the build unless every statement of AFTER (the text of @llm_advance segment SEG after the last attention layer's flash
+    launches) is a known memory-free form or a ROW_LOCAL launch with its ARGS_OK command arguments, and SEG defines each name
+    once. LAST_Q judges the program before its rewrite; LAST_ROWS (applied after it) judges its own output, masks included, and
+    its moved q region (KERNELS: that region's kernels, ARGS_OK empty: no command argument; WHERE names the region, {} its layer)."""
+    def stop(msg):
+        sys.exit(f"{who}: {msg}")
     cargs = set(re.findall(r"(%\w+): buffer", seg.split("\n", 1)[0]))
     defs = {}
     for d in DEF.finditer(seg):
@@ -291,23 +309,16 @@ def apply(text):
     names = collections.Counter(n for d in re.finditer(r"(?m)^ *(%\w+(?:, *%\w+)*) = ", seg) for n in re.split(r", *", d.group(1)))
     twice = sorted(n for n, k in names.items() if k > 1)
     if twice:
-        die(f"@llm_advance defines {len(twice)} names more than once: {twice[:4]}")
+        stop(f"@llm_advance defines {len(twice)} names more than once: {twice[:4]}")
     other = []
     for ln in after.splitlines():
         s = ln.strip()
         if LAUNCH_LINE.fullmatch(s):
-            ok = _launch_ok(s, cargs, defs)
+            ok = _launch_ok(s, cargs, defs, kernels, args_ok)
         else:
             used = set(re.findall(r"%\w+", s)) & cargs if not s.startswith("//") else set()
             ok = AFTER_OK.fullmatch(s) and (not used or (used == {"%weights"} and s.split(" = ", 1)[-1].startswith("command.parameter %weights,")))
         if not ok:
             other.append(s[:100])
     if other:
-        die(f"after layer {layer}'s flash launches: {len(other)} statements not known row-local or memory-free: {other[:4]}")
-    if seg.count(PROLOGUE) != 1 or seg.count(ALLOC) != 1:
-        die(f"@llm_advance has {seg.count(PROLOGUE)} work-list launches and {seg.count(ALLOC)} list allocations (expected 1, 1)")
-    for ln in readers:
-        block = block.replace(ln, ln.replace("%flash_tiles,", "%flash_tiles_out,", 1), 1)
-    seg = seg[:b0] + block + seg[b1:]
-    seg = seg.replace(ALLOC, ALLOC + ALLOC.replace("%flash_tiles ", "%flash_tiles_out "), 1).replace(PROLOGUE, PROLOGUE + CROP, 1)
-    return text[:m.start()] + seg + text[end:] + "\n" + KERNEL, layer
+        stop(f"{where.format(layer)}: {len(other)} statements not known row-local or memory-free: {other[:4]}")
