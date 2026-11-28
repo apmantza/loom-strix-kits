@@ -461,7 +461,12 @@ def lint_table(path):
         path = hits[0]
     cols, rows = None, {}
     for line in open(path, errors="replace"):
-        w = line.split()
+        w = []
+        for x in line.split():                    # kernel_lint's 'bound' tier is two words ('12 bound', '15 bound:v18'): one cell
+            if w and (x == "bound" or x.startswith("bound:")):
+                w[-1] += " " + x
+            else:
+                w.append(x)
         if w[:3] == ["kernel", "where", "loop"]:
             if cols is not None:
                 raise ValueError(f"{path}: two kernel_lint headers (two runs in one file)")

@@ -256,6 +256,17 @@ def main():
         near = w("lint-951.txt", LINT_BASE.replace("   952   952", "   951   951", 1))
         rc, out = cli("compiler-check", w("q226.sh", CARD.replace("# result:", "# compiler: g_attention_flash2_f16o loop_instructions 952 -> 945\n# result:")), near, base)
         case("compiler-check, 952 -> 945 predicted, 951 read (inside both 2 % bands, 1 of 7 moved): refused", rc == 1)
+        # F7 (lint-gw review E737): kernel_lint prints a 'bound' tier as two words ('12 bound' in w/S, '15 bound:v18' in next), and
+        # the whitespace split shifted every later column, so cov / fly / ldsW were read from the wrong cell on every bound kernel.
+        # Recurrence: a '# compiler: ... load_cover' line on a 160-lane matvec judged against its 'sites' count.
+        bnd = LINT_BASE.replace("252   5   12  kept", "252   5 bound   12 bound:v18  kept", 1)
+        tb = lt.lint_table(w("lint-bound.txt", bnd))["g_attention_flash2_partial_f16o"]
+        case(f"lint_table: a 'bound' tier keeps the later columns in place (w/S '5 bound', next '12 bound:v18', cov 86, fly 3, "
+             f"ldsW 1.62) ({tb})", tb.get("w/S") == "5 bound" and tb.get("next") == "12 bound:v18" and tb.get("cov") == 86.0
+             and tb.get("fly") == 3.0 and tb.get("ldsW") == 1.62 and tb.get("pf") == "kept")
+        rc, out = cli("compiler-check", w("q229.sh", CARD.replace("# result:", "# compiler: g_attention_flash2_partial_f16o load_cover 86 "
+                                                                       "-> 86\n# result:")), w("lint-bound2.txt", bnd), base)
+        case(f"compiler-check, cov on a bound kernel read from its own column: OK ({out.strip()[-40:]})", rc == 0)
         def pair(b_loop, a_loop, line, n):
             bt = w(f"lint-b{n}.txt", LINT_BASE.replace("   952   952", f"   {b_loop}   {b_loop}", 1))
             at = w(f"lint-a{n}.txt", LINT_BASE.replace("   952   952", f"   {a_loop}   {a_loop}", 1))
