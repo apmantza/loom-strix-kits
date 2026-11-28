@@ -194,6 +194,12 @@ more bytes than Strata's' after checking only Strata's file; our generator's doc
 - **Red first, mutate every guard, test the boundaries.** New kernel cases must fail on the old code and on a deliberate
   break (E4, E10); every threshold or mode switch gets a case straddling it (E45). Keep the unchanged path's tests
   byte-identical as a regression check.
+  A deliberate break that passes is a finding about the break before it is one about the tests (HRX-like E752 -> E760: two
+  'test gaps' were neither). Check first that the break can be seen: (a) it is not equivalent (another guard already makes the
+  removed one redundant: a key clamp made dropped key-valid selects harmless; pair the break with a control that removes only the
+  other guard); (b) the case's reference does not copy the broken text (a reference built by undoing a rewrite on the package's
+  own kernel carried the break into both sides). A text-edited break is refused when its added lines appear in the generated
+  cases (HRX-like scripts/mutant_ref_check.sh).
 - **Text rewrites of generated code are contracts.** A regex pass that finds code by its exact shape silently skips new
   shapes; make the build fail when a site is left half-converted, and prove that guard with a mutant (E31). Make passes
   terminate and idempotent (E76: a move pass swapped two blocks forever).
