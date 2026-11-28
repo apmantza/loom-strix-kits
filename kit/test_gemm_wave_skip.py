@@ -6,8 +6,9 @@ and silently skips new shapes), so each structural guard below is one way a late
 a barrier or a store pulled into the skipped region (a wave that skips would miss a workgroup barrier: a hang, or an output row not
 written), an MMA left outside the region (half the work skipped), a region value read after the region (undefined on the skip path),
 or a new m256 kernel name that is neither rewritten nor skipped.
-Fixture: fixtures/gemm_f16o_m256.loom (F16O11's served swiglu kernel and its gfx12 twin), run through GEMM256_FLATADDR first, the
-order gen_llm applies them. With a program path (a built package's program/llm.loom): checks every served gfx11 f16 m256 GEMM there
+Fixture: fixtures/gemm_f16o_m256.loom (F16O11's served swiglu kernel and its gfx12 twin) as generated: GEMM256_FLATADDR, which
+gen_llm applies first, leaves this kernel alone since HRX-like E744 (gemm_flataddr.SKIP); the flat-lane x prefetch form is covered by
+the _qgs fixture below (store_m256 and _qgs, both rewritten). With a program path (a built package's program/llm.loom): checks every served gfx11 f16 m256 GEMM there
 holds the wave skip."""
 import os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,7 +35,7 @@ def main():
     def case(desc, ok):
         nonlocal fails, n
         n += 1; fails += not ok; print(("ok  " if ok else "FAIL") + "  " + desc)
-    text, _ = gemm_flataddr.apply(open(os.path.join(HERE, "fixtures", "gemm_f16o_m256.loom")).read())
+    text = open(os.path.join(HERE, "fixtures", "gemm_f16o_m256.loom")).read()
     out, done = gemm_wave_skip.apply(text)
     case(f"the served _f16o kernel is rewritten ({done})", done == ["g_gemm_f16_swiglu_m256_f16o"])
     k0, k1 = body(text, "g_gemm_f16_swiglu_m256_f16o"), body(out, "g_gemm_f16_swiglu_m256_f16o")
@@ -108,8 +109,8 @@ def main():
               "    vector.store %cr_x, %x_stage_view[%x_stage_row, %x_stage_col] : vector<32xf16>, view<256x72xf16>\n",
               "    vector.store %cr_x1, %x_stage_view[%x_stage_row1, %x_stage_col] : vector<32xf16>, view<256x72xf16>\n"):
         refused(f"a kernel without anchor {a.strip()[:60]!r} stops the build", k0.replace(a, "", 1), a.strip()[:40])
-    refused("an in-loop x prefetch in neither known form stops the build",
-            k0.replace("  %x_lane1_v = index.madd %x_row1, %kx, %x_stage_col : index\n", "  %x_lane1_v = index.madd %x_row, %kx, %x_stage_col : index\n", 1), "x prefetch")
+    refused("an in-loop x prefetch in neither known form stops the build (by-row form: second load off x_row1)",
+            k0.replace("%xv1 = vector.load %x_view[%x_row1, %x_coln]", "%xv1 = vector.load %x_view[%x_row, %x_coln]", 1), "x prefetch")
     refused("a weight view not pinned to its workgroup alloca stops the build",
             re.sub(r"(?m)^  %w_wave_view = buffer\.view %w_stage\[", "  %w_wave_view = buffer.view %w[", k0, count=1), "w_wave_view")
     # loop shape: one K loop, its header, its yield last, a region, both barriers beside the region
@@ -147,6 +148,11 @@ def main():
     import difflib
     qt = open(os.path.join(HERE, "fixtures", "gemm_f16_store_m256_qgs.loom")).read()
     qout, qdone = gemm_wave_skip.apply(qt)
+    # the flat-lane x prefetch (GEMM256_FLATADDR's form, served by store / acc / _qgs; the swiglu fixture above is by-row since E744)
+    ks = body(qt, "g_gemm_f16_store_m256")
+    ksm = ks.replace("  %x_lane1_v = index.madd %x_row1, %kx, %x_stage_col : index\n", "  %x_lane1_v = index.madd %x_row, %kx, %x_stage_col : index\n", 1)
+    case("an in-loop x prefetch in neither known form stops the build (flat-lane form: lane1 off x_row)",
+         ksm != ks and refuses(lambda: gemm_wave_skip.wave_skip(ksm, "x"), "x prefetch"))
     case(f"QG_SPLIT's _qgs is rewritten beside store_m256, its twin skipped ({qdone})",
          sorted(qdone) == ["g_gemm_f16_store_m256", "g_gemm_f16_store_m256_qgs"])
     def added(name):

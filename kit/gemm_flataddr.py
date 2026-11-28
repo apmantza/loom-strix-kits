@@ -13,9 +13,11 @@ the addresses the 2-D form read (rows are padded: kx = k + 64), so nothing past 
 Fails closed: every anchor must match exactly once per kernel.
 
 apply() picks the kernels on a whole program: every gfx11 kernel named g_gemm_f16_{acc,store,swiglu}_m256 or its F16O11 copy
-(_m256_f16o); gfx12 twins (target(@rdna4)) are skipped by name; any other g_gemm_f16_*m256* kernel stops the build. The pattern
-before HRX-like E512 ended at `_m256"`, so the served swiglu GEMM (g_gemm_f16_swiglu_m256_f16o since F16O11) was never rewritten
-while the build log listed the unserved g_gemm_f16_swiglu_m256 as done."""
+(_m256_f16o); gfx12 twins (target(@rdna4)) and SKIP are skipped by name; any other g_gemm_f16_*m256* kernel stops the build. The
+pattern before HRX-like E512 ended at `_m256"`, so the served swiglu GEMM (g_gemm_f16_swiglu_m256_f16o since F16O11) was never
+rewritten while the build log listed the unserved g_gemm_f16_swiglu_m256 as done; E514 rewrote it, and E744 measured that a served
+loss (1.0093x in cycles), so SKIP returns it to the form live pkg-e480 serves (the unserved g_gemm_f16_swiglu_m256 stays rewritten,
+as in pkg-e480)."""
 import re
 
 
@@ -83,6 +85,9 @@ def flataddr(text):
 
 KERNEL = re.compile(r'^kernel\.def (?:target\(@(\w+)\) )?export\("(g_gemm_f16_\w*m256\w*)"\).*?\n\} launch\(.*?\n\}\n', re.S | re.M)
 REWRITE = re.compile(r"g_gemm_f16_(acc|store|swiglu)_m256(_f16o|_qgs)?")   # _qgs: QG_SPLIT (qg_split.py), same loads as store
+# known skip by name: the served swiglu GEMM keeps its 2-D addressing, as live pkg-e480 serves it. HRX-like E744 (q258, 2 x ABBA,
+# 4 starts per arm): the rewrite (E514) made it 1.0093x slower in served cycles (+0.48 s per 81k); mechanism hypothesis E738
+SKIP = frozenset({"g_gemm_f16_swiglu_m256_f16o"})
 
 
 def apply(text):
@@ -92,6 +97,8 @@ def apply(text):
         target, name = m.group(1), m.group(2)
         if target == "rdna4" and name.endswith("_rdna4"):
             continue   # gfx12 twin: not served on gfx1151 (the rewrite's anchors are the gfx11 K-tile-64 forms)
+        if name in SKIP:
+            continue   # left as generated (E744)
         if target not in (None, "rdna3") or not REWRITE.fullmatch(name):
             raise SystemExit(f"GEMM256_FLATADDR: {name} (target {target}) is neither rewritten nor a known skip: extend apply() or skip it by name")
         out += [text[last:m.start()], flataddr(m.group(0))]; last = m.end(); done.append(name)
